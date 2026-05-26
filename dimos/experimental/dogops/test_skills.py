@@ -23,9 +23,24 @@ def test_skill_container_runs_closed_loop_and_reports_state(tmp_path) -> None:
     scan = _payload(skills.scan_zone("INBOUND_DOCK"))
     assert scan["visible_tag_ids"] == [20, 101, 102]
 
+    manifest_scan = _payload(skills.scan_receiving_manifest("INBOUND_DOCK"))
+    assert manifest_scan["status"] == "mismatch"
+    assert manifest_scan["missing_packages"] == ["PKG-103"]
+    assert manifest_scan["detected_packages"] == ["PKG-101", "PKG-102"]
+
     asset = _payload(skills.inspect_asset("COOLING_1"))
     assert asset["ok"] is True
     assert asset["expected_clear"] is True
+
+    gauge = _payload(skills.read_gauge("TEMP_1"))
+    assert gauge["status"] == "normal"
+    assert gauge["unit"] == "celsius"
+
+    clearance = _payload(skills.check_clearance("COOLING_1"))
+    assert clearance["status"] == "clear"
+
+    aisle = _payload(skills.detect_blocked_aisle("RACK_ROW_A"))
+    assert aisle["blocked"] is False
 
     reconciliation = _payload(skills.reconcile_manifest())
     assert reconciliation["manifest_exceptions"] == 2

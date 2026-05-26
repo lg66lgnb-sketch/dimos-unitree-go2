@@ -16,6 +16,8 @@ from dimos.experimental.dogops.config_loader import (
 )
 from dimos.experimental.dogops.mission_engine import run_offline_simulation
 from dimos.experimental.dogops.models import (
+    Asset,
+    AssetKind,
     Incident,
     IncidentState,
     IncidentType,
@@ -180,6 +182,124 @@ class DogOpsSkillContainer(Module):
             display_name=asset.display_name,
             expected_clear=asset.expected_clear,
             incidents=incidents,
+        )
+
+    @skill
+    def read_gauge(self, asset_id: str) -> str:
+        site = read_site_config(self.site_path)
+        asset = site.asset_by_id().get(asset_id)
+        if asset is None:
+            return _json(ok=False, skill="read_gauge", error="unknown_asset", asset_id=asset_id)
+
+        max_celsius = asset.expected_state.get("max_celsius")
+        if max_celsius is not None:
+            reading = self._latest_fact(f"{asset.id}.temperature_c")
+            if reading is None:
+                reading = asset.expected_state.get("current_celsius", float(max_celsius) - 2.0)
+            reading_c = float(reading)
+            max_c = float(max_celsius)
+            return _json(
+                ok=True,
+                skill="read_gauge",
+                asset_id=asset.id,
+                gauge_type="temperature",
+                reading=reading_c,
+                unit="celsius",
+                max_celsius=max_c,
+                status="normal" if reading_c <= max_c else "high_temperature",
+            )
+
+        status = self._asset_status(asset)
+        return _json(
+            ok=True,
+            skill="read_gauge",
+            asset_id=asset.id,
+            gauge_type="status_card",
+            reading=status,
+            unit="status",
+            expected_status=asset.expected_status,
+            status=status,
+        )
+
+    @skill
+    def check_clearance(self, asset_id: str) -> str:
+        site = read_site_config(self.site_path)
+        asset = site.asset_by_id().get(asset_id)
+        if asset is None:
+            return _json(ok=False, skill="check_clearance", error="unknown_asset", asset_id=asset_id)
+
+        clearance_clear = self._clearance_for_asset(asset)
+        if clearance_clear is None:
+            return _json(
+                ok=False,
+                skill="check_clearance",
+                error="no_clearance_expectation",
+                asset_id=asset.id,
+            )
+
+        blockers = [] if clearance_clear else self._blocking_packages_for_asset(asset)
+        return _json(
+            ok=True,
+            skill="check_clearance",
+            asset_id=asset.id,
+            clear=clearance_clear,
+            status="clear" if clearance_clear else "blocked",
+            blocking_package_ids=blockers,
+        )
+
+    @skill
+    def detect_blocked_aisle(self, zone_id: str) -> str:
+        site = read_site_config(self.site_path)
+        if zone_id not in site.zone_by_id():
+            return _json(
+                ok=False, skill="detect_blocked_aisle", error="unknown_zone", zone_id=zone_id
+            )
+
+        aisle_assets = [
+            asset
+            for asset in site.assets
+            if asset.zone_id == zone_id and asset.asset_kind == AssetKind.aisle_clearance
+        ]
+        blocked_assets = [
+            {
+                "asset_id": asset.id,
+                "blocking_package_ids": self._blocking_packages_for_asset(asset),
+            }
+            for asset in aisle_assets
+            if self._clearance_for_asset(asset) is False
+        ]
+        return _json(
+            ok=True,
+            skill="detect_blocked_aisle",
+            zone_id=zone_id,
+            blocked=bool(blocked_assets),
+            blocked_assets=blocked_assets,
+        )
+
+    @skill
+    def scan_receiving_manifest(self, zone_id: str) -> str:
+        site = read_site_config(self.site_path)
+        if zone_id not in site.zone_by_id():
+            return _json(
+                ok=False, skill="scan_receiving_manifest", error="unknown_zone", zone_id=zone_id
+            )
+
+        manifest = read_manifest(self.manifest_path)
+        expected = sorted(
+            item.package_id for item in manifest.items if item.expected_zone_id == zone_id
+        )
+        detected = sorted(self._detected_packages_for_zone(zone_id))
+        missing = sorted(set(expected) - set(detected))
+        unexpected = sorted(set(detected) - set(expected))
+        return _json(
+            ok=True,
+            skill="scan_receiving_manifest",
+            zone_id=zone_id,
+            expected_packages=expected,
+            detected_packages=detected,
+            missing_packages=missing,
+            unexpected_packages=unexpected,
+            status="matched" if not missing and not unexpected else "mismatch",
         )
 
     @skill
@@ -406,6 +526,60 @@ class DogOpsSkillContainer(Module):
         if not self._state_file().exists():
             return _json(ok=False, skill=skill_name, error="missing_run", run_dir=str(self.run_dir))
         return DogOpsStore.load_existing(self.run_dir)
+
+    def _latest_fact(self, key: str) -> bool | str | int | float | None:
+        mission = read_mission(self.mission_path)
+        for observation in reversed(list(mission.simulation_observations.values())):
+            if key in observation.facts:
+                return observation.facts[key]
+        return None
+
+    def _clearance_for_asset(self, asset: Asset) -> bool | None:
+        if self._state_file().exists():
+            state = DogOpsStore.load_existing(self.run_dir).state
+            assert state is not None
+            active_blocker_types = {IncidentType.blocked_aisle, IncidentType.blocked_cooling}
+            has_active_blocker = any(
+                incident.entity_id == asset.id
+                and incident.type in active_blocker_types
+                and incident.state not in {IncidentState.resolved, IncidentState.false_positive}
+                for incident in state.incidents
+            )
+            if has_active_blocker:
+                return False
+
+        fact = self._latest_fact(f"{asset.id}.clearance_clear")
+        if isinstance(fact, bool):
+            return fact
+        return asset.expected_clear
+
+    def _blocking_packages_for_asset(self, asset: Asset) -> list[str]:
+        blockers = set(asset.blocking_package_ids)
+        mission = read_mission(self.mission_path)
+        for observation in mission.simulation_observations.values():
+            for key, value in observation.facts.items():
+                if key.endswith(".blocks_asset_id") and value == asset.id:
+                    blockers.add(key.removesuffix(".blocks_asset_id"))
+        return sorted(blockers)
+
+    def _detected_packages_for_zone(self, zone_id: str) -> set[str]:
+        detected: set[str] = set()
+        mission = read_mission(self.mission_path)
+        for observation in mission.simulation_observations.values():
+            if observation.zone_id != zone_id:
+                continue
+            for key, value in observation.facts.items():
+                if key.startswith("PKG-") and key.endswith(".zone_id") and value == zone_id:
+                    detected.add(key.removesuffix(".zone_id"))
+        return detected
+
+    def _asset_status(self, asset: Asset) -> str:
+        clearance = self._clearance_for_asset(asset)
+        if clearance is False:
+            return "blocked"
+        if clearance is True and asset.expected_status is not None:
+            return asset.expected_status
+        return asset.expected_status or "unknown"
 
 
 def _find_incident(incidents: list[Incident], incident_id: str) -> Incident | None:
