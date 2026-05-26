@@ -32,6 +32,7 @@
 - Before committing, inspect `git diff` and commit only relevant files.
 - Before pushing, fetch again, verify branch/account, and push only the current task branch.
 - Open draft PRs for non-trivial work; include summary, checks run, failures, and risks.
+- For PR review requests, suggest `$simple-pr-review-loop` for standard review/fix cycles or `$deep-pr-review-loop` for adversarial subagent-backed review.
 - Never force-push shared branches. If explicitly needed on your own branch, use `--force-with-lease`.
 - Do not add `Co-Authored-By` unless explicitly requested.
 
