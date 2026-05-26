@@ -53,6 +53,7 @@
 - This repo vendors Codex skills under `.codex/skills/` so every Codex user gets the same review workflows.
 - Use `$simple-pr-review-loop` for normal PR/branch hardening: review, fix P0/P1/P2 findings, verify, commit, push, and re-review.
 - Use `$deep-pr-review-loop` for adversarial review loops, subagent review lenses, claim/spec validation, test adequacy review, or when a normal review may miss deeper route/state issues.
+- If those skill names are not listed in the current Codex session, read `.codex/skills/simple-pr-review-loop/SKILL.md` or `.codex/skills/deep-pr-review-loop/SKILL.md` directly and follow that workflow.
 
 ## Failure memory
 - Record repeated failures in `docs/FAILURE_MEMORY.md` before changing strategy.
