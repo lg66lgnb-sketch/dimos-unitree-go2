@@ -5,6 +5,7 @@ Start here for the build and real-Go2 demo:
 - [DEMO.md](DEMO.md): local CLI/dashboard/tag detector demo.
 - [DRY_RUNS.md](DRY_RUNS.md): repeatable local dry-run loop.
 - [TAGS.md](TAGS.md): AprilTag IDs and mounting notes.
+- [SITEOPS_SKILLS_VALIDATION.md](SITEOPS_SKILLS_VALIDATION.md): issue #2 SiteOps skill surface and MCP validation loop.
 - [HARDWARE_HANDOFF.md](HARDWARE_HANDOFF.md): Mac + Go2 checklist, video capture, evidence.
 - [../ARENA.md](../ARENA.md): physical layout.
 - [../SAFETY.md](../SAFETY.md): safety and stop commands.
