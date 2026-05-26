@@ -1,0 +1,46 @@
+Read SPEC.md, STATUS.md, AGENTS.md, and docs/dogops/UPSTREAM_OPPORTUNITIES.md.
+
+Goal: validate useful DimOS upstream PRs/issues without destabilizing DogOps.
+
+Hard rules:
+- Do not change DogOps product direction.
+- Do not base the DogOps main demo branch on draft or unmerged PRs.
+- Use git worktrees or isolated branches for every upstream PR.
+- After two failed corrections on the same issue, stop, summarize what was learned, update STATUS.md and docs/dogops/UPSTREAM_OPPORTUNITIES.md, and move to the documented fallback.
+- Prefer narrow tests and concrete logs over reasoning from diffs.
+- Keep all changes surgical.
+
+Phase 1: baseline Go2 performance
+- Run replay timing for issue #1634:
+  `/usr/bin/time -p uv run dimos --replay --viewer=none run unitree-go2`
+- Save command, stdout/stderr, and wall/user/sys time to `.dogops/upstream/baseline_go2_timing.md`.
+- If replay fails, save the full failure and do not keep retrying more than twice.
+
+Phase 2: PR #2236 Go2 static transforms
+- Check out PR #2236 in an isolated worktree/branch.
+- Run the stated replay check and the narrowest relevant blueprint tests.
+- Write `.dogops/upstream/pr_2236_validation.md` with: commands run, result, whether it helps DogOps AprilTag/spatial reporting, and recommendation.
+- Do not merge it into DogOps unless it passes cleanly and the diff is understood.
+
+Phase 3: DogOps NavEval
+- Check PR #2138 only for ideas; do not merge its broad branch.
+- Ensure DogOps has independent `nav_eval.py` metrics: waypoint attempted/reached, retry count, tag reacquisition time, route duration, operator intervention count.
+- Add tests for those metrics.
+
+Phase 4: exactly one upstream goodwill task
+Pick exactly one:
+- PR #2237: add XYZRGB+times test and dynamic time-field offset;
+- PR #2213: fix blueprint relative-import loading;
+- PR #2242: fix zero-vector pose normalization or PointCloud2 color/intensity regression.
+
+For the selected task:
+- make a surgical branch;
+- run narrow tests;
+- prepare a short PR description;
+- update STATUS.md with whether it is ready.
+
+Deliverables:
+- `.dogops/upstream/baseline_go2_timing.md`
+- `.dogops/upstream/pr_2236_validation.md`
+- updated STATUS.md
+- no DogOps demo dependency on upstream PR branches
