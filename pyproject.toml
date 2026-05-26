@@ -1,0 +1,28 @@
+[project]
+name = "dimos-unitree-go2"
+version = "0.1.0"
+description = "DogOps DimOS SiteOps Agent implementation pack"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.12,<3",
+    "PyYAML>=6.0,<7",
+]
+
+[project.optional-dependencies]
+vision = [
+    "opencv-contrib-python-headless>=4.10,<5",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3,<9",
+    "ruff>=0.14,<1",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"

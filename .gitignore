@@ -1,10 +1,30 @@
-.DS_Store
-__pycache__/
-*.py[cod]
-.venv/
-node_modules/
-dist/
-build/
+# Local secrets and machine-specific config
 .env
 .env.*
-!.env.example
+*.local.yaml
+*.private.yaml
+
+# DogOps generated outputs
+.dogops/
+dogops-tags-*.pdf
+artifacts/dogops/
+dogops-evidence/
+MUJOCO_LOG.TXT
+
+# Python tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+
+# Logs and OS noise
+*.log
+.DS_Store
+
+# Local demo media; store/share intentionally outside source control
+*.mov
+*.mp4
+*.m4v
+*.heic

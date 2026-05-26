@@ -38,7 +38,7 @@ site policy + receiving manifest
 **Robot/runtime constraints:**
 
 - Robot: Unitree Go2 Air is available and should be used for final validation.
-- Host: offboard MacBook with the full DimOS checkout is the primary build and runtime target.
+- Host: offboard host with the full DimOS checkout is the primary build and runtime target.
 - Ubuntu/UTM VM: optional for offline development only; do not make it required for final validation.
 - Demo space: indoor/office, about 10 m × 10 m, props can be arranged.
 - Internet: somewhat reliable.
@@ -161,7 +161,7 @@ Offline product checks, dashboard checks, direct skill tests, optional AprilTag 
 
 For the next build:
 
-- Build directly in `/Users/p/src/pg/dimos` or another full DimOS checkout.
+- Build directly in `$DIMOS_ROOT` or another full DimOS checkout.
 - Add the DogOps blueprint and run registry checks early, before demo polish.
 - DogOps modules used as DimOS workers should tolerate framework-injected kwargs such as `g=`.
 - The Go2 blueprint file should expose a real module-level `unitree_go2_dogops` blueprint in a full DimOS checkout; use metadata fallback only for isolated import tests.
