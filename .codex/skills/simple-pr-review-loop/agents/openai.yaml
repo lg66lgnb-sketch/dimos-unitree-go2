@@ -1,0 +1,4 @@
+interface:
+  display_name: "Simple PR Review Loop"
+  short_description: "Loop until no P0/P1/P2 remain"
+  default_prompt: "Use $simple-pr-review-loop to review a PR, fix actionable P0/P1/P2 findings, verify, push, and repeat until no active P0/P1/P2 remain."

@@ -32,6 +32,7 @@
 - Before committing, inspect `git diff` and commit only relevant files.
 - Before pushing, fetch again, verify branch/account, and push only the current task branch.
 - Open draft PRs for non-trivial work; include summary, checks run, failures, and risks.
+- For PR review requests, suggest `$simple-pr-review-loop` for standard review/fix cycles or `$deep-pr-review-loop` for adversarial subagent-backed review.
 - Never force-push shared branches. If explicitly needed on your own branch, use `--force-with-lease`.
 - Do not add `Co-Authored-By` unless explicitly requested.
 
@@ -48,6 +49,12 @@
 - Each subagent must read `SPEC.md`, this file, and `STATUS.md` if backlog-related.
 - Each subagent must report changed files, checks run, failures, and remaining risks.
 - Merge only after the main worktree passes the relevant checks.
+
+## Repo-local Codex skills
+- This repo vendors Codex skills under `.codex/skills/` so every Codex user gets the same review workflows.
+- Use `$simple-pr-review-loop` for normal PR/branch hardening: review, fix P0/P1/P2 findings, verify, commit, push, and re-review.
+- Use `$deep-pr-review-loop` for adversarial review loops, subagent review lenses, claim/spec validation, test adequacy review, or when a normal review may miss deeper route/state issues.
+- If those skill names are not listed in the current Codex session, read `.codex/skills/simple-pr-review-loop/SKILL.md` or `.codex/skills/deep-pr-review-loop/SKILL.md` directly and follow that workflow.
 
 ## Failure memory
 - Record repeated failures in `docs/FAILURE_MEMORY.md` before changing strategy.
