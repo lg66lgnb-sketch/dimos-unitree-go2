@@ -49,6 +49,11 @@
 - Each subagent must report changed files, checks run, failures, and remaining risks.
 - Merge only after the main worktree passes the relevant checks.
 
+## Repo-local Codex skills
+- This repo vendors Codex skills under `.codex/skills/` so every Codex user gets the same review workflows.
+- Use `$simple-pr-review-loop` for normal PR/branch hardening: review, fix P0/P1/P2 findings, verify, commit, push, and re-review.
+- Use `$deep-pr-review-loop` for adversarial review loops, subagent review lenses, claim/spec validation, test adequacy review, or when a normal review may miss deeper route/state issues.
+
 ## Failure memory
 - Record repeated failures in `docs/FAILURE_MEMORY.md` before changing strategy.
 - Do not retry the same failing approach more than twice without a new fact.
