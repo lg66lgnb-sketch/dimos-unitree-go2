@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 from html import escape
+import json
 from pathlib import Path
 from typing import Any
 
 
-def render_dashboard_html(state: dict[str, Any], report: dict[str, Any]) -> str:
+def render_dashboard_html(
+    state: dict[str, Any],
+    report: dict[str, Any],
+    *,
+    robot_control_token: str | None = None,
+) -> str:
     run = state["run"]
     nav = report.get("nav_summary") or {}
     packages = report.get("packages") or []
@@ -91,6 +97,78 @@ def render_dashboard_html(state: dict[str, Any], report: dict[str, Any]) -> str:
     .severity-P1 {{ color: var(--danger); font-weight: 700; }}
     .timeline {{ display: grid; gap: 8px; }}
     .timeline div {{ border-left: 3px solid var(--accent); padding-left: 10px; }}
+    .robot-controls {{
+      display: grid;
+      grid-template-columns: repeat(3, minmax(72px, 1fr));
+      gap: 8px;
+      max-width: 360px;
+    }}
+    .posture-controls {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 12px;
+    }}
+    .posture-controls button {{
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #f8fafc;
+      color: var(--ink);
+      cursor: pointer;
+      font: inherit;
+      min-height: 38px;
+      padding: 8px 12px;
+    }}
+    .posture-controls button:hover {{ border-color: var(--accent); }}
+    .posture-controls button:disabled {{ cursor: wait; opacity: 0.65; }}
+    .motion-controls {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 12px;
+    }}
+    .motion-controls button {{
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #f8fafc;
+      color: var(--ink);
+      cursor: pointer;
+      font: inherit;
+      min-height: 34px;
+      padding: 6px 10px;
+    }}
+    .motion-controls button[aria-pressed="true"] {{
+      background: #e6f4f1;
+      border-color: var(--accent);
+      color: var(--accent);
+      font-weight: 700;
+    }}
+    .motion-controls button:disabled {{ cursor: wait; opacity: 0.65; }}
+    .robot-controls button {{
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #f8fafc;
+      color: var(--ink);
+      cursor: pointer;
+      font: inherit;
+      min-height: 42px;
+      padding: 8px 10px;
+    }}
+    .robot-controls button:hover {{ border-color: var(--accent); }}
+    .robot-controls button:disabled {{ cursor: wait; opacity: 0.65; }}
+    .robot-controls .hard-stop {{
+      background: var(--danger);
+      border-color: var(--danger);
+      color: #ffffff;
+      font-weight: 700;
+    }}
+    .robot-status {{
+      min-height: 20px;
+      margin-top: 10px;
+      color: var(--muted);
+    }}
+    .robot-status.error {{ color: var(--danger); }}
+    .robot-status.ok {{ color: var(--accent); }}
     @media (max-width: 900px) {{
       header {{ align-items: start; flex-direction: column; }}
       main {{ grid-template-columns: 1fr; padding: 14px; }}
@@ -132,6 +210,31 @@ def render_dashboard_html(state: dict[str, Any], report: dict[str, Any]) -> str:
       <ul>{''.join(f"<li>{escape(str(item))}</li>" for item in what_changed)}</ul>
     </section>
     <section class="wide">
+      <h2>Robot Control</h2>
+      <div class="posture-controls" data-posture-controls>
+        <button type="button" data-posture="wake">Wake / Stand</button>
+        <button type="button" data-posture="balance">Balance</button>
+        <button type="button" data-posture="sleep">Sleep</button>
+      </div>
+      <div class="motion-controls" data-motion-controls>
+        <button type="button" data-motion="nudge" aria-pressed="true">Nudge</button>
+        <button type="button" data-motion="step" aria-pressed="false">Step</button>
+        <button type="button" data-motion="walk" aria-pressed="false">Walk</button>
+      </div>
+      <div class="robot-controls" data-robot-controls>
+        <span></span>
+        <button type="button" data-command="forward">Forward</button>
+        <span></span>
+        <button type="button" data-command="left">Left</button>
+        <button type="button" class="hard-stop" data-command="hard_stop">HARD STOP</button>
+        <button type="button" data-command="right">Right</button>
+        <button type="button" data-command="yaw_left">Yaw L</button>
+        <button type="button" data-command="backward">Back</button>
+        <button type="button" data-command="yaw_right">Yaw R</button>
+      </div>
+      <div class="robot-status" data-robot-status>Idle</div>
+    </section>
+    <section class="wide">
       <h2>Package Reconciliation</h2>
       {package_table(packages)}
     </section>
@@ -155,6 +258,86 @@ def render_dashboard_html(state: dict[str, Any], report: dict[str, Any]) -> str:
       </div>
     </section>
   </main>
+  <script>
+    (() => {{
+      const controls = document.querySelector("[data-robot-controls]");
+      const postureControls = document.querySelector("[data-posture-controls]");
+      const motionControls = document.querySelector("[data-motion-controls]");
+      const status = document.querySelector("[data-robot-status]");
+      if (!controls || !status) return;
+      let motionProfile = "nudge";
+      const robotControlToken = {json.dumps(robot_control_token)};
+      const buttons = Array.from(document.querySelectorAll("[data-command], [data-posture], [data-motion]"));
+      const setBusy = (busy) => buttons.forEach((button) => {{ button.disabled = busy; }});
+      const setStatus = (text, state) => {{
+        status.textContent = text;
+        status.className = `robot-status ${{state || ""}}`;
+      }};
+      const sendRobotAction = async (url, body, successText) => {{
+        setBusy(true);
+        setStatus(`Sending ${{body.command}}...`, "");
+        try {{
+          const headers = {{"Content-Type": "application/json"}};
+          if (robotControlToken) headers["X-DogOps-Control-Token"] = robotControlToken;
+          const response = await fetch(url, {{
+            method: "POST",
+            headers,
+            body: JSON.stringify(body),
+          }});
+          const result = await response.json();
+          if (!response.ok || !result.ok) {{
+            throw new Error(result.error || "command_failed");
+          }}
+          setStatus(successText(result), "ok");
+        }} catch (error) {{
+          setStatus(`Robot command failed: ${{error.message}}`, "error");
+        }} finally {{
+          setBusy(false);
+        }}
+      }};
+      controls.addEventListener("click", async (event) => {{
+        const button = event.target.closest("button[data-command]");
+        if (!button) return;
+        const command = button.getAttribute("data-command");
+        const motionText = (result) => {{
+          if (command === "hard_stop") return "Hard stop sent";
+          if (!result.observed) return `Sent ${{command}}`;
+          const distanceCm = Math.round((result.observed_distance_m || 0) * 1000) / 10;
+          const yawDeg = Math.round(Math.abs(result.observed_dyaw_rad || 0) * 1800 / Math.PI) / 10;
+          if (distanceCm >= 0.5) return `Sent ${{command}} / observed ${{distanceCm}} cm`;
+          if (yawDeg >= 0.5) return `Sent ${{command}} / observed ${{yawDeg}} deg`;
+          return `Sent ${{command}} / no clear odom movement`;
+        }};
+        await sendRobotAction(
+          "/api/robot/jog",
+          {{command, profile: motionProfile}},
+          motionText
+        );
+      }});
+      if (motionControls) {{
+        motionControls.addEventListener("click", (event) => {{
+          const button = event.target.closest("button[data-motion]");
+          if (!button) return;
+          motionProfile = button.getAttribute("data-motion") || "nudge";
+          motionControls.querySelectorAll("[data-motion]").forEach((item) => {{
+            item.setAttribute("aria-pressed", item === button ? "true" : "false");
+          }});
+        }});
+      }}
+      if (postureControls) {{
+        postureControls.addEventListener("click", async (event) => {{
+          const button = event.target.closest("button[data-posture]");
+          if (!button) return;
+          const command = button.getAttribute("data-posture");
+          await sendRobotAction(
+            "/api/robot/posture",
+            {{command}},
+            () => command === "wake" ? "Wake / stand complete" : `Sent ${{command}}`
+          );
+        }});
+      }}
+    }})();
+  </script>
 </body>
 </html>
 """
@@ -230,16 +413,17 @@ def work_order_table(work_orders: list[dict[str, Any]]) -> str:
     )
 
 
-def write_dashboard_html(run_dir: str | Path) -> Path:
+def write_dashboard_html(run_dir: str | Path, *, robot_control_token: str | None = None) -> Path:
     root = Path(run_dir)
     state = _read_json(root / "state.json")
     report = _read_json(root / "report.json")
     html_path = root / "dashboard.html"
-    html_path.write_text(render_dashboard_html(state, report), encoding="utf-8")
+    html_path.write_text(
+        render_dashboard_html(state, report, robot_control_token=robot_control_token),
+        encoding="utf-8",
+    )
     return html_path
 
 
 def _read_json(path: Path) -> dict[str, Any]:
-    import json
-
     return json.loads(path.read_text(encoding="utf-8"))

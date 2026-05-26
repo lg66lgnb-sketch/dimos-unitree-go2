@@ -821,6 +821,17 @@ POST /api/work_orders/{id}/ready_to_verify -> mark ready
 POST /api/operator/event -> record manual/guided event
 ```
 
+If the dashboard exposes direct Go2 manual controls, they must be conservative, measurable, and independent of the dashboard UI shape:
+
+- Use the native Go2 Sport API for manual velocity motions: `SPORT_MOD` / `Move` (`api_id=1008`) followed by `StopMove` (`api_id=1003`).
+- Do not use wireless-controller joystick emulation as the primary dashboard movement path unless a future hardware test proves it is more reliable.
+- Provide motion profiles rather than a single pulse: `Nudge`, `Step`, and `Walk`, with server-side caps for speed and duration.
+- Disable Go2 obstacle avoidance before short linear manual motion in the confined demo arena; keep this scoped to manual movement only.
+- Report odometry feedback after every motion command. A button is not considered validated just because the HTTP request returned.
+- Keep one red hard stop available in the same control group.
+- Protect robot-control POST endpoints with a per-server dashboard token, loopback host/origin checks, and server-side robot IP selection. Browser payloads must not choose arbitrary robot IPs.
+- Cover this underlying capability with tests that assert Sport `Move`, `StopMove`, motion-profile caps, and response status handling, so later dashboard redesigns do not regress basic manual control.
+
 ### 13.2 Dashboard panels
 
 Required panels:

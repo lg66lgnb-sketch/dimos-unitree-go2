@@ -58,13 +58,20 @@ The real Unitree Go2 Air is available. Offline simulation remains the first safe
 |---|---|---|
 | Part 0 — full DimOS preflight | Not started | `uv run dimos list` works; base `unitree-go2` is listed; Go2 network smoke attempted if `GO2_IP` known |
 | Part A — offline core | Not started | simulated mission opens/verifies incidents and writes report |
-| Part B — dashboard | Not started | dashboard shows run state/report/nav metrics |
+| Part B — dashboard | In progress | dashboard shows run state/report/nav metrics; manual Go2 controls use Sport `Move`/`StopMove` and report odometry |
 | Part C — DimOS registry/MCP | Not started | `unitree-go2-dogops` appears in `dimos list`; DogOps MCP tools visible or exact blocker documented |
 | Part D — AprilTag observation | Not started | detector reads generated tags and supports simulated/real image observations |
 | Part E — real-Go2 dry run | Not started | base `unitree-go2` smoke passes; DogOps blueprint starts or documented blocker exists |
 | Part F — demo hardening | Not started | 3 stable local dry runs plus at least one hardware/guided rehearsal |
 | Part G — 90-second video | Not started | video shows closed loop, dashboard, report, and fallback level if any |
 | Part H — stretch | Deferred | dock alignment and portal simulation only after core works |
+
+## Recent Hardware Notes
+
+- Dashboard manual controls were validated against the real Go2 through WebRTC on the local robot network.
+- The reliable basic-control path is native Go2 Sport `Move` (`api_id=1008`) followed by `StopMove` (`api_id=1003`), not wireless-controller joystick emulation.
+- The dashboard now exposes `Nudge`, `Step`, and `Walk` motion profiles and reports observed odometry after each move.
+- Latest measured profile smoke: `Step + Forward` observed about 9 cm; `Walk + Forward` observed about 14 cm. Use odometry output as the feedback signal, not HTTP success alone.
 
 ## Required Acceptance Checklist
 

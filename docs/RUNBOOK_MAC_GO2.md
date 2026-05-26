@@ -121,6 +121,34 @@ uv run dimos stop --force
 
 If navigation is unstable, switch to guided mode and record `guided=true`. If MCP fails but the local product works, use fallback L2/L3 honestly.
 
+## Dashboard Manual Motion Smoke
+
+When using the DogOps dashboard for simple manual control, use the conservative motion profiles and verify movement from odometry, not from button completion alone.
+
+Expected backend behavior:
+
+- movement buttons call the native Go2 Sport `Move` API and then `StopMove`;
+- `HARD STOP` calls `StopMove` and sends zero joystick frames;
+- `Nudge`, `Step`, and `Walk` are server-capped profiles;
+- robot-control POSTs require the dashboard page's per-server token and loopback origin;
+- the server chooses the configured robot IP; browser payloads cannot redirect motion to another host;
+- each completed move reports observed distance or yaw from Go2 odometry.
+
+Safe smoke sequence in a clear 2 m x 2 m or larger space:
+
+```text
+Wake / Stand
+Step + Forward  -> expect non-zero observed cm
+Step + Left     -> expect non-zero observed cm
+Step + Right    -> expect non-zero observed cm
+Step + Back     -> expect non-zero observed cm
+Yaw L / Yaw R   -> expect non-zero observed deg
+HARD STOP
+Sleep
+```
+
+If the UI says only `Sent ...` without observed movement, treat that as unverified and debug odometry/motion before claiming hardware control works.
+
 ## Fallback Levels
 
 | Level | What runs | When to use |
