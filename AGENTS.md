@@ -30,6 +30,7 @@
 - If Codex `gh` auth/API checks fail ambiguously, retry with approved network before declaring auth blocked.
 - Do not switch branches, pull, rebase, reset, stash, or discard local changes unless needed and safe.
 - When creating a task branch, base it on the current remote default branch.
+- Name task branches `<github-login>/<short-task>`, not `codex/...`.
 - Before committing, inspect `git diff` and commit only relevant files.
 - Before pushing, fetch again, verify branch/account, inspect commits for privacy/security issues, get explicit confirmation, and push only the current task branch.
 - Open draft PRs for non-trivial work; include summary, checks run, failures, and risks.
