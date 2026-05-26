@@ -68,6 +68,15 @@ kill "$DASH_PID"
 
 If port `8765` is busy, use another port and record it.
 
+Dashboard manual control has a separate regression contract because the dashboard UI can change while the basic movement capability should persist:
+
+```bash
+uv run pytest -q dimos/experimental/dogops/test_dashboard.py \
+  -k 'robot_motion_session or motion_profile or response_status_code'
+```
+
+These tests must prove the underlying path still uses native Go2 Sport `Move` plus `StopMove`, applies server-side profile caps, and parses Go2 response status codes. They are CI-safe and do not require hardware.
+
 ## Part C: DimOS Registry And MCP
 
 Run this as soon as the blueprint exists:
@@ -113,6 +122,22 @@ uv run dimos stop --force
 ```
 
 If navigation is unsafe, use guided mode and record `guided=true`. If MCP is unavailable, run the CLI/dashboard fallback and collect Go2 movement/tag footage separately.
+
+For the real dashboard manual-control smoke, use the profile controls in order:
+
+```text
+Wake / Stand
+Step + Forward
+Step + Left
+Step + Right
+Step + Back
+Yaw L
+Yaw R
+HARD STOP
+Sleep
+```
+
+Each movement must report observed odometry (`cm` or `deg`). A successful HTTP response without observed odometry is not enough evidence.
 
 ## Commit-Ready Check
 
