@@ -31,7 +31,6 @@
 - When creating a task branch, base it on the current remote default branch.
 - Before committing, inspect `git diff` and commit only relevant files.
 - Before pushing, fetch again, verify branch/account, and push only the current task branch.
-- Use `gh` for PRs, checks, comments, and reviews.
 - Open draft PRs for non-trivial work; include summary, checks run, failures, and risks.
 - Never force-push shared branches. If explicitly needed on your own branch, use `--force-with-lease`.
 - Do not add `Co-Authored-By` unless explicitly requested.
