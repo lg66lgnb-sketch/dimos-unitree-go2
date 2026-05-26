@@ -18,11 +18,17 @@ def _get_json(url: str) -> dict[str, object]:
         return json.loads(response.read().decode("utf-8"))
 
 
-def _post_json(url: str, payload: dict[str, Any]) -> tuple[int, dict[str, object]]:
+def _post_json(
+    url: str,
+    payload: dict[str, Any],
+    *,
+    headers: dict[str, str] | None = None,
+) -> tuple[int, dict[str, object]]:
+    request_headers = {"Content-Type": "application/json", **(headers or {})}
     request = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers=request_headers,
         method="POST",
     )
     try:
@@ -30,6 +36,12 @@ def _post_json(url: str, payload: dict[str, Any]) -> tuple[int, dict[str, object
             return response.status, json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         return exc.status, json.loads(exc.read().decode("utf-8"))
+
+
+def _robot_headers(server) -> dict[str, str]:
+    return {
+        dashboard.ROBOT_CONTROL_TOKEN_HEADER: server.RequestHandlerClass.robot_control_token,
+    }
 
 
 def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
@@ -51,6 +63,7 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert 'data-motion="nudge"' in content
     assert 'data-motion="step"' in content
     assert 'data-motion="walk"' in content
+    assert "X-DogOps-Control-Token" in content
 
 
 def test_dashboard_module_writes_dashboard_and_reports_status(tmp_path) -> None:
@@ -115,6 +128,7 @@ def test_dashboard_robot_jog_sends_low_speed_bounded_pulse(tmp_path, monkeypatch
         status, result = _post_json(
             f"{base_url}/api/robot/jog",
             {"command": "forward", "duration_s": 99},
+            headers=_robot_headers(server),
         )
     finally:
         server.shutdown()
@@ -126,7 +140,6 @@ def test_dashboard_robot_jog_sends_low_speed_bounded_pulse(tmp_path, monkeypatch
     assert result["linear_x"] == 0.15
     assert result["duration_s"] == dashboard.MAX_JOG_DURATION_S
     assert result["profile"] == "nudge"
-    assert result["robot_ip"] == "192.168.12.1"
     assert calls == [(0.15, 0.0, 0.0, dashboard.MAX_JOG_DURATION_S, "192.168.12.1")]
 
 
@@ -154,6 +167,7 @@ def test_dashboard_robot_jog_applies_motion_profile(tmp_path, monkeypatch) -> No
         status, result = _post_json(
             f"{base_url}/api/robot/jog",
             {"command": "forward", "profile": "walk"},
+            headers=_robot_headers(server),
         )
     finally:
         server.shutdown()
@@ -166,6 +180,129 @@ def test_dashboard_robot_jog_applies_motion_profile(tmp_path, monkeypatch) -> No
     assert result["linear_x"] == pytest.approx(0.2025)
     assert result["duration_s"] == 1.2
     assert calls == [(0.2025, 0.0, 0.0, 1.2, "192.168.12.1")]
+
+
+def test_dashboard_robot_jog_ignores_payload_robot_ip(tmp_path, monkeypatch) -> None:
+    calls: list[str] = []
+
+    def fake_publish(
+        linear_x: float,
+        linear_y: float,
+        angular_z: float,
+        duration_s: float,
+        robot_ip: str,
+    ) -> None:
+        calls.append(robot_ip)
+
+    monkeypatch.setattr(dashboard, "_publish_robot_jog", fake_publish)
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        status, result = _post_json(
+            f"{base_url}/api/robot/jog",
+            {"command": "forward", "robot_ip": "10.0.0.99"},
+            headers=_robot_headers(server),
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 200
+    assert result["ok"] is True
+    assert "robot_ip" not in result
+    assert calls == ["192.168.12.1"]
+
+
+def test_dashboard_robot_control_requires_token(tmp_path, monkeypatch) -> None:
+    def fail_publish(*_: object) -> None:
+        raise AssertionError("unauthorized robot control must not publish")
+
+    monkeypatch.setattr(dashboard, "_publish_robot_jog", fail_publish)
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        status, result = _post_json(f"{base_url}/api/robot/jog", {"command": "forward"})
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 403
+    assert result["ok"] is False
+    assert result["error"] == "robot_control_forbidden"
+
+
+def test_dashboard_robot_control_rejects_non_loopback_host(tmp_path, monkeypatch) -> None:
+    def fail_publish(*_: object) -> None:
+        raise AssertionError("non-local robot control must not publish")
+
+    monkeypatch.setattr(dashboard, "_publish_robot_jog", fail_publish)
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        status, result = _post_json(
+            f"{base_url}/api/robot/jog",
+            {"command": "forward"},
+            headers={
+                **_robot_headers(server),
+                "Host": "192.168.1.10:8765",
+            },
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 403
+    assert result["ok"] is False
+    assert result["error"] == "robot_control_local_only"
+
+
+def test_dashboard_robot_control_rejects_cross_origin(tmp_path, monkeypatch) -> None:
+    def fail_publish(*_: object) -> None:
+        raise AssertionError("cross-origin robot control must not publish")
+
+    monkeypatch.setattr(dashboard, "_publish_robot_jog", fail_publish)
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        status, result = _post_json(
+            f"{base_url}/api/robot/jog",
+            {"command": "forward"},
+            headers={
+                **_robot_headers(server),
+                "Origin": "https://example.com",
+            },
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 403
+    assert result["ok"] is False
+    assert result["error"] == "robot_control_bad_origin"
 
 
 def test_motion_profile_falls_back_and_caps_speed() -> None:
@@ -207,7 +344,11 @@ def test_dashboard_robot_hard_stop_uses_hard_stop_publisher(tmp_path, monkeypatc
     base_url = f"http://127.0.0.1:{server.server_address[1]}"
 
     try:
-        status, result = _post_json(f"{base_url}/api/robot/jog", {"command": "hard_stop"})
+        status, result = _post_json(
+            f"{base_url}/api/robot/jog",
+            {"command": "hard_stop"},
+            headers=_robot_headers(server),
+        )
     finally:
         server.shutdown()
         server.server_close()
@@ -233,7 +374,11 @@ def test_dashboard_robot_jog_rejects_unknown_command(tmp_path, monkeypatch) -> N
     base_url = f"http://127.0.0.1:{server.server_address[1]}"
 
     try:
-        status, result = _post_json(f"{base_url}/api/robot/jog", {"command": "sprint"})
+        status, result = _post_json(
+            f"{base_url}/api/robot/jog",
+            {"command": "sprint"},
+            headers=_robot_headers(server),
+        )
     finally:
         server.shutdown()
         server.server_close()
@@ -263,6 +408,7 @@ def test_dashboard_robot_posture_wake_calls_posture_runner(tmp_path, monkeypatch
         status, result = _post_json(
             f"{base_url}/api/robot/posture",
             {"command": "wake", "robot_ip": "192.168.12.1"},
+            headers=_robot_headers(server),
         )
     finally:
         server.shutdown()
@@ -272,6 +418,7 @@ def test_dashboard_robot_posture_wake_calls_posture_runner(tmp_path, monkeypatch
     assert status == 200
     assert result["ok"] is True
     assert result["command"] == "wake"
+    assert "robot_ip" not in result
     assert calls == [("wake", "192.168.12.1")]
 
 
@@ -288,7 +435,11 @@ def test_dashboard_robot_posture_rejects_unknown_command(tmp_path, monkeypatch) 
     base_url = f"http://127.0.0.1:{server.server_address[1]}"
 
     try:
-        status, result = _post_json(f"{base_url}/api/robot/posture", {"command": "dance"})
+        status, result = _post_json(
+            f"{base_url}/api/robot/posture",
+            {"command": "dance"},
+            headers=_robot_headers(server),
+        )
     finally:
         server.shutdown()
         server.server_close()
@@ -343,7 +494,7 @@ def test_robot_motion_session_uses_sport_move_for_linear_jog(monkeypatch) -> Non
 
     result = session.jog(0.15, 0.0, 0.0, 0.0)
 
-    assert obstacle_calls == [False]
+    assert obstacle_calls == [False, True]
     assert sport_calls == ["BalanceStand", "StopMove"]
     assert session.mode == "balance"
     assert move_calls == [(0.15, 0.0, 0.0)]

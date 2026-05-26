@@ -75,7 +75,7 @@ uv run pytest -q dimos/experimental/dogops/test_dashboard.py \
   -k 'robot_motion_session or motion_profile or response_status_code'
 ```
 
-These tests must prove the underlying path still uses native Go2 Sport `Move` plus `StopMove`, applies server-side profile caps, and parses Go2 response status codes. They are CI-safe and do not require hardware.
+These tests must prove the underlying path still uses native Go2 Sport `Move` plus `StopMove`, applies server-side profile caps, parses Go2 response status codes, restores obstacle avoidance after linear movement, and rejects unauthenticated or non-local robot-control requests. They are CI-safe and do not require hardware.
 
 ## Part C: DimOS Registry And MCP
 

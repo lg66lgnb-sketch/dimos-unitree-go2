@@ -829,6 +829,7 @@ If the dashboard exposes direct Go2 manual controls, they must be conservative, 
 - Disable Go2 obstacle avoidance before short linear manual motion in the confined demo arena; keep this scoped to manual movement only.
 - Report odometry feedback after every motion command. A button is not considered validated just because the HTTP request returned.
 - Keep one red hard stop available in the same control group.
+- Protect robot-control POST endpoints with a per-server dashboard token, loopback host/origin checks, and server-side robot IP selection. Browser payloads must not choose arbitrary robot IPs.
 - Cover this underlying capability with tests that assert Sport `Move`, `StopMove`, motion-profile caps, and response status handling, so later dashboard redesigns do not regress basic manual control.
 
 ### 13.2 Dashboard panels

@@ -130,6 +130,8 @@ Expected backend behavior:
 - movement buttons call the native Go2 Sport `Move` API and then `StopMove`;
 - `HARD STOP` calls `StopMove` and sends zero joystick frames;
 - `Nudge`, `Step`, and `Walk` are server-capped profiles;
+- robot-control POSTs require the dashboard page's per-server token and loopback origin;
+- the server chooses the configured robot IP; browser payloads cannot redirect motion to another host;
 - each completed move reports observed distance or yaw from Go2 odometry.
 
 Safe smoke sequence in a clear 2 m x 2 m or larger space:

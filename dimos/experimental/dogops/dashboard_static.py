@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 from html import escape
+import json
 from pathlib import Path
 from typing import Any
 
 
-def render_dashboard_html(state: dict[str, Any], report: dict[str, Any]) -> str:
+def render_dashboard_html(
+    state: dict[str, Any],
+    report: dict[str, Any],
+    *,
+    robot_control_token: str | None = None,
+) -> str:
     run = state["run"]
     nav = report.get("nav_summary") or {}
     packages = report.get("packages") or []
@@ -260,6 +266,7 @@ def render_dashboard_html(state: dict[str, Any], report: dict[str, Any]) -> str:
       const status = document.querySelector("[data-robot-status]");
       if (!controls || !status) return;
       let motionProfile = "nudge";
+      const robotControlToken = {json.dumps(robot_control_token)};
       const buttons = Array.from(document.querySelectorAll("[data-command], [data-posture], [data-motion]"));
       const setBusy = (busy) => buttons.forEach((button) => {{ button.disabled = busy; }});
       const setStatus = (text, state) => {{
@@ -270,9 +277,11 @@ def render_dashboard_html(state: dict[str, Any], report: dict[str, Any]) -> str:
         setBusy(true);
         setStatus(`Sending ${{body.command}}...`, "");
         try {{
+          const headers = {{"Content-Type": "application/json"}};
+          if (robotControlToken) headers["X-DogOps-Control-Token"] = robotControlToken;
           const response = await fetch(url, {{
             method: "POST",
-            headers: {{"Content-Type": "application/json"}},
+            headers,
             body: JSON.stringify(body),
           }});
           const result = await response.json();
@@ -404,16 +413,17 @@ def work_order_table(work_orders: list[dict[str, Any]]) -> str:
     )
 
 
-def write_dashboard_html(run_dir: str | Path) -> Path:
+def write_dashboard_html(run_dir: str | Path, *, robot_control_token: str | None = None) -> Path:
     root = Path(run_dir)
     state = _read_json(root / "state.json")
     report = _read_json(root / "report.json")
     html_path = root / "dashboard.html"
-    html_path.write_text(render_dashboard_html(state, report), encoding="utf-8")
+    html_path.write_text(
+        render_dashboard_html(state, report, robot_control_token=robot_control_token),
+        encoding="utf-8",
+    )
     return html_path
 
 
 def _read_json(path: Path) -> dict[str, Any]:
-    import json
-
     return json.loads(path.read_text(encoding="utf-8"))

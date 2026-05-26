@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import TimeoutError as FutureTimeoutError
+import ipaddress
 import json
 import math
 import os
+import secrets
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -52,6 +54,7 @@ ROBOT_JOG_COMMANDS: dict[str, tuple[float, float, float]] = {
 }
 HARD_STOP_COMMANDS = {"hard_stop", "stop"}
 ROBOT_POSTURE_COMMANDS = {"wake", "balance", "sleep"}
+ROBOT_CONTROL_TOKEN_HEADER = "X-DogOps-Control-Token"
 DEFAULT_ROBOT_IP = (
     os.environ.get("DOGOPS_ROBOT_IP")
     or os.environ.get("GO2_IP")
@@ -64,10 +67,14 @@ _ROBOT_SESSIONS_LOCK = threading.Lock()
 
 def make_dashboard_server(run_dir: str | Path, host: str, port: int) -> ThreadingHTTPServer:
     root = Path(run_dir)
-    write_dashboard_html(root)
+    robot_control_token = secrets.token_urlsafe(32)
+    write_dashboard_html(root, robot_control_token=robot_control_token)
+    token = robot_control_token
 
     class Handler(DogOpsDashboardHandler):
         run_dir = root
+        robot_control_token = token
+        robot_ip = DEFAULT_ROBOT_IP
 
     return ThreadingHTTPServer((host, port), Handler)
 
@@ -113,6 +120,8 @@ class DogOpsDashboardModule(Module):
 
 class DogOpsDashboardHandler(BaseHTTPRequestHandler):
     run_dir: Path
+    robot_control_token: str
+    robot_ip: str
 
     def do_GET(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
@@ -136,9 +145,11 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/operator/event":
             self._record_operator_event()
         elif path == "/api/robot/jog":
-            self._robot_jog()
+            if self._authorize_robot_control():
+                self._robot_jog()
         elif path == "/api/robot/posture":
-            self._robot_posture()
+            if self._authorize_robot_control():
+                self._robot_posture()
         else:
             self._send_json({"error": "not_found", "path": path}, HTTPStatus.NOT_FOUND)
 
@@ -180,7 +191,7 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
             )
             return
 
-        robot_ip = str(payload.get("robot_ip") or DEFAULT_ROBOT_IP)
+        robot_ip = self.robot_ip
 
         try:
             linear_x, linear_y, angular_z, duration_s, profile = _resolve_motion_request(
@@ -223,7 +234,6 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
                 "linear_x": linear_x,
                 "linear_y": linear_y,
                 "angular_z": angular_z,
-                "robot_ip": robot_ip,
                 "profile": profile,
                 **(motion_result or {}),
             }
@@ -239,7 +249,7 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
             )
             return
 
-        robot_ip = str(payload.get("robot_ip") or DEFAULT_ROBOT_IP)
+        robot_ip = self.robot_ip
         try:
             ok = _run_robot_call(lambda: _run_robot_posture(command, robot_ip))
         except ModuleNotFoundError as exc:
@@ -265,7 +275,26 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
             )
             return
 
-        self._send_json({"ok": bool(ok), "command": command, "robot_ip": robot_ip})
+        self._send_json({"ok": bool(ok), "command": command})
+
+    def _authorize_robot_control(self) -> bool:
+        host = self.headers.get("Host", "")
+        if not _is_loopback_host(_host_name(host)):
+            self._send_json({"ok": False, "error": "robot_control_local_only"}, HTTPStatus.FORBIDDEN)
+            return False
+
+        origin = self.headers.get("Origin")
+        if origin and not _origin_matches_host(origin, host):
+            self._send_json({"ok": False, "error": "robot_control_bad_origin"}, HTTPStatus.FORBIDDEN)
+            return False
+
+        expected = self.robot_control_token
+        provided = self.headers.get(ROBOT_CONTROL_TOKEN_HEADER, "")
+        if not secrets.compare_digest(provided, expected):
+            self._send_json({"ok": False, "error": "robot_control_forbidden"}, HTTPStatus.FORBIDDEN)
+            return False
+
+        return True
 
     def _send_file(self, path: Path, content_type: str) -> None:
         if not path.exists():
@@ -339,6 +368,43 @@ def _resolve_motion_request(
 
 def _cap(value: float, limit: float) -> float:
     return max(-limit, min(value, limit))
+
+
+def _host_parts(host_header: str) -> tuple[str, int | None]:
+    try:
+        parsed = urlparse(f"//{host_header.strip()}")
+        return (parsed.hostname or "").lower(), parsed.port
+    except ValueError:
+        return "", None
+
+
+def _host_name(host_header: str) -> str:
+    return _host_parts(host_header)[0]
+
+
+def _is_loopback_host(hostname: str) -> bool:
+    if hostname == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
+
+
+def _origin_matches_host(origin: str, host_header: str) -> bool:
+    try:
+        parsed_origin = urlparse(origin)
+        origin_host = (parsed_origin.hostname or "").lower()
+        origin_port = parsed_origin.port
+    except ValueError:
+        return False
+
+    request_host, request_port = _host_parts(host_header)
+    if parsed_origin.scheme not in {"http", "https"}:
+        return False
+    if not _is_loopback_host(origin_host):
+        return False
+    return origin_host == request_host and origin_port == request_port
 
 
 def _publish_robot_jog(
@@ -427,13 +493,18 @@ class _RobotMotionSession:
         duration_s: float,
     ) -> dict[str, Any]:
         with self.lock:
-            self._ensure_motion_ready(disable_obstacles=bool(linear_x or linear_y))
-            before = self._wait_pose()
-            self._sport_move(linear_x, linear_y, angular_z)
-            time.sleep(duration_s)
-            self.hard_stop()
-            after = self._wait_pose()
-            return _pose_delta(before, after)
+            restore_obstacles = bool(linear_x or linear_y)
+            try:
+                self._ensure_motion_ready(disable_obstacles=restore_obstacles)
+                before = self._wait_pose()
+                self._sport_move(linear_x, linear_y, angular_z)
+                time.sleep(duration_s)
+                self.hard_stop()
+                after = self._wait_pose()
+                return _pose_delta(before, after)
+            finally:
+                if restore_obstacles:
+                    self.connection.set_obstacle_avoidance(True)
 
     def hard_stop(self) -> None:
         with self.lock:
