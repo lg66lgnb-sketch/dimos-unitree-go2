@@ -1,8 +1,35 @@
 # DogOps SiteOps Agent
 
-DogOps is a DimOS application for running a Unitree Go2 as a physical SiteOps agent. The dashboard combines the DogOps semantic facility view with live DimOS navigation data from the dog: costmap heatmap, odom robot pose, planned path, and target overlays on the same map.
+DogOps turns a Unitree Go2 running on DimOS into a physical SiteOps agent for spaces where software alerts cannot see the real world: warehouses, lab rooms, data-center rows, maker spaces, construction offices, and industrial floors.
+
+The current dashboard combines the DogOps semantic facility view with live DimOS navigation data from the dog: costmap heatmap, odom robot pose, planned path, and target overlays on the same map.
 
 The dashboard does not require Rerun to render these top-map layers. Rerun remains optional as a separate DimOS viewer, while the DogOps map consumes the underlying DimOS messages directly.
+
+## Product Direction
+
+The full DogOps loop is a physical SiteOps workflow: the robot receives a site policy and receiving manifest, maps the demo facility, follows an inspection route, scans AprilTag-labeled packages and assets, reconciles physical state against expected state, opens spatial work orders for exceptions, revisits after human remediation, and produces a dashboard report with package status, incident history, evidence, and navigation metrics.
+
+DogOps is designed to run without cloud API keys or an LLM. The core workflow is deterministic and MCP-callable; Gemini/OpenAI/VLM analysis is optional, server-side, and limited to narration or extra image analysis around the same base product loop.
+
+## Demo Loop
+
+This is the target loop for the product demo and the direction for future hardening:
+
+```text
+site policy + receiving manifest
+-> autonomous route through a staged facility
+-> DimOS-backed map with DogOps semantic overlays
+-> AprilTag package/asset inspection
+-> manifest reconciliation
+-> physical hazard and work-order creation
+-> human remediation request
+-> robot revisits the same location
+-> closure verification
+-> dashboard + report + navigation metrics
+```
+
+In the default demo scenario, `PKG-104` is placed in the wrong zone and blocks `COOLING_1`. DogOps detects both the logistics exception and the facility hazard, opens `INC-001` / `WO-001`, waits for the package to move to `QA_HOLD`, revisits `COOLING_1`, verifies the fix, and leaves `PKG-103` as the intentional missing-package exception.
 
 ## Architecture
 
@@ -23,6 +50,8 @@ The top map keeps semantic/click projection separate from live overlay projectio
 
 ## Features
 
+Current live map and dashboard capabilities:
+
 - Same-map heatmap layer from DimOS `OccupancyGrid` costmap data.
 - Robot pose layer from live Go2 odom.
 - Path, route, clicked-point, and planner target overlays from DimOS navigation topics.
@@ -33,6 +62,19 @@ The top map keeps semantic/click projection separate from live overlay projectio
 - Robot Control panel with conservative posture and motion commands.
 - Dashboard shutdown closes DogOps-owned Go2 WebRTC sessions so direct Robot Control does not keep stealing the mapping stream.
 - DogOps worker modules tolerate full DimOS runtime injection and expose docstrings for MCP skill discovery.
+
+Broader SiteOps capabilities already present or being built toward:
+
+- Site and manifest modeling for zones, packages, assets, policies, incidents, work orders, and navigation events.
+- DimOS-backed mapping and route overlays using `global_costmap`, planner `path`, and `odom` streams.
+- Operator route planning with waypoints and points of interest for photos or readings.
+- AprilTag 36h11 package, zone, and asset identity.
+- Deterministic mission engine for receiving, inspection, remediation, verification, and final reporting.
+- Dashboard views for map, route, packages, incidents, work orders, POI evidence, readings, and navigation metrics.
+- MCP skills for running missions, scanning zones, verifying work orders, mapping open space, executing route plans, and reporting navigation/POI results.
+- Real-Go2 path with conservative motion, explicit stop commands, and honest recording of retries, guided interventions, and safety stops.
+
+DogOps does not implement its own SLAM stack. It uses the existing DimOS Go2 map/navigation pipeline and adds the SiteOps product layer on top: semantic zones, policy state, package placement, incident evidence, route progress, and run reports. Rerun remains useful for raw robot telemetry; the DogOps dashboard is the operator-facing workflow.
 
 ## Repository Layout
 
@@ -137,4 +179,3 @@ Local hardware smoke during development confirmed:
 - `/api/map` received `odom=True` and `global_costmap=True`.
 - Live costmap payload reported `48 x 32` with `1536` cells.
 - Top-map layers reported `heatmap=True` and `robot=True`.
-
