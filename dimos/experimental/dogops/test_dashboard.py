@@ -95,9 +95,15 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert 'data-rerun-frame' not in content
     assert 'data-rerun-web-link' in content
     assert 'data-map-command-status' in content
+    assert 'data-map-action="map_from_scratch"' in content
+    assert 'data-map-action="return_home"' in content
+    assert 'data-map-action="arm_poi"' in content
+    assert 'data-map-action="run_poi_route"' in content
     assert 'data-map-action="arm_go_to"' in content
     assert 'data-go-to-marker' in content
     assert "/api/robot/go_to" in content
+    assert "/api/route/poi" in content
+    assert "/api/route/pois/run" in content
     assert "worldFromSvgEvent" in content
     assert "map-zone no-go" not in content
     assert "OBS-003" in content
@@ -934,6 +940,171 @@ def test_dashboard_robot_go_to_rejects_bad_target(tmp_path, monkeypatch) -> None
     assert status == 400
     assert result["ok"] is False
     assert result["error"] == "invalid_go_to_target"
+
+
+def test_dashboard_robot_map_from_scratch_starts_exploration(tmp_path, monkeypatch) -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    monkeypatch.setattr(
+        dashboard,
+        "_start_robot_map",
+        lambda robot_ip: {"connected": True, "robot_ip": robot_ip},
+    )
+    monkeypatch.setattr(dashboard, "_reset_robot_map_origin", lambda robot_ip: True)
+
+    def fake_mcp(skill_name: str, args: dict[str, object]) -> dict[str, object]:
+        calls.append((skill_name, args))
+        return {"transport": "dimos_mcp", "skill": skill_name}
+
+    monkeypatch.setattr(dashboard, "_call_dimos_mcp_skill", fake_mcp)
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        status, result = _post_json(
+            f"{base_url}/api/robot/map_from_scratch",
+            {"command": "map_from_scratch"},
+            headers=_robot_headers(server),
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 200
+    assert result["ok"] is True
+    assert result["command"] == "map_from_scratch"
+    assert result["origin_set"] is True
+    assert calls == [("begin_exploration", {})]
+
+
+def test_dashboard_robot_return_home_uses_home_pose(tmp_path, monkeypatch) -> None:
+    calls: list[tuple[float, float]] = []
+
+    def fake_go_to(x: float, y: float) -> dict[str, object]:
+        calls.append((x, y))
+        return {"transport": "dimos_mcp", "skill": "go_to"}
+
+    monkeypatch.setattr(dashboard, "_run_robot_go_to", fake_go_to)
+    run_dir = tmp_path / "latest"
+    state = run_offline_simulation(out=run_dir)
+    home = next(zone for zone in state.site.zones if zone.id == "HOME")
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        status, result = _post_json(
+            f"{base_url}/api/robot/return_home",
+            {"command": "return_home"},
+            headers=_robot_headers(server),
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 200
+    assert result["ok"] is True
+    assert result["target_id"] == "HOME"
+    assert calls == [(home.pose_hint.x, home.pose_hint.y)]
+
+
+def test_dashboard_route_poi_add_clear_and_map_projection(tmp_path) -> None:
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        status, result = _post_json(
+            f"{base_url}/api/route/poi",
+            {"command": "add_poi", "x": 1.5, "y": -0.25},
+            headers=_robot_headers(server),
+        )
+        map_data = _get_json(f"{base_url}/api/map")
+        poi_data = _get_json(f"{base_url}/api/poi")
+        clear_status, clear_result = _post_json(
+            f"{base_url}/api/route/poi/clear",
+            {"command": "clear_pois"},
+            headers=_robot_headers(server),
+        )
+        cleared = _get_json(f"{base_url}/api/poi")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 200
+    assert result["ok"] is True
+    assert result["poi"]["id"] == "POI-001"  # type: ignore[index]
+    assert map_data["operator_pois"][0]["x"] == 1.5  # type: ignore[index]
+    assert poi_data["operator_pois"][0]["id"] == "POI-001"  # type: ignore[index]
+    assert clear_status == 200
+    assert clear_result["ok"] is True
+    assert cleared["operator_pois"] == []
+
+
+def test_dashboard_route_pois_run_captures_images_and_returns_home(tmp_path, monkeypatch) -> None:
+    go_to_calls: list[tuple[float, float]] = []
+    mcp_calls: list[tuple[str, dict[str, object]]] = []
+
+    def fake_go_to(x: float, y: float) -> dict[str, object]:
+        go_to_calls.append((x, y))
+        return {"transport": "dimos_mcp", "skill": "go_to"}
+
+    def fake_mcp(skill_name: str, args: dict[str, object]) -> dict[str, object]:
+        mcp_calls.append((skill_name, args))
+        return {"transport": "dimos_mcp", "skill": skill_name}
+
+    monkeypatch.setattr(dashboard, "_run_robot_go_to", fake_go_to)
+    monkeypatch.setattr(dashboard, "_call_dimos_mcp_skill", fake_mcp)
+    run_dir = tmp_path / "latest"
+    state = run_offline_simulation(out=run_dir)
+    home = next(zone for zone in state.site.zones if zone.id == "HOME")
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        _post_json(
+            f"{base_url}/api/route/poi",
+            {"command": "add_poi", "x": 1.5, "y": -0.25},
+            headers=_robot_headers(server),
+        )
+        status, result = _post_json(
+            f"{base_url}/api/route/pois/run",
+            {"command": "run_poi_route", "arrival_timeout_s": 0},
+            headers=_robot_headers(server),
+        )
+        poi_data = _get_json(f"{base_url}/api/poi")
+        image_path = poi_data["poi_captures"][0]["image_path"]  # type: ignore[index]
+        with urllib.request.urlopen(f"{base_url}/{image_path}", timeout=5) as response:
+            image_payload = response.read().decode("utf-8")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 200
+    assert result["ok"] is True
+    assert len(result["captures"]) == 1
+    assert go_to_calls == [(1.5, -0.25), (home.pose_hint.x, home.pose_hint.y)]
+    assert mcp_calls == [("observe", {})]
+    assert poi_data["poi_captures"][0]["poi_id"] == "POI-001"  # type: ignore[index]
+    assert any(
+        capture["source"] == "robot_poi_capture"
+        for capture in poi_data["captures"]  # type: ignore[index]
+    )
+    assert "Robot observe image placeholder" in image_payload
 
 
 def test_dimos_mcp_call_command_prefers_configured_prefix(monkeypatch) -> None:

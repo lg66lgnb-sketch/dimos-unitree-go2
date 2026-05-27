@@ -26,6 +26,14 @@ from dimos.experimental.dogops.dashboard_static import (
     write_dashboard_html,
 )
 from dimos.experimental.dogops.live_map import DogOpsLiveMapAdapter
+from dimos.experimental.dogops.models import (
+    NavAction,
+    NavEvent,
+    Observation,
+    OperatorPointOfInterest,
+    PoiCapture,
+    Pose2D,
+)
 from dimos.experimental.dogops.store import DogOpsStore
 
 try:  # pragma: no cover - exercised only inside a full DimOS checkout.
@@ -42,6 +50,9 @@ DEFAULT_JOG_DURATION_S = 0.35
 MAX_JOG_DURATION_S = 2.00
 MAX_LINEAR_SPEED = 0.65
 MAX_ANGULAR_SPEED = 1.10
+POI_ROUTE_DEFAULT_TIMEOUT_S = 45.0
+POI_ROUTE_MAX_TIMEOUT_S = 120.0
+POI_ROUTE_DEFAULT_TOLERANCE_M = 0.45
 ROBOT_CALL_TIMEOUT_S = 8.0
 DIMOS_MCP_CALL_TIMEOUT_S = 12.0
 WEBRTC_COMMAND_TIMEOUT_S = 2.0
@@ -175,6 +186,13 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
             else:
                 asset_path, content_type = asset
                 self._send_file(asset_path, content_type)
+        elif path.startswith("/evidence/"):
+            evidence = self._resolve_evidence_file(path)
+            if evidence is None:
+                self._send_json({"error": "evidence_not_found", "path": path}, HTTPStatus.NOT_FOUND)
+            else:
+                evidence_path, content_type = evidence
+                self._send_file(evidence_path, content_type)
         elif path == "/api/state":
             self._send_file(self.run_dir / "state.json", "application/json")
         elif path == "/api/report":
@@ -219,9 +237,27 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/robot/map_start":
             if self._authorize_robot_control():
                 self._robot_map_start()
+        elif path == "/api/robot/map_from_scratch":
+            if self._authorize_robot_control():
+                self._robot_map_from_scratch()
+        elif path == "/api/robot/stop_mapping":
+            if self._authorize_robot_control():
+                self._robot_stop_mapping()
         elif path == "/api/robot/map_origin":
             if self._authorize_robot_control():
                 self._robot_map_origin()
+        elif path == "/api/robot/return_home":
+            if self._authorize_robot_control():
+                self._robot_return_home()
+        elif path == "/api/route/poi":
+            if self._authorize_robot_control():
+                self._route_poi_add()
+        elif path == "/api/route/poi/clear":
+            if self._authorize_robot_control():
+                self._route_poi_clear()
+        elif path == "/api/route/pois/run":
+            if self._authorize_robot_control():
+                self._route_pois_run()
         else:
             self._send_json({"error": "not_found", "path": path}, HTTPStatus.NOT_FOUND)
 
@@ -426,6 +462,74 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
 
         self._send_json({"ok": True, "command": "map_start", **result})
 
+    def _robot_map_from_scratch(self) -> None:
+        robot_ip = self.robot_ip
+        try:
+            pose_result = _run_robot_call(lambda: _start_robot_map(robot_ip))
+            origin_set = _reset_robot_map_origin(robot_ip)
+            exploration = _run_robot_call(lambda: _call_dimos_mcp_skill("begin_exploration", {}))
+        except ModuleNotFoundError as exc:
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": "dimos_mapping_unavailable",
+                    "message": str(exc),
+                },
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            return
+        except TimeoutError as exc:
+            self._send_json(
+                {"ok": False, "error": "map_from_scratch_timeout", "message": str(exc)},
+                HTTPStatus.GATEWAY_TIMEOUT,
+            )
+            return
+        except Exception as exc:
+            self._send_json(
+                {"ok": False, "error": "map_from_scratch_failed", "message": str(exc)},
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            return
+
+        self._send_json(
+            {
+                "ok": True,
+                "command": "map_from_scratch",
+                "origin_set": bool(origin_set),
+                "safety": "DimOS exploration and navigation stack",
+                "pose": pose_result,
+                **(exploration or {}),
+            }
+        )
+
+    def _robot_stop_mapping(self) -> None:
+        try:
+            result = _run_robot_call(lambda: _call_dimos_mcp_skill("end_exploration", {}))
+        except ModuleNotFoundError as exc:
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": "dimos_mapping_unavailable",
+                    "message": str(exc),
+                },
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            return
+        except TimeoutError as exc:
+            self._send_json(
+                {"ok": False, "error": "stop_mapping_timeout", "message": str(exc)},
+                HTTPStatus.GATEWAY_TIMEOUT,
+            )
+            return
+        except Exception as exc:
+            self._send_json(
+                {"ok": False, "error": "stop_mapping_failed", "message": str(exc)},
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            return
+
+        self._send_json({"ok": True, "command": "stop_mapping", **(result or {})})
+
     def _robot_map_origin(self) -> None:
         robot_ip = self.robot_ip
         try:
@@ -444,6 +548,176 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
             return
 
         self._send_json({"ok": bool(result), "command": "map_origin"})
+
+    def _robot_return_home(self) -> None:
+        try:
+            home = _home_target(DogOpsStore.load_existing(self.run_dir).state)
+            result = _run_robot_call(lambda: _run_robot_go_to(home["x"], home["y"]))
+        except ModuleNotFoundError as exc:
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": "dimos_mcp_unavailable",
+                    "message": str(exc),
+                },
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            return
+        except TimeoutError as exc:
+            self._send_json(
+                {"ok": False, "error": "return_home_timeout", "message": str(exc)},
+                HTTPStatus.GATEWAY_TIMEOUT,
+            )
+            return
+        except Exception as exc:
+            self._send_json(
+                {"ok": False, "error": "return_home_failed", "message": str(exc)},
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            return
+
+        self._send_json(
+            {
+                "ok": True,
+                "command": "return_home",
+                "target_id": home["target_id"],
+                "x": home["x"],
+                "y": home["y"],
+                **(result or {}),
+            }
+        )
+
+    def _route_poi_add(self) -> None:
+        payload = self._read_body_json()
+        try:
+            x, y = _go_to_target(payload)
+        except ValueError as exc:
+            self._send_json(
+                {"ok": False, "error": "invalid_poi_target", "message": str(exc)},
+                HTTPStatus.BAD_REQUEST,
+            )
+            return
+
+        store = DogOpsStore.load_existing(self.run_dir)
+        state = store.state
+        assert state is not None
+        poi = OperatorPointOfInterest(
+            id=_next_poi_id(state.operator_pois),
+            label=str(payload.get("label") or f"POI {len(state.operator_pois) + 1}"),
+            x=x,
+            y=y,
+            created_at=time.time(),
+        )
+        state.operator_pois.append(poi)
+        _write_dashboard_state(store, self.robot_control_token)
+        self._send_json({"ok": True, "command": "add_poi", "poi": poi.model_dump(mode="json")})
+
+    def _route_poi_clear(self) -> None:
+        store = DogOpsStore.load_existing(self.run_dir)
+        state = store.state
+        assert state is not None
+        state.operator_pois.clear()
+        state.poi_captures.clear()
+        _write_dashboard_state(store, self.robot_control_token)
+        self._send_json({"ok": True, "command": "clear_pois"})
+
+    def _route_pois_run(self) -> None:
+        payload = self._read_body_json()
+        store = DogOpsStore.load_existing(self.run_dir)
+        state = store.state
+        assert state is not None
+        timeout_s = _bounded_float(
+            payload.get("arrival_timeout_s"),
+            default=POI_ROUTE_DEFAULT_TIMEOUT_S,
+            minimum=0.0,
+            maximum=POI_ROUTE_MAX_TIMEOUT_S,
+        )
+        tolerance_m = _bounded_float(
+            payload.get("arrival_tolerance_m"),
+            default=POI_ROUTE_DEFAULT_TOLERANCE_M,
+            minimum=0.1,
+            maximum=2.0,
+        )
+        captures: list[dict[str, Any]] = []
+
+        try:
+            for index, poi in enumerate(state.operator_pois, 1):
+                started = time.time()
+                move_result = _run_robot_call(lambda poi=poi: _run_robot_go_to(poi.x, poi.y))
+                arrived = _wait_for_robot_near(poi.x, poi.y, timeout_s, tolerance_m)
+                capture = _capture_poi(store, poi, index, arrived=arrived)
+                captures.append(
+                    {
+                        "poi": poi.model_dump(mode="json"),
+                        "capture": capture.model_dump(mode="json"),
+                        "move": move_result,
+                        "arrived": arrived,
+                    }
+                )
+                state.nav_events.append(
+                    NavEvent(
+                        id=f"NAV-POI-{index:03d}",
+                        run_id=state.run.id,
+                        ts=started,
+                        action=NavAction.goto,
+                        target_id=poi.id,
+                        success=arrived,
+                        elapsed_s=max(0.0, time.time() - started),
+                        note="operator POI capture route",
+                    )
+                )
+                poi.status = "captured" if arrived else "captured_no_arrival_confirmed"
+
+            home = _home_target(state)
+            return_home = _run_robot_call(lambda: _run_robot_go_to(home["x"], home["y"]))
+        except ModuleNotFoundError as exc:
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": "dimos_mcp_unavailable",
+                    "message": str(exc),
+                    "captures": captures,
+                },
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            return
+        except TimeoutError as exc:
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": "poi_route_timeout",
+                    "message": str(exc),
+                    "captures": captures,
+                },
+                HTTPStatus.GATEWAY_TIMEOUT,
+            )
+            return
+        except Exception as exc:
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": "poi_route_failed",
+                    "message": str(exc),
+                    "captures": captures,
+                },
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            return
+
+        _write_dashboard_state(store, self.robot_control_token)
+        self._send_json(
+            {
+                "ok": True,
+                "command": "run_poi_route",
+                "captures": captures,
+                "return_home": {
+                    "target_id": home["target_id"],
+                    "x": home["x"],
+                    "y": home["y"],
+                    **(return_home or {}),
+                },
+            }
+        )
 
     def _authorize_local_read(self) -> bool:
         host = self.headers.get("Host", "")
@@ -499,6 +773,181 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
             return {}
         raw = self.rfile.read(length)
         return json.loads(raw.decode("utf-8"))
+
+    def _resolve_evidence_file(self, path: str) -> tuple[Path, str] | None:
+        relative = path.removeprefix("/evidence/")
+        if not relative or relative.startswith(("/", ".")) or ".." in Path(relative).parts:
+            return None
+        evidence_root = (self.run_dir / "evidence").resolve()
+        candidate = (evidence_root / relative).resolve()
+        if evidence_root not in {candidate, *candidate.parents} or not candidate.exists():
+            return None
+        return candidate, _content_type(candidate)
+
+
+def _write_dashboard_state(store: DogOpsStore, robot_control_token: str | None) -> None:
+    state = store.state
+    if state is None:
+        raise RuntimeError("DogOps run has no loaded state")
+    store.write_state(state.run.id)
+    store.write_report(state.run.id)
+    write_dashboard_html(store.root, robot_control_token=robot_control_token)
+
+
+def _next_poi_id(existing: list[OperatorPointOfInterest]) -> str:
+    used = {poi.id for poi in existing}
+    index = len(existing) + 1
+    while True:
+        candidate = f"POI-{index:03d}"
+        if candidate not in used:
+            return candidate
+        index += 1
+
+
+def _home_target(state: Any) -> dict[str, Any]:
+    site = getattr(state, "site", None)
+    zones = getattr(site, "zones", []) if site is not None else []
+    for zone in zones:
+        if getattr(zone, "id", "") == "HOME" or str(getattr(zone, "zone_kind", "")) == "home":
+            pose = getattr(zone, "pose_hint", None)
+            if pose is not None and pose.x is not None and pose.y is not None:
+                return {"target_id": getattr(zone, "id", "HOME"), "x": float(pose.x), "y": float(pose.y)}
+    return {"target_id": "HOME", "x": 0.0, "y": 0.0}
+
+
+def _bounded_float(value: Any, *, default: float, minimum: float, maximum: float) -> float:
+    try:
+        resolved = float(value)
+    except (TypeError, ValueError):
+        resolved = default
+    if not math.isfinite(resolved):
+        resolved = default
+    return max(minimum, min(resolved, maximum))
+
+
+def _wait_for_robot_near(x: float, y: float, timeout_s: float, tolerance_m: float) -> bool:
+    deadline = time.time() + timeout_s
+    while True:
+        pose = _latest_robot_map_pose()
+        if pose is not None and math.hypot(pose["x"] - x, pose["y"] - y) <= tolerance_m:
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.2)
+
+
+def _latest_robot_map_pose() -> dict[str, float] | None:
+    live = _LIVE_MAP_ADAPTER.snapshot()
+    if isinstance(live, dict):
+        pose = live.get("robot_pose")
+        if isinstance(pose, dict):
+            try:
+                return {"x": float(pose["x"]), "y": float(pose["y"])}
+            except (KeyError, TypeError, ValueError):
+                pass
+    with _ROBOT_SESSIONS_LOCK:
+        sessions = list(_ROBOT_SESSIONS.values())
+    for session in sessions:
+        snapshot = session.pose_snapshot()
+        pose = snapshot.get("pose") if isinstance(snapshot, dict) else None
+        if isinstance(pose, dict):
+            try:
+                return {"x": float(pose["x"]), "y": float(pose["y"])}
+            except (KeyError, TypeError, ValueError):
+                continue
+    return None
+
+
+def _capture_poi(
+    store: DogOpsStore,
+    poi: OperatorPointOfInterest,
+    index: int,
+    *,
+    arrived: bool,
+) -> PoiCapture:
+    state = store.state
+    if state is None:
+        raise RuntimeError("DogOps run has no loaded state")
+    note = "arrived" if arrived else "arrival not confirmed before capture"
+    observe_result: dict[str, Any] | None = None
+    try:
+        observe_result = _call_dimos_mcp_skill("observe", {})
+    except Exception as exc:
+        note = f"{note}; observe unavailable: {exc}"
+
+    image_path = _image_path_from_observe_result(observe_result)
+    if image_path is None:
+        image_path = _write_poi_placeholder(store.root, poi, index, note)
+
+    capture = PoiCapture(
+        id=f"CAP-POI-{index:03d}",
+        poi_id=poi.id,
+        ts=time.time(),
+        x=poi.x,
+        y=poi.y,
+        image_path=image_path,
+        note=note,
+    )
+    state.poi_captures.append(capture)
+    state.observations.append(
+        Observation(
+            id=f"OBS-POI-{index:03d}",
+            ts=capture.ts,
+            run_id=state.run.id,
+            entity_id=poi.id,
+            pose=Pose2D(x=poi.x, y=poi.y, frame=poi.frame_id, source="operator_poi"),
+            image_path=image_path,
+            facts={"operator_poi": poi.id, "arrival_confirmed": arrived},
+            source="robot_poi_capture",
+        )
+    )
+    return capture
+
+
+def _image_path_from_observe_result(result: dict[str, Any] | None) -> str | None:
+    if not isinstance(result, dict):
+        return None
+    candidates = [result, result.get("mcp_result")] if isinstance(result.get("mcp_result"), dict) else [result]
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        for key in ("image_path", "path", "file", "evidence_path"):
+            value = candidate.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return None
+
+
+def _write_poi_placeholder(root: Path, poi: OperatorPointOfInterest, index: int, note: str) -> str:
+    evidence_dir = root / "evidence"
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"poi-{index:03d}.svg"
+    safe_label = poi.label.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    safe_note = note.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    payload = f"""<svg xmlns="http://www.w3.org/2000/svg" width="720" height="405" viewBox="0 0 720 405">
+  <rect width="720" height="405" fill="#071016"/>
+  <rect x="34" y="34" width="652" height="337" fill="#0d1720" stroke="#52e0c4" stroke-width="2"/>
+  <text x="56" y="92" fill="#e5edf5" font-family="Arial, sans-serif" font-size="32" font-weight="700">{safe_label}</text>
+  <text x="56" y="142" fill="#a9b4c4" font-family="Arial, sans-serif" font-size="22">x={poi.x:.2f}m y={poi.y:.2f}m</text>
+  <text x="56" y="190" fill="#facc15" font-family="Arial, sans-serif" font-size="20">{safe_note}</text>
+  <text x="56" y="320" fill="#64748b" font-family="Arial, sans-serif" font-size="18">Robot observe image placeholder</text>
+</svg>
+"""
+    (evidence_dir / filename).write_text(payload, encoding="utf-8")
+    return f"evidence/{filename}"
+
+
+def _content_type(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix == ".svg":
+        return "image/svg+xml; charset=utf-8"
+    if suffix == ".png":
+        return "image/png"
+    if suffix in {".jpg", ".jpeg"}:
+        return "image/jpeg"
+    if suffix == ".json":
+        return "application/json"
+    return "application/octet-stream"
 
 
 def _run_robot_call(fn: Any) -> Any:

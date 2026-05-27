@@ -179,6 +179,23 @@ def build_map_data(
             }
         )
 
+    operator_pois: list[dict[str, Any]] = []
+    for poi in state.get("operator_pois") or []:
+        try:
+            x = float(poi["x"])
+            y = float(poi["y"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        operator_pois.append(
+            {
+                "id": str(poi.get("id") or "POI"),
+                "label": str(poi.get("label") or poi.get("id") or "POI"),
+                "x": x,
+                "y": y,
+                "status": str(poi.get("status") or "planned"),
+            }
+        )
+
     live = live_overlay or {
         "ok": False,
         "source": "DimOS live LCM topics",
@@ -193,7 +210,14 @@ def build_map_data(
     }
     points = [
         (item["x"], item["y"])
-        for group in (map_zones, map_assets, map_packages, map_route, map_observations)
+        for group in (
+            map_zones,
+            map_assets,
+            map_packages,
+            map_route,
+            map_observations,
+            operator_pois,
+        )
         for item in group
     ]
     points.extend(_live_overlay_points(live))
@@ -205,6 +229,7 @@ def build_map_data(
         "assets": map_assets,
         "packages": map_packages,
         "route": map_route,
+        "operator_pois": operator_pois,
         "observations": map_observations,
         "incidents": map_incidents,
         "bounds": bounds,
@@ -370,6 +395,8 @@ def build_poi_data(state: dict[str, Any], report: dict[str, Any]) -> dict[str, A
     return {
         "run_id": report.get("run_id"),
         "captures": captures,
+        "operator_pois": state.get("operator_pois") or [],
+        "poi_captures": state.get("poi_captures") or [],
         "readings": readings,
     }
 
@@ -405,6 +432,10 @@ def render_site_map(state: dict[str, Any], report: dict[str, Any]) -> str:
             f'<polyline class="map-route" points="{route_points}" />'
             + "".join(_render_route_stop(projector, stop, index) for index, stop in enumerate(map_data["route"], 1))
         )
+    operator_pois = "".join(
+        _render_operator_poi(projector, poi, index)
+        for index, poi in enumerate(map_data["operator_pois"], 1)
+    )
     robot = _render_live_robot_pose()
     scan_items = "".join(_render_scan_item(observation) for observation in map_data["observations"])
     legend = (
@@ -413,6 +444,7 @@ def render_site_map(state: dict[str, Any], report: dict[str, Any]) -> str:
         '<span><i class="legend-heatmap"></i>DimOS heatmap</span>'
         '<span><i class="legend-route"></i>trajectory</span>'
         '<span><i class="legend-live"></i>live odom</span>'
+        '<span><i class="legend-poi"></i>operator POI</span>'
         '<span><i class="legend-tag"></i>tag return</span>'
         '<span><i class="legend-no-go"></i>no-go cost</span>'
         '<span><i class="legend-incident"></i>P1/P2 event</span>'
@@ -459,6 +491,7 @@ def render_site_map(state: dict[str, Any], report: dict[str, Any]) -> str:
           </g>
           <g data-layer="path">
             {route}
+            {operator_pois}
             <polyline class="map-dimos-path" data-live-path points="" />
           </g>
           <g data-layer="robot">
@@ -626,6 +659,13 @@ def render_dashboard_html(
       background: #fbfcfd;
       padding: 8px 10px;
     }}
+    .compact-list img {{
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      display: block;
+      margin-bottom: 8px;
+      max-width: 100%;
+    }}
     .map-panel {{
       background: #07090d;
       border-color: #1d2430;
@@ -750,6 +790,17 @@ def render_dashboard_html(
       font-weight: 700;
       text-anchor: middle;
     }}
+    .map-operator-poi {{ fill: #fef08a; stroke: #05070c; stroke-width: 2; }}
+    .map-operator-poi.captured {{ fill: #86efac; }}
+    .map-operator-poi-label {{
+      fill: #fef9c3;
+      font-size: 11px;
+      font-weight: 700;
+      paint-order: stroke;
+      stroke: #05070c;
+      stroke-linejoin: round;
+      stroke-width: 4px;
+    }}
     .map-zone-anchor {{ fill: #05070c; stroke: #8b95a7; stroke-width: 1.5; }}
     .map-zone-label {{
       fill: #b9c4d5;
@@ -819,7 +870,7 @@ def render_dashboard_html(
     .map-go-to-ring {{ fill: rgba(248, 113, 113, 0.14); stroke: #f87171; stroke-width: 2; }}
     .map-go-to-cross {{ stroke: #fecaca; stroke-linecap: round; stroke-width: 2; }}
     .map-axis-label {{ fill: #657184; font-size: 10px; }}
-    .site-map.go-to-armed {{ cursor: crosshair; }}
+    .site-map.go-to-armed, .site-map.poi-armed {{ cursor: crosshair; }}
     .map-legend {{
       color: #a9b4c4;
       display: flex;
@@ -838,6 +889,7 @@ def render_dashboard_html(
     .legend-heatmap {{ background: #f97316; }}
     .legend-route {{ background: #52e0c4; }}
     .legend-live {{ background: #facc15; }}
+    .legend-poi {{ background: #fef08a; }}
     .legend-tag {{ background: #a78bfa; }}
     .legend-no-go {{ background: #ef4444; }}
     .legend-incident {{ background: #fb7185; }}
@@ -1098,8 +1150,13 @@ def render_dashboard_html(
           <button type="button" data-posture="sleep">Sleep</button>
         </div>
         <div class="map-controls" data-map-controls>
-          <button type="button" data-map-action="start">Start Live Map</button>
+          <button type="button" data-map-action="map_from_scratch">Map From Scratch</button>
+          <button type="button" data-map-action="stop_mapping">Stop Mapping</button>
+          <button type="button" data-map-action="return_home">Return Home</button>
           <button type="button" data-map-action="origin">Set Map Origin</button>
+          <button type="button" data-map-action="arm_poi" aria-pressed="false">Add POI</button>
+          <button type="button" data-map-action="clear_pois">Clear POIs</button>
+          <button type="button" data-map-action="run_poi_route">Run POI Route</button>
           <button type="button" data-map-action="arm_go_to" aria-pressed="false">Arm Go To</button>
         </div>
         <div class="motion-controls" data-motion-controls>
@@ -1230,6 +1287,7 @@ def render_dashboard_html(
       let dimosMapPolling = false;
       let dimosRobotPoseActive = false;
       let goToArmed = false;
+      let poiArmed = false;
       let liveMapBounds = null;
       let liveOverlayBounds = null;
       try {{
@@ -1302,12 +1360,28 @@ def render_dashboard_html(
       }};
       const setGoToArmed = (armed) => {{
         goToArmed = armed;
+        if (armed) setPoiArmed(false);
         if (liveMapSvg) liveMapSvg.classList.toggle("go-to-armed", armed);
         if (mapControls) {{
           const button = mapControls.querySelector('[data-map-action="arm_go_to"]');
           if (button) button.setAttribute("aria-pressed", armed ? "true" : "false");
         }}
         setMapCommandStatus(armed ? "Map Go To armed" : "Map command idle", armed ? "ok" : "");
+      }};
+      const setPoiArmed = (armed) => {{
+        poiArmed = armed;
+        if (armed) goToArmed = false;
+        if (liveMapSvg) {{
+          liveMapSvg.classList.toggle("poi-armed", armed);
+          liveMapSvg.classList.toggle("go-to-armed", goToArmed);
+        }}
+        if (mapControls) {{
+          const poiButton = mapControls.querySelector('[data-map-action="arm_poi"]');
+          const goToButton = mapControls.querySelector('[data-map-action="arm_go_to"]');
+          if (poiButton) poiButton.setAttribute("aria-pressed", armed ? "true" : "false");
+          if (goToButton) goToButton.setAttribute("aria-pressed", goToArmed ? "true" : "false");
+        }}
+        setMapCommandStatus(armed ? "POI selection armed" : "Map command idle", armed ? "ok" : "");
       }};
       const setGoToMarker = (target) => {{
         if (!goToMarker || !target) return;
@@ -1517,6 +1591,17 @@ def render_dashboard_html(
         );
         await refreshLiveMap();
       }};
+      const addPoiTarget = async (target) => {{
+        if (!target || robotBusy) return;
+        setMapCommandStatus(`Adding POI x=${{target.x.toFixed(2)}} y=${{target.y.toFixed(2)}}...`, "");
+        const result = await sendRobotAction(
+          "/api/route/poi",
+          {{command: "add_poi", x: target.x, y: target.y}},
+          () => `POI added x=${{target.x.toFixed(2)}} y=${{target.y.toFixed(2)}}`
+        );
+        setMapCommandStatus(result ? "POI added" : "POI add failed", result ? "ok" : "error");
+        if (result) window.location.reload();
+      }};
       const sendRobotAction = async (url, body, successText) => {{
         robotBusy = true;
         setBusy(true);
@@ -1552,15 +1637,18 @@ def render_dashboard_html(
       }});
       if (liveMapSvg) {{
         liveMapSvg.addEventListener("click", async (event) => {{
-          if (!goToArmed) return;
+          if (!goToArmed && !poiArmed) return;
           event.preventDefault();
           const target = worldFromSvgEvent(event);
-          setGoToArmed(false);
+          const addingPoi = poiArmed;
+          if (addingPoi) setPoiArmed(false);
+          else setGoToArmed(false);
           if (!target) {{
-            setMapCommandStatus("Go To target unavailable", "error");
+            setMapCommandStatus(addingPoi ? "POI target unavailable" : "Go To target unavailable", "error");
             return;
           }}
-          await sendGoToTarget(target);
+          if (addingPoi) await addPoiTarget(target);
+          else await sendGoToTarget(target);
         }});
       }}
       window.addEventListener("keydown", async (event) => {{
@@ -1602,7 +1690,25 @@ def render_dashboard_html(
           if (!button) return;
           const action = button.getAttribute("data-map-action");
           button.blur();
-          if (action === "start") {{
+          if (action === "map_from_scratch") {{
+            await sendRobotAction(
+              "/api/robot/map_from_scratch",
+              {{command: "map_from_scratch"}},
+              () => "Mapping started"
+            );
+          }} else if (action === "stop_mapping") {{
+            await sendRobotAction(
+              "/api/robot/stop_mapping",
+              {{command: "stop_mapping"}},
+              () => "Mapping stopped"
+            );
+          }} else if (action === "return_home") {{
+            await sendRobotAction(
+              "/api/robot/return_home",
+              {{command: "return_home"}},
+              () => "Return home sent"
+            );
+          }} else if (action === "start") {{
             await sendRobotAction(
               "/api/robot/map_start",
               {{command: "map_start"}},
@@ -1614,6 +1720,22 @@ def render_dashboard_html(
               {{command: "map_origin"}},
               () => "Map origin set"
             );
+          }} else if (action === "arm_poi") {{
+            setPoiArmed(!poiArmed);
+          }} else if (action === "clear_pois") {{
+            const result = await sendRobotAction(
+              "/api/route/poi/clear",
+              {{command: "clear_pois"}},
+              () => "POIs cleared"
+            );
+            if (result) window.location.reload();
+          }} else if (action === "run_poi_route") {{
+            const result = await sendRobotAction(
+              "/api/route/pois/run",
+              {{command: "run_poi_route"}},
+              (payload) => `POI route complete (${{(payload.captures || []).length}} captures)`
+            );
+            if (result) window.location.reload();
           }} else if (action === "arm_go_to") {{
             setGoToArmed(!goToArmed);
           }}
@@ -2002,6 +2124,22 @@ def _render_route_stop(projector: _MapProjector, stop: dict[str, Any], index: in
     )
 
 
+def _render_operator_poi(projector: _MapProjector, poi: dict[str, Any], index: int) -> str:
+    x = projector.x(float(poi["x"]))
+    y = projector.y(float(poi["y"]))
+    label = escape(str(poi.get("label") or poi.get("id") or f"POI {index}"))
+    status = escape(str(poi.get("status") or "planned"))
+    css_status = "captured" if "captured" in status else "planned"
+    title = escape(f"{poi.get('id') or label} {status}")
+    return (
+        f'<g><title>{title}</title>'
+        f'<circle class="map-operator-poi {css_status}" cx="{x:.1f}" cy="{y:.1f}" r="10" />'
+        f'<text class="map-route-index" x="{x:.1f}" y="{y + 1:.1f}">{index}</text>'
+        f'<text class="map-operator-poi-label" x="{x + 13:.1f}" y="{y - 12:.1f}">{label}</text>'
+        "</g>"
+    )
+
+
 def _render_live_robot_pose() -> str:
     return (
         '<polyline class="map-live-trace" data-live-trace points="" />'
@@ -2153,8 +2291,34 @@ def route_table(stops: list[dict[str, Any]]) -> str:
 
 def poi_list(poi_data: dict[str, Any]) -> str:
     captures = poi_data.get("captures") or []
+    operator_pois = poi_data.get("operator_pois") or []
+    poi_captures = poi_data.get("poi_captures") or []
     readings = poi_data.get("readings") or []
     items = []
+    for poi in operator_pois:
+        items.append(
+            "<li>"
+            f"<strong>{escape(str(poi.get('label') or poi.get('id') or 'POI'))}</strong> "
+            f"{float(poi.get('x') or 0):.2f}m, {float(poi.get('y') or 0):.2f}m / "
+            f"{escape(str(poi.get('status') or 'planned'))}"
+            "</li>"
+        )
+    for capture in poi_captures:
+        image_path = str(capture.get("image_path") or "")
+        image_src = "/" + image_path if image_path.startswith("evidence/") else image_path
+        image_html = (
+            f'<img src="{escape(image_src, quote=True)}" alt="{escape(str(capture.get("id") or "POI capture"), quote=True)}" />'
+            if image_src
+            else ""
+        )
+        items.append(
+            "<li>"
+            f"{image_html}"
+            f"<strong>{escape(str(capture.get('id') or 'capture'))}</strong> "
+            f"{escape(str(capture.get('poi_id') or 'POI'))} / "
+            f"{escape(str(capture.get('status') or 'captured'))}"
+            "</li>"
+        )
     for capture in captures[:4]:
         tags = ", ".join(str(tag_id) for tag_id in capture.get("visible_tag_ids") or []) or "none"
         incidents = capture.get("related_incident_ids") or []
