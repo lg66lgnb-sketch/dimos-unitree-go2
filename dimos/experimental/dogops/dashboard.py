@@ -548,6 +548,13 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
 
     def _stop_map_route(self) -> None:
         request_route_stop(self.run_dir)
+        hard_stop: dict[str, Any] = {"attempted": True, "ok": False}
+        try:
+            hard_stop_result = _run_robot_call(lambda: _run_route_hard_stop(self.robot_ip))
+        except Exception as exc:
+            hard_stop["error"] = str(exc)
+        else:
+            hard_stop.update({"ok": True, **(hard_stop_result or {})})
         try:
             result = _run_robot_call(_run_robot_stop_route)
         except ModuleNotFoundError as exc:
@@ -556,6 +563,7 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
                     "ok": False,
                     "error": "dimos_mcp_unavailable",
                     "message": str(exc),
+                    "hard_stop": hard_stop,
                     **self._route_execution_payload(),
                 },
                 HTTPStatus.SERVICE_UNAVAILABLE,
@@ -567,6 +575,7 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
                     "ok": False,
                     "error": "stop_route_timeout",
                     "message": str(exc),
+                    "hard_stop": hard_stop,
                     **self._route_execution_payload(),
                 },
                 HTTPStatus.GATEWAY_TIMEOUT,
@@ -578,6 +587,7 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
                     "ok": False,
                     "error": "stop_route_failed",
                     "message": str(exc),
+                    "hard_stop": hard_stop,
                     **self._route_execution_payload(),
                 },
                 HTTPStatus.INTERNAL_SERVER_ERROR,
@@ -589,6 +599,7 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
             {
                 "ok": True,
                 "command": "stop_route",
+                "hard_stop": hard_stop,
                 **(result or {}),
                 **self._route_execution_payload(route_execution=route_execution),
             }
@@ -1160,6 +1171,10 @@ def _run_robot_posture(command: str, robot_ip: str) -> bool:
 
 def _run_robot_go_to(x: float, y: float) -> dict[str, Any]:
     return _call_dimos_mcp_skill("go_to", {"x": x, "y": y})
+
+
+def _run_route_hard_stop(robot_ip: str) -> dict[str, Any]:
+    return _publish_robot_hard_stop(robot_ip)
 
 
 def _run_robot_follow_route(route_id: str | None, dry_run: bool) -> dict[str, Any]:

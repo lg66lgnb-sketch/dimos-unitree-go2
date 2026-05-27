@@ -10,6 +10,7 @@ from dimos.experimental.dogops.map_authoring import (
     MapAuthoringState,
     save_map_authoring,
 )
+from dimos.experimental.dogops.route_executor import load_route_execution, save_route_execution
 from dimos.experimental.dogops.skills import DogOpsSkillContainer
 
 
@@ -196,13 +197,22 @@ def test_skill_container_stop_route_marks_execution_stopped(tmp_path) -> None:
             ],
         ),
     )
-    skills = DogOpsSkillContainer(run_dir=tmp_path / "latest")
+    stop_calls: list[str] = []
+    skills = DogOpsSkillContainer(
+        run_dir=tmp_path / "latest",
+        route_stop_handler=lambda: stop_calls.append("stop"),
+    )
     _payload(skills.follow_route(dry_run=True))
+    state = load_route_execution(tmp_path / "latest")
+    state.state = "running"
+    save_route_execution(tmp_path / "latest", state)
 
     result = _payload(skills.stop_route())
 
     assert result["ok"] is True
-    assert result["state"] == "completed"
+    assert result["state"] == "stopped"
+    assert result["route_execution"]["stop_requested"] is True  # type: ignore[index]
+    assert stop_calls == ["stop"]
 
 
 def test_skill_container_work_order_methods_are_idempotent(tmp_path) -> None:

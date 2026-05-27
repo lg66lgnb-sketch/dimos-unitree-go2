@@ -1632,7 +1632,8 @@ def render_dashboard_html(
         const current = mapAuthoring || {{}};
         const routes = Array.isArray(current.routes) ? current.routes : [];
         if (!routes.length) return null;
-        return routes.find((route) => route.id === current.selected_route_id) || routes[0];
+        if (!current.selected_route_id) return null;
+        return routes.find((route) => route.id === current.selected_route_id) || null;
       }};
       const routeExecutionText = (state) => {{
         if (!state || !state.state) return "Execution: idle";

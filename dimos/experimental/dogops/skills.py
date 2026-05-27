@@ -105,6 +105,7 @@ class DogOpsSkillContainer(Module):
         policy_path: str | Path = DEFAULT_POLICY,
         run_dir: str | Path = ".dogops/runs/latest",
         go_to_handler: Callable[[float, float, float, str], object] | None = None,
+        route_stop_handler: Callable[[], object] | None = None,
         live_map_adapter: DogOpsLiveMapAdapter | None = None,
         **_: object,
     ) -> None:
@@ -116,6 +117,7 @@ class DogOpsSkillContainer(Module):
         self.policy_path = Path(policy_path)
         self.run_dir = Path(run_dir)
         self._go_to_handler = go_to_handler
+        self._route_stop_handler = route_stop_handler
         self._live_map_adapter = live_map_adapter
 
     @skill
@@ -251,6 +253,7 @@ class DogOpsSkillContainer(Module):
         executor = DogOpsRouteExecutor(
             self.run_dir,
             goal_publisher=publisher,
+            stop_handler=self._route_stop_handler,
             live_snapshot_reader=live_adapter.snapshot if not dry_run else None,
         )
         try:
@@ -279,7 +282,7 @@ class DogOpsSkillContainer(Module):
     @skill
     def stop_route(self) -> str:
         """Request that a running DogOps authored route stop."""
-        executor = DogOpsRouteExecutor(self.run_dir)
+        executor = DogOpsRouteExecutor(self.run_dir, stop_handler=self._route_stop_handler)
         try:
             state = executor.stop_route()
         except RouteExecutionError as exc:
@@ -290,11 +293,12 @@ class DogOpsSkillContainer(Module):
                 message=str(exc),
             )
         return _json(
-            ok=True,
+            ok=state.last_error is None,
             skill="stop_route",
             route_id=state.route_id,
             state=state.state,
             active_waypoint_id=state.active_waypoint_id,
+            last_error=state.last_error,
             route_execution=state.model_dump(mode="json"),
         )
 

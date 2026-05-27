@@ -170,7 +170,7 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert "/api/map/no_go_shapes/publish" in content
     assert "/api/map/tag_bindings" in content
     assert "/from_observation" in content
-    assert "routes.find((item) => item.id === current.selected_route_id) || routes[0]" in content
+    assert "if (!current.selected_route_id) return null" in content
     assert "selected_route_id: route.id" in content
     assert 'data-go-to-marker' in content
     assert "/api/robot/go_to" in content
@@ -1412,6 +1412,7 @@ def test_dashboard_route_follow_stop_and_status_endpoints(tmp_path, monkeypatch)
 
     monkeypatch.setattr(dashboard, "_run_robot_follow_route", fake_follow)
     monkeypatch.setattr(dashboard, "_run_robot_stop_route", fake_stop)
+    monkeypatch.setattr(dashboard, "_run_route_hard_stop", lambda robot_ip: {"robot_ip": robot_ip})
     original_run_robot_call = dashboard._run_robot_call
 
     def tracking_run_robot_call(fn: Any, *, timeout_s: float = dashboard.ROBOT_CALL_TIMEOUT_S) -> object:
@@ -1479,6 +1480,8 @@ def test_dashboard_route_follow_stop_and_status_endpoints(tmp_path, monkeypatch)
     assert stop_result["ok"] is True
     assert stop_result["command"] == "stop_route"
     assert stop_result["route_execution"]["state"] == "stopped"  # type: ignore[index]
+    assert stop_result["hard_stop"]["ok"] is True  # type: ignore[index]
+    assert stop_result["hard_stop"]["robot_ip"] == "192.168.12.1"  # type: ignore[index]
 
 
 def test_dashboard_route_status_requires_token(tmp_path) -> None:

@@ -17,6 +17,7 @@ from dimos.experimental.dogops.route_executor import (
     load_route_execution,
     request_route_stop,
     route_feedback_from_snapshot,
+    route_execution_lock,
     save_route_execution,
 )
 
@@ -98,6 +99,13 @@ def test_missing_and_empty_routes_are_rejected(tmp_path) -> None:
     with pytest.raises(RouteExecutionError, match="no waypoints"):
         executor.follow_route(dry_run=True)
 
+    save_map_authoring(
+        tmp_path,
+        MapAuthoringState(selected_route_id=None, routes=[_route("ROUTE_A")]),
+    )
+    with pytest.raises(RouteExecutionError, match="no route_id"):
+        executor.follow_route(dry_run=True)
+
 
 def test_fake_publisher_receives_goals_in_order_and_waits_for_odom(tmp_path) -> None:
     _save_authoring(tmp_path)
@@ -112,6 +120,7 @@ def test_fake_publisher_receives_goals_in_order_and_waits_for_odom(tmp_path) -> 
     def snapshot() -> dict[str, object]:
         return {
             "robot_pose": {"x": current_goal["x"], "y": current_goal["y"]},
+            "target": {"x": current_goal["x"], "y": current_goal["y"]},
             "topics": {"odom": {"age_s": 0.1}},
         }
 
@@ -127,7 +136,7 @@ def test_fake_publisher_receives_goals_in_order_and_waits_for_odom(tmp_path) -> 
 
     assert state.state == "completed"
     assert state.waypoints_reached == 2
-    assert published == [(1.0, 2.0, "map"), (2.0, 2.5, "map")]
+    assert published == [(1.0, 2.0, "world"), (2.0, 2.5, "world")]
     assert [event.state for event in state.events] == [
         "queued",
         "sent",
@@ -154,6 +163,7 @@ def test_stale_odom_causes_timeout_failure(tmp_path) -> None:
         goal_publisher=CallableGoalPublisher(lambda *_: {"accepted": True}),
         live_snapshot_reader=lambda: {
             "robot_pose": {"x": 0.0, "y": 0.0},
+            "target": {"x": 1.0, "y": 2.0},
             "topics": {"odom": {"age_s": 99.0}},
         },
         waypoint_timeout_s=0.25,
@@ -191,6 +201,7 @@ def test_stop_request_interrupts_execution(tmp_path) -> None:
         goal_publisher=CallableGoalPublisher(lambda *_: {"accepted": True}),
         live_snapshot_reader=lambda: {
             "robot_pose": {"x": -10.0, "y": -10.0},
+            "target": {"x": 1.0, "y": 2.0},
             "topics": {"odom": {"age_s": 0.1}},
         },
         waypoint_timeout_s=2.0,
@@ -220,6 +231,7 @@ def test_completed_route_appends_nav_events_and_report(tmp_path) -> None:
         goal_publisher=CallableGoalPublisher(publish, transport_name="fake_nav"),
         live_snapshot_reader=lambda: {
             "robot_pose": {"x": current_goal["x"], "y": current_goal["y"]},
+            "target": {"x": current_goal["x"], "y": current_goal["y"]},
             "topics": {"odom": {"age_s": 0.1}},
         },
         sleep_fn=lambda _: None,
@@ -233,6 +245,105 @@ def test_completed_route_appends_nav_events_and_report(tmp_path) -> None:
     stored = (tmp_path / "nav_events.jsonl").read_text(encoding="utf-8")
     assert "CHECKPOINT_1" in stored
     assert "CHECKPOINT_2" in stored
+    assert '"error_m": 0.0' in stored
+    assert '"guided": false' in stored
+    assert '"retries": 0' in stored
+
+
+def test_repeated_route_runs_append_distinct_nav_evidence(tmp_path) -> None:
+    run_offline_simulation(out=tmp_path)
+    _save_authoring(tmp_path)
+    current_goal = {"x": 0.0, "y": 0.0}
+
+    def publish(x: float, y: float, z: float, frame: str) -> dict[str, object]:
+        current_goal.update({"x": x, "y": y})
+        return {"accepted": True}
+
+    executor = DogOpsRouteExecutor(
+        tmp_path,
+        goal_publisher=CallableGoalPublisher(publish, transport_name="fake_nav"),
+        live_snapshot_reader=lambda: {
+            "robot_pose": {"x": current_goal["x"], "y": current_goal["y"]},
+            "target": {"x": current_goal["x"], "y": current_goal["y"]},
+            "topics": {"odom": {"age_s": 0.1}},
+        },
+        sleep_fn=lambda _: None,
+    )
+
+    first = executor.follow_route()
+    second = executor.follow_route()
+
+    assert first.state == "completed"
+    assert second.state == "completed"
+    stored = (tmp_path / "nav_events.jsonl").read_text(encoding="utf-8")
+    assert stored.count("live route ROUTE_A: reached CHECKPOINT_1 via fake_nav") == 2
+
+
+def test_no_progress_is_recorded_before_timeout(tmp_path) -> None:
+    _save_authoring(tmp_path)
+    now = 0.0
+
+    def sleep_fn(seconds: float) -> None:
+        nonlocal now
+        now += seconds
+
+    executor = DogOpsRouteExecutor(
+        tmp_path,
+        goal_publisher=CallableGoalPublisher(lambda *_: {"accepted": True}),
+        live_snapshot_reader=lambda: {
+            "robot_pose": {"x": -10.0, "y": -10.0},
+            "target": {"x": 1.0, "y": 2.0},
+            "topics": {"odom": {"age_s": 0.1}},
+        },
+        waypoint_timeout_s=5.0,
+        no_progress_timeout_s=0.3,
+        poll_interval_s=0.1,
+        time_fn=lambda: now,
+        sleep_fn=sleep_fn,
+    )
+
+    state = executor.follow_route()
+
+    assert state.state == "failed"
+    assert state.last_error == "no progress toward waypoint"
+    assert state.events[-1].note == "no progress toward waypoint"
+
+
+def test_unconfirmed_goal_does_not_mark_waypoint_reached(tmp_path) -> None:
+    _save_authoring(tmp_path)
+
+    executor = DogOpsRouteExecutor(
+        tmp_path,
+        goal_publisher=CallableGoalPublisher(lambda *_: {"accepted": True}),
+        live_snapshot_reader=lambda: {
+            "robot_pose": {"x": 1.0, "y": 2.0},
+            "topics": {"odom": {"age_s": 0.1}},
+        },
+        waypoint_timeout_s=0.1,
+        sleep_fn=lambda _: None,
+    )
+
+    state = executor.follow_route()
+
+    assert state.state == "failed"
+    assert "unconfirmed" in state.last_error
+
+
+def test_concurrent_route_start_is_rejected(tmp_path) -> None:
+    _save_authoring(tmp_path)
+    state = DogOpsRouteExecutor(tmp_path).follow_route(dry_run=True)
+    state.state = "running"
+    save_route_execution(tmp_path, state)
+
+    with route_execution_lock(tmp_path):
+        with pytest.raises(RouteExecutionError, match="already running"):
+            DogOpsRouteExecutor(tmp_path).follow_route(dry_run=True)
+
+    # The failed attempt must not leave behind a stale lock.
+    state.state = "completed"
+    save_route_execution(tmp_path, state)
+    state = DogOpsRouteExecutor(tmp_path).follow_route(dry_run=True)
+    assert state.state == "completed"
 
 
 def test_route_feedback_from_snapshot_handles_odom_age() -> None:
@@ -257,3 +368,16 @@ def test_request_route_stop_sets_server_side_stop_flag(tmp_path) -> None:
     assert stopped.stop_requested is True
     assert stopped.completed_at == 123.0
     assert load_route_execution(tmp_path).stop_requested is True
+
+
+def test_stop_route_invokes_transport_stop_handler(tmp_path) -> None:
+    _save_authoring(tmp_path)
+    calls: list[str] = []
+    state = DogOpsRouteExecutor(tmp_path).follow_route(dry_run=True)
+    state.state = "running"
+    save_route_execution(tmp_path, state)
+
+    stopped = DogOpsRouteExecutor(tmp_path, stop_handler=lambda: calls.append("stop")).stop_route()
+
+    assert stopped.state == "stopped"
+    assert calls == ["stop"]
