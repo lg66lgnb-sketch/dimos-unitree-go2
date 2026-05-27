@@ -93,6 +93,11 @@ class DogOpsDashboardServer(ThreadingHTTPServer):
         stop = getattr(self.live_map_adapter, "stop", None)
         if stop is not None:
             stop()
+        with _ROBOT_SESSIONS_LOCK:
+            sessions = list(_ROBOT_SESSIONS.values())
+            _ROBOT_SESSIONS.clear()
+        for session in sessions:
+            session.close()
         super().server_close()
 
 
@@ -129,6 +134,8 @@ class DogOpsDashboardModule(Module):
         port: int = 8765,
         **_: object,
     ) -> None:
+        if _:
+            super().__init__(**_)
         self.run_dir = Path(run_dir)
         self.host = host
         self.port = port
