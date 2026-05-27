@@ -31,7 +31,12 @@ PACKAGE_OFFSETS_M = (
 )
 
 
-def build_map_data(state: dict[str, Any], report: dict[str, Any]) -> dict[str, Any]:
+def build_map_data(
+    state: dict[str, Any],
+    report: dict[str, Any],
+    *,
+    live_overlay: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     site = state.get("site") or {}
     zones = site.get("zones") or []
     assets = site.get("assets") or []
@@ -173,11 +178,24 @@ def build_map_data(state: dict[str, Any], report: dict[str, Any]) -> dict[str, A
             }
         )
 
+    live = live_overlay or {
+        "ok": False,
+        "source": "DimOS live LCM topics",
+        "status": "not_requested",
+        "error": "",
+        "topics": {},
+        "costmap": None,
+        "path": [],
+        "route": [],
+        "robot_pose": None,
+        "target": None,
+    }
     points = [
         (item["x"], item["y"])
         for group in (map_zones, map_assets, map_packages, map_route, map_observations)
         for item in group
     ]
+    points.extend(_live_overlay_points(live))
     bounds = _map_bounds(points)
     return {
         "site_id": site.get("site_id"),
@@ -189,7 +207,59 @@ def build_map_data(state: dict[str, Any], report: dict[str, Any]) -> dict[str, A
         "observations": map_observations,
         "incidents": map_incidents,
         "bounds": bounds,
+        "live": live,
+        "layers": {
+            "semantic": True,
+            "heatmap": bool((live.get("costmap") or {}).get("cells")) if isinstance(live, dict) else False,
+            "path": bool(live.get("path") or live.get("route")) if isinstance(live, dict) else False,
+            "robot": bool(live.get("robot_pose")) if isinstance(live, dict) else False,
+        },
     }
+
+
+def _live_overlay_points(live: dict[str, Any]) -> list[tuple[float, float]]:
+    points: list[tuple[float, float]] = []
+    for point in [*(live.get("path") or []), *(live.get("route") or [])]:
+        maybe_point = _xy_point(point)
+        if maybe_point is not None:
+            points.append(maybe_point)
+    for point in (live.get("robot_pose"), live.get("target")):
+        maybe_point = _xy_point(point)
+        if maybe_point is not None:
+            points.append(maybe_point)
+    costmap = live.get("costmap") or {}
+    cells = costmap.get("cells") if isinstance(costmap, dict) else None
+    if isinstance(cells, list):
+        for cell in cells:
+            maybe_point = _xy_point(cell)
+            if maybe_point is None:
+                continue
+            x, y = maybe_point
+            width = _float_or_none(cell.get("width") if isinstance(cell, dict) else None) or 0.0
+            height = _float_or_none(cell.get("height") if isinstance(cell, dict) else None) or 0.0
+            points.append((x, y))
+            points.append((x + width, y + height))
+    return points
+
+
+def _xy_point(item: Any) -> tuple[float, float] | None:
+    if not isinstance(item, dict):
+        return None
+    x = _float_or_none(item.get("x"))
+    y = _float_or_none(item.get("y"))
+    if x is None or y is None:
+        return None
+    return x, y
+
+
+def _float_or_none(value: Any) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(result):
+        return None
+    return result
 
 
 def build_route_data(state: dict[str, Any], report: dict[str, Any]) -> dict[str, Any]:
@@ -341,6 +411,7 @@ def render_site_map(state: dict[str, Any], report: dict[str, Any]) -> str:
     legend = (
         '<div class="map-legend">'
         '<span><i class="legend-free"></i>free grid</span>'
+        '<span><i class="legend-heatmap"></i>DimOS heatmap</span>'
         '<span><i class="legend-route"></i>trajectory</span>'
         '<span><i class="legend-live"></i>live odom</span>'
         '<span><i class="legend-tag"></i>tag return</span>'
@@ -348,9 +419,18 @@ def render_site_map(state: dict[str, Any], report: dict[str, Any]) -> str:
         '<span><i class="legend-incident"></i>P1/P2 event</span>'
         "</div>"
     )
+    layer_controls = (
+        '<div class="map-layer-controls" data-map-layer-controls>'
+        '<button type="button" data-map-layer="semantic" aria-pressed="true">Semantic</button>'
+        '<button type="button" data-map-layer="heatmap" aria-pressed="true">Heatmap</button>'
+        '<button type="button" data-map-layer="path" aria-pressed="true">Path</button>'
+        '<button type="button" data-map-layer="robot" aria-pressed="true">Robot</button>'
+        "</div>"
+    )
     return f"""
       <div class="map-shell" data-map-surface>
         {_render_rerun_surface(rerun_web_url)}
+        {layer_controls}
         <svg class="site-map" role="img" aria-label="DogOps mission map"
           data-live-map-svg data-map-bounds="{bounds_attr}"
           viewBox="0 0 {MAP_WIDTH} {MAP_HEIGHT}">
@@ -367,17 +447,25 @@ def render_site_map(state: dict[str, Any], report: dict[str, Any]) -> str:
             </pattern>
           </defs>
           <rect class="map-bg" x="0" y="0" width="{MAP_WIDTH}" height="{MAP_HEIGHT}" rx="8" />
-          {floor_cells}
-          {grid}
-          {point_cloud}
-          {no_go}
-          {route}
-          {robot}
-          {zones}
-          {assets}
-          {packages}
-          {observations}
-          {incidents}
+          <g data-layer="heatmap" data-live-heatmap></g>
+          <g data-layer="semantic">
+            {floor_cells}
+            {grid}
+            {point_cloud}
+            {no_go}
+            {zones}
+            {assets}
+            {packages}
+            {observations}
+            {incidents}
+          </g>
+          <g data-layer="path">
+            {route}
+            <polyline class="map-dimos-path" data-live-path points="" />
+          </g>
+          <g data-layer="robot">
+            {robot}
+          </g>
         </svg>
         {legend}
         <div class="map-workflow">
@@ -600,6 +688,7 @@ def render_dashboard_html(
     .map-hatch-line {{ stroke: #f87171; stroke-width: 1; opacity: 0.35; }}
     .map-point {{ fill: #7dd3fc; opacity: 0.46; }}
     .map-point.hot {{ fill: #f0abfc; opacity: 0.62; }}
+    .map-live-cost-cell {{ opacity: 0.64; stroke: rgba(255, 255, 255, 0.08); stroke-width: 0.4; }}
     .map-no-go {{
       fill: rgba(127, 29, 29, 0.42);
       stroke: #ef4444;
@@ -676,8 +765,19 @@ def render_dashboard_html(
       stroke-linejoin: round;
       stroke-width: 3.5;
     }}
+    .map-dimos-path {{
+      fill: none;
+      filter: url(#dogops-map-glow);
+      stroke: #38bdf8;
+      stroke-dasharray: 9 7;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      stroke-width: 3;
+    }}
     .map-live-robot-halo {{ fill: rgba(250, 204, 21, 0.16); stroke: #facc15; stroke-width: 1.5; }}
     .map-live-robot-core {{ fill: #facc15; stroke: #fff7cc; stroke-width: 1.2; }}
+    .map-dimos-target-ring {{ fill: rgba(56, 189, 248, 0.16); stroke: #38bdf8; stroke-width: 2; }}
+    .map-dimos-target-core {{ fill: #38bdf8; stroke: #e0f2fe; stroke-width: 1.2; }}
     .map-go-to-ring {{ fill: rgba(248, 113, 113, 0.14); stroke: #f87171; stroke-width: 2; }}
     .map-go-to-cross {{ stroke: #fecaca; stroke-linecap: round; stroke-width: 2; }}
     .map-axis-label {{ fill: #657184; font-size: 10px; }}
@@ -697,6 +797,7 @@ def render_dashboard_html(
       width: 10px;
     }}
     .legend-free {{ background: #484981; }}
+    .legend-heatmap {{ background: #f97316; }}
     .legend-route {{ background: #52e0c4; }}
     .legend-live {{ background: #facc15; }}
     .legend-tag {{ background: #a78bfa; }}
@@ -722,6 +823,27 @@ def render_dashboard_html(
     }}
     .map-command-status.ok {{ color: #86efac; }}
     .map-command-status.error {{ color: #fca5a5; }}
+    .map-layer-controls {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }}
+    .map-layer-controls button {{
+      background: #0d1119;
+      border: 1px solid #334155;
+      border-radius: 999px;
+      color: #d8dee9;
+      cursor: pointer;
+      font: inherit;
+      min-height: 30px;
+      padding: 5px 10px;
+    }}
+    .map-layer-controls button[aria-pressed="true"] {{
+      background: #123b36;
+      border-color: #52e0c4;
+      color: #d8fff6;
+      font-weight: 700;
+    }}
     .map-live-status {{
       color: #f7d75d;
       font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -1022,6 +1144,7 @@ def render_dashboard_html(
       const postureControls = document.querySelector("[data-posture-controls]");
       const motionControls = document.querySelector("[data-motion-controls]");
       const mapControls = document.querySelector("[data-map-controls]");
+      const layerControls = document.querySelector("[data-map-layer-controls]");
       const rerunSurface = document.querySelector("[data-rerun-surface]");
       const rerunConnect = document.querySelector("[data-rerun-connect]");
       const rerunFrame = document.querySelector("[data-rerun-frame]");
@@ -1030,21 +1153,28 @@ def render_dashboard_html(
       const liveMapSvg = document.querySelector("[data-live-map-svg]");
       const liveMapStatus = document.querySelector("[data-live-map-status]");
       const mapCommandStatus = document.querySelector("[data-map-command-status]");
+      const liveHeatmap = liveMapSvg ? liveMapSvg.querySelector("[data-live-heatmap]") : null;
+      const livePath = liveMapSvg ? liveMapSvg.querySelector("[data-live-path]") : null;
       const liveTrace = liveMapSvg ? liveMapSvg.querySelector("[data-live-trace]") : null;
       const liveRobot = liveMapSvg ? liveMapSvg.querySelector("[data-live-robot]") : null;
+      const liveTarget = liveMapSvg ? liveMapSvg.querySelector("[data-live-target]") : null;
       const goToMarker = liveMapSvg ? liveMapSvg.querySelector("[data-go-to-marker]") : null;
       const status = document.querySelector("[data-robot-status]");
       if (!controls || !status) return;
       let motionProfile = "nudge";
       let robotBusy = false;
       let liveMapPolling = false;
+      let dimosMapPolling = false;
+      let dimosRobotPoseActive = false;
       let goToArmed = false;
       let liveMapBounds = null;
+      let liveOverlayBounds = null;
       try {{
         liveMapBounds = liveMapSvg ? JSON.parse(liveMapSvg.dataset.mapBounds || "{{}}") : null;
       }} catch (_) {{
         liveMapBounds = null;
       }}
+      liveOverlayBounds = liveMapBounds;
       const liveMapSize = {{width: {MAP_WIDTH}, height: {MAP_HEIGHT}}};
       const motionLabels = {{
         nudge: "Nudge",
@@ -1092,16 +1222,19 @@ def render_dashboard_html(
         if (rerunStandby) rerunStandby.hidden = true;
         setRerunStatus("Rerun visualization connected");
       }};
-      const projectLivePose = (pose) => {{
-        if (!liveMapBounds || !pose) return null;
-        const spanX = Math.max(0.1, liveMapBounds.x_max - liveMapBounds.x_min);
-        const spanY = Math.max(0.1, liveMapBounds.y_max - liveMapBounds.y_min);
+      const projectPoseWithBounds = (pose, bounds) => {{
+        if (!bounds || !pose) return null;
+        const spanX = Math.max(0.1, bounds.x_max - bounds.x_min);
+        const spanY = Math.max(0.1, bounds.y_max - bounds.y_min);
         return {{
-          x: ((pose.x - liveMapBounds.x_min) / spanX) * liveMapSize.width,
-          y: liveMapSize.height - (((pose.y - liveMapBounds.y_min) / spanY) * liveMapSize.height),
+          x: ((pose.x - bounds.x_min) / spanX) * liveMapSize.width,
+          y: liveMapSize.height - (((pose.y - bounds.y_min) / spanY) * liveMapSize.height),
         }};
       }};
+      const projectLivePose = (pose) => projectPoseWithBounds(pose, liveMapBounds);
+      const projectLiveOverlayPose = (pose) => projectPoseWithBounds(pose, liveOverlayBounds);
       const projectWorldPoint = (x, y) => projectLivePose({{x, y}});
+      const projectLiveOverlayPoint = (x, y) => projectLiveOverlayPose({{x, y}});
       const worldFromSvgEvent = (event) => {{
         if (!liveMapSvg || !liveMapBounds) return null;
         const matrix = liveMapSvg.getScreenCTM();
@@ -1136,26 +1269,105 @@ def render_dashboard_html(
           `translate(${{projected.x.toFixed(1)}} ${{projected.y.toFixed(1)}})`
         );
       }};
-      const setLiveMapUnavailable = (text) => {{
+      const setLiveMapUnavailable = (text, keepRobot = false) => {{
         if (liveMapStatus) liveMapStatus.textContent = text;
-        if (liveRobot) liveRobot.style.display = "none";
+        if (liveRobot && !keepRobot) liveRobot.style.display = "none";
       }};
-      const updateLiveMap = (data) => {{
+      const heatColor = (cost) => {{
+        if (cost >= 0.75) return "#dc2626";
+        if (cost >= 0.5) return "#f97316";
+        if (cost >= 0.28) return "#eab308";
+        return "#22c55e";
+      }};
+      const renderLiveHeatmap = (costmap) => {{
+        if (!liveHeatmap) return 0;
+        liveHeatmap.textContent = "";
+        const cells = costmap && Array.isArray(costmap.cells) ? costmap.cells : [];
+        let rendered = 0;
+        for (const cell of cells) {{
+          const cost = Math.max(0, Math.min(1, Number(cell.cost || 0)));
+          if (cost < 0.12) continue;
+          const p1 = projectLiveOverlayPoint(Number(cell.x), Number(cell.y));
+          const p2 = projectLiveOverlayPoint(Number(cell.x) + Number(cell.width || 0), Number(cell.y) + Number(cell.height || 0));
+          if (!p1 || !p2) continue;
+          const rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+          rect.setAttribute("class", "map-live-cost-cell");
+          rect.setAttribute("x", Math.min(p1.x, p2.x).toFixed(1));
+          rect.setAttribute("y", Math.min(p1.y, p2.y).toFixed(1));
+          rect.setAttribute("width", Math.abs(p2.x - p1.x).toFixed(1));
+          rect.setAttribute("height", Math.abs(p2.y - p1.y).toFixed(1));
+          rect.setAttribute("fill", heatColor(cost));
+          rect.setAttribute("opacity", (0.18 + cost * 0.55).toFixed(2));
+          liveHeatmap.appendChild(rect);
+          rendered += 1;
+        }}
+        return rendered;
+      }};
+      const renderDimOSPath = (path) => {{
+        if (!livePath) return 0;
+        const points = Array.isArray(path) ? path : [];
+        const projected = points
+          .map((point) => projectLiveOverlayPoint(point.x, point.y))
+          .filter(Boolean)
+          .map((point) => `${{point.x.toFixed(1)}},${{point.y.toFixed(1)}}`);
+        livePath.setAttribute("points", projected.join(" "));
+        return projected.length;
+      }};
+      const renderDimOSTarget = (target) => {{
+        if (!liveTarget) return;
+        const projected = target ? projectLiveOverlayPoint(target.x, target.y) : null;
+        if (!projected) {{
+          liveTarget.style.display = "none";
+          return;
+        }}
+        liveTarget.style.display = "";
+        liveTarget.setAttribute(
+          "transform",
+          `translate(${{projected.x.toFixed(1)}} ${{projected.y.toFixed(1)}})`
+        );
+      }};
+      const updateDimOSMapLayers = (data) => {{
+        const live = data && data.live ? data.live : null;
+        if (!live) return;
+        if (data.bounds) liveOverlayBounds = data.bounds;
+        const heatmapCells = renderLiveHeatmap(live.costmap);
+        const pathPoints = renderDimOSPath(live.path || live.route || []);
+        renderDimOSTarget(live.target);
+        dimosRobotPoseActive = Boolean(live.robot_pose);
+        if (live.robot_pose) {{
+          const yawRad = Number.isFinite(live.robot_pose.theta_deg)
+            ? live.robot_pose.theta_deg * Math.PI / 180
+            : 0;
+          updateLiveMap(
+            {{ok: true, pose: {{x: live.robot_pose.x, y: live.robot_pose.y, yaw_rad: yawRad}}, trajectory: [], ts: Date.now() / 1000}},
+            liveOverlayBounds
+          );
+        }}
+        if (liveMapStatus) {{
+          if (live.ok) {{
+            liveMapStatus.textContent = `Live DimOS: heatmap=${{heatmapCells}} path=${{pathPoints}} source=${{live.source || "LCM topics"}}`;
+          }} else if (!liveMapStatus.textContent.startsWith("Live odom: x=")) {{
+            liveMapStatus.textContent = `Live DimOS: waiting for topics${{live.error ? ` (${{live.error}})` : ""}}`;
+          }}
+        }}
+      }};
+      const updateLiveMap = (data, bounds = liveMapBounds) => {{
         if (!liveMapSvg || !liveTrace || !liveRobot || !liveMapStatus) return;
         if (!data || !data.ok || !data.pose) {{
+          if (dimosRobotPoseActive) return;
           const error = data && data.error ? data.error : "offline";
           setLiveMapUnavailable(`Live odom: ${{error}}`);
           return;
         }}
         const trajectory = Array.isArray(data.trajectory) ? data.trajectory : [];
         const points = trajectory
-          .map((pose) => projectLivePose(pose))
+          .map((pose) => projectPoseWithBounds(pose, bounds))
           .filter(Boolean)
           .map((point) => `${{point.x.toFixed(1)}},${{point.y.toFixed(1)}}`);
         liveTrace.setAttribute("points", points.join(" "));
-        const projected = projectLivePose(data.pose);
+        const projected = projectPoseWithBounds(data.pose, bounds);
         if (!projected) {{
-          setLiveMapUnavailable("Live odom: map projection unavailable");
+          if (!dimosRobotPoseActive) setLiveMapUnavailable("Live odom: map projection unavailable");
           return;
         }}
         const yawDeg = (data.pose.yaw_rad || 0) * 180 / Math.PI;
@@ -1180,10 +1392,31 @@ def render_dashboard_html(
           const result = await response.json();
           updateLiveMap(result);
         }} catch (error) {{
-          setLiveMapUnavailable(`Live odom: ${{error.message}}`);
+          if (!dimosRobotPoseActive) setLiveMapUnavailable(`Live odom: ${{error.message}}`);
         }} finally {{
           window.clearTimeout(timeout);
           liveMapPolling = false;
+        }}
+      }};
+      const refreshDimOSMap = async () => {{
+        if (dimosMapPolling || !liveMapSvg) return;
+        dimosMapPolling = true;
+        const controller = new AbortController();
+        const timeout = window.setTimeout(() => controller.abort(), 1800);
+        try {{
+          const response = await fetch("/api/map", {{
+            cache: "no-store",
+            signal: controller.signal,
+          }});
+          const result = await response.json();
+          updateDimOSMapLayers(result);
+        }} catch (error) {{
+          if (liveMapStatus && !liveMapStatus.textContent.startsWith("Live odom: x=")) {{
+            liveMapStatus.textContent = `Live DimOS: ${{error.message}}`;
+          }}
+        }} finally {{
+          window.clearTimeout(timeout);
+          dimosMapPolling = false;
         }}
       }};
       const shouldIgnoreKeyboardEvent = (event) => {{
@@ -1342,8 +1575,22 @@ def render_dashboard_html(
           await refreshLiveMap();
         }});
       }}
+      if (layerControls) {{
+        layerControls.addEventListener("click", (event) => {{
+          const button = event.target.closest("button[data-map-layer]");
+          if (!button || !liveMapSvg) return;
+          const layer = button.getAttribute("data-map-layer");
+          const pressed = button.getAttribute("aria-pressed") !== "true";
+          button.setAttribute("aria-pressed", pressed ? "true" : "false");
+          liveMapSvg.querySelectorAll(`[data-layer="${{layer}}"]`).forEach((item) => {{
+            item.toggleAttribute("hidden", !pressed);
+          }});
+        }});
+      }}
       refreshLiveMap();
+      refreshDimOSMap();
       window.setInterval(refreshLiveMap, 1000);
+      window.setInterval(refreshDimOSMap, 1500);
     }})();
   </script>
 </body>
@@ -1717,6 +1964,11 @@ def _render_live_robot_pose() -> str:
         "<title>Live Go2 odometry pose</title>"
         '<circle class="map-live-robot-halo" cx="0" cy="0" r="18" />'
         '<path class="map-live-robot-core" d="M 14 0 L -9 -8 L -5 0 L -9 8 Z" />'
+        "</g>"
+        '<g data-live-target style="display:none" transform="translate(0 0)">'
+        "<title>DimOS planner target</title>"
+        '<circle class="map-dimos-target-ring" cx="0" cy="0" r="14" />'
+        '<circle class="map-dimos-target-core" cx="0" cy="0" r="4" />'
         "</g>"
         '<g data-go-to-marker style="display:none" transform="translate(0 0)">'
         "<title>DimOS go_to target</title>"

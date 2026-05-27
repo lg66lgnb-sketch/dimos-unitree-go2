@@ -25,6 +25,7 @@ from dimos.experimental.dogops.dashboard_static import (
     build_route_data,
     write_dashboard_html,
 )
+from dimos.experimental.dogops.live_map import DogOpsLiveMapAdapter
 from dimos.experimental.dogops.store import DogOpsStore
 
 try:  # pragma: no cover - exercised only inside a full DimOS checkout.
@@ -74,6 +75,30 @@ DEFAULT_ROBOT_IP = (
 )
 _ROBOT_SESSIONS: dict[str, _RobotMotionSession] = {}
 _ROBOT_SESSIONS_LOCK = threading.Lock()
+_LIVE_MAP_ADAPTER = DogOpsLiveMapAdapter()
+
+
+class DogOpsDashboardServer(ThreadingHTTPServer):
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        handler_class: type[BaseHTTPRequestHandler],
+        *,
+        live_map_adapter: DogOpsLiveMapAdapter,
+    ) -> None:
+        super().__init__(server_address, handler_class)
+        self.live_map_adapter = live_map_adapter
+
+    def server_close(self) -> None:
+        stop = getattr(self.live_map_adapter, "stop", None)
+        if stop is not None:
+            stop()
+        with _ROBOT_SESSIONS_LOCK:
+            sessions = list(_ROBOT_SESSIONS.values())
+            _ROBOT_SESSIONS.clear()
+        for session in sessions:
+            session.close()
+        super().server_close()
 
 
 def make_dashboard_server(run_dir: str | Path, host: str, port: int) -> ThreadingHTTPServer:
@@ -87,7 +112,7 @@ def make_dashboard_server(run_dir: str | Path, host: str, port: int) -> Threadin
         robot_control_token = token
         robot_ip = DEFAULT_ROBOT_IP
 
-    return ThreadingHTTPServer((host, port), Handler)
+    return DogOpsDashboardServer((host, port), Handler, live_map_adapter=_LIVE_MAP_ADAPTER)
 
 
 def serve_dashboard(run_dir: str | Path, host: str = "127.0.0.1", port: int = 8765) -> None:
@@ -109,6 +134,8 @@ class DogOpsDashboardModule(Module):
         port: int = 8765,
         **_: object,
     ) -> None:
+        if _:
+            super().__init__(**_)
         self.run_dir = Path(run_dir)
         self.host = host
         self.port = port
@@ -148,7 +175,7 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/map":
             state = self._read_json(self.run_dir / "state.json")
             report = self._read_json(self.run_dir / "report.json")
-            self._send_json(build_map_data(state, report))
+            self._send_json(build_map_data(state, report, live_overlay=_LIVE_MAP_ADAPTER.snapshot()))
         elif path == "/api/robot/pose":
             if self._authorize_local_read():
                 self._send_json(_robot_pose_snapshot(self.robot_ip))

@@ -100,6 +100,8 @@ class DogOpsSkillContainer(Module):
         go_to_handler: Callable[[float, float, float, str], object] | None = None,
         **_: object,
     ) -> None:
+        if _:
+            super().__init__(**_)
         self.site_path = Path(site_path)
         self.manifest_path = Path(manifest_path)
         self.mission_path = Path(mission_path)
@@ -109,6 +111,7 @@ class DogOpsSkillContainer(Module):
 
     @skill
     def load_site_config(self, path: str = str(DEFAULT_SITE)) -> str:
+        """Load a DogOps site configuration file and report inventory counts."""
         self.site_path = Path(path)
         site = read_site_config(self.site_path)
         return _json(
@@ -122,6 +125,7 @@ class DogOpsSkillContainer(Module):
 
     @skill
     def load_manifest(self, path: str = str(DEFAULT_MANIFEST)) -> str:
+        """Load a receiving manifest file and report the package count."""
         self.manifest_path = Path(path)
         manifest = read_manifest(self.manifest_path)
         return _json(
@@ -133,6 +137,7 @@ class DogOpsSkillContainer(Module):
 
     @skill
     def load_mission(self, path: str = str(DEFAULT_MISSION)) -> str:
+        """Load a DogOps mission plan and report its step count."""
         self.mission_path = Path(path)
         mission = read_mission(self.mission_path)
         return _json(
@@ -144,6 +149,7 @@ class DogOpsSkillContainer(Module):
 
     @skill
     def run_mission(self, mission_id: str = "receiving_sre_demo") -> str:
+        """Run the deterministic DogOps mission simulation."""
         mission = read_mission(self.mission_path)
         if mission.mission_id != mission_id:
             return _json(
@@ -172,6 +178,7 @@ class DogOpsSkillContainer(Module):
 
     @skill
     def go_to(self, x: float, y: float, z: float = 0.0, frame_id: str = "map") -> str:
+        """Send a navigation target through the DimOS clicked point stream."""
         try:
             x_f, y_f, z_f = _finite_point(x, y, z)
         except ValueError as exc:
@@ -222,6 +229,7 @@ class DogOpsSkillContainer(Module):
 
     @skill
     def scan_zone(self, zone_id: str) -> str:
+        """Scan a configured site zone and return visible tags and packages."""
         mission = read_mission(self.mission_path)
         observations = [
             obs for obs in mission.simulation_observations.values() if obs.zone_id == zone_id
@@ -245,6 +253,7 @@ class DogOpsSkillContainer(Module):
 
     @skill
     def read_gauge(self, asset_id: str = "TEMP_1") -> str:
+        """Read or simulate a gauge value for a configured asset."""
         site = read_site_config(self.site_path)
         asset = site.asset_by_id().get(asset_id)
         if asset is None:
@@ -287,6 +296,7 @@ class DogOpsSkillContainer(Module):
 
     @skill
     def check_clearance(self, asset_id: str) -> str:
+        """Check whether an asset clearance is blocked."""
         site = read_site_config(self.site_path)
         asset = site.asset_by_id().get(asset_id)
         if asset is None:
@@ -310,6 +320,7 @@ class DogOpsSkillContainer(Module):
 
     @skill
     def detect_blocked_aisle(self, zone_id: str = "AISLE_1") -> str:
+        """Detect whether a configured aisle is blocked."""
         site = read_site_config(self.site_path)
         asset = site.asset_by_id().get(zone_id)
         if asset is None:
@@ -346,6 +357,7 @@ class DogOpsSkillContainer(Module):
 
     @skill
     def scan_receiving_manifest(self, zone_id: str = "INBOUND_DOCK") -> str:
+        """Scan a receiving zone and compare observations with the manifest."""
         site = read_site_config(self.site_path)
         if zone_id not in site.zone_by_id():
             return _json(
@@ -387,6 +399,7 @@ class DogOpsSkillContainer(Module):
 
     @skill
     def inspect_asset(self, asset_id: str) -> str:
+        """Inspect a configured asset and return its current issue state."""
         site = read_site_config(self.site_path)
         asset = site.asset_by_id().get(asset_id)
         if asset is None:
@@ -411,6 +424,7 @@ class DogOpsSkillContainer(Module):
 
     @skill
     def reconcile_manifest(self) -> str:
+        """Reconcile the current run against the receiving manifest."""
         store = self._require_store("reconcile_manifest")
         if isinstance(store, str):
             return store
@@ -429,6 +443,7 @@ class DogOpsSkillContainer(Module):
 
     @skill
     def open_work_order(self, entity_id: str, issue_type: str) -> str:
+        """Open or return a work order for a DogOps incident."""
         store = self._require_store("open_work_order")
         if isinstance(store, str):
             return store
@@ -480,6 +495,7 @@ class DogOpsSkillContainer(Module):
 
     @skill
     def mark_ready_to_verify(self, work_order_id: str) -> str:
+        """Mark a work order ready for robot verification."""
         store = self._require_store("mark_ready_to_verify")
         if isinstance(store, str):
             return store
@@ -511,6 +527,7 @@ class DogOpsSkillContainer(Module):
 
     @skill
     def verify_work_order(self, work_order_id: str) -> str:
+        """Verify a ready work order and close it if resolved."""
         store = self._require_store("verify_work_order")
         if isinstance(store, str):
             return store
@@ -544,6 +561,7 @@ class DogOpsSkillContainer(Module):
 
     @skill
     def what_changed(self, since_run_id: str | None = None) -> str:
+        """Summarize operational changes in the current DogOps run."""
         store = self._require_store("what_changed")
         if isinstance(store, str):
             return store
@@ -561,6 +579,7 @@ class DogOpsSkillContainer(Module):
 
     @skill
     def nav_eval_report(self, run_id: str | None = None) -> str:
+        """Return navigation evaluation metrics for a DogOps run."""
         store = self._require_store("nav_eval_report")
         if isinstance(store, str):
             return store
@@ -583,6 +602,7 @@ class DogOpsSkillContainer(Module):
 
     @skill
     def dock_align(self, dock_id: str = "DOCK_1") -> str:
+        """Report simulated AprilTag dock alignment readiness."""
         site = read_site_config(self.site_path)
         if not any(entity.id == dock_id for entity in site.special_entities.values()):
             return _json(ok=False, skill="dock_align", error="unknown_dock", dock_id=dock_id)
@@ -597,6 +617,7 @@ class DogOpsSkillContainer(Module):
 
     @skill
     def portal_entry(self, portal_id: str = "PORTAL_1") -> str:
+        """Report simulated readiness for gated portal entry."""
         site = read_site_config(self.site_path)
         if not any(entity.id == portal_id for entity in site.special_entities.values()):
             return _json(ok=False, skill="portal_entry", error="unknown_portal", portal_id=portal_id)
@@ -612,6 +633,7 @@ class DogOpsSkillContainer(Module):
 
     @skill
     def stop_mission(self) -> str:
+        """Stop the current DogOps mission run if one is active."""
         if not self._state_file().exists():
             return _json(ok=True, skill="stop_mission", state="not_started")
         store = DogOpsStore.load_existing(self.run_dir)
