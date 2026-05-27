@@ -340,6 +340,107 @@ class PackageStatus(DogOpsModel):
     blocks_asset_id: str | None = None
 
 
+class MapCell(DogOpsModel):
+    x_index: int
+    y_index: int
+    state: Literal["unknown", "free", "occupied", "restricted"] = "unknown"
+    confidence: float = 0.0
+
+
+class MapFeature(DogOpsModel):
+    id: str
+    kind: EntityKind
+    display_name: str
+    pose: Pose2D
+    radius_m: float = 0.4
+    source: str = "site_config"
+
+
+class SiteMap(DogOpsModel):
+    map_id: str = "dogops_open_space"
+    frame: str = "world"
+    status: Literal["empty", "mapping", "mapped"] = "empty"
+    source: str = "empty"
+    dimos_schema: str = "dimos.web.websocket_vis.v1"
+    dimos_costmap: dict[str, Any] | None = None
+    dimos_path: dict[str, Any] | None = None
+    robot_pose: Pose2D | None = None
+    resolution_m: float = 0.5
+    width_m: float = 4.5
+    height_m: float = 3.0
+    origin: Pose2D = Field(
+        default_factory=lambda: Pose2D(
+            x=-0.75,
+            y=-2.0,
+            theta_deg=0.0,
+            frame="world",
+            source="demo_map_origin",
+        )
+    )
+    cells: list[MapCell] = Field(default_factory=list)
+    explored_path: list[Pose2D] = Field(default_factory=list)
+    features: list[MapFeature] = Field(default_factory=list)
+    coverage_ratio: float = 0.0
+    cell_stats: dict[str, int | float] = Field(default_factory=dict)
+    notes: list[str] = Field(default_factory=list)
+
+
+class RouteWaypoint(DogOpsModel):
+    id: str
+    target_id: str
+    display_name: str
+    pose: Pose2D
+    order: int
+    action: Literal["goto", "scan", "inspect", "photo"] = "goto"
+    hold_s: float = 0.0
+    required: bool = True
+
+
+class PointOfInterest(DogOpsModel):
+    id: str
+    waypoint_id: str
+    target_id: str
+    display_name: str
+    pose: Pose2D
+    capture_photo: bool = True
+    reading_keys: list[str] = Field(default_factory=list)
+    analysis_prompt: str = ""
+
+
+class RoutePlan(DogOpsModel):
+    id: str = "operator_route"
+    name: str = "Operator route"
+    source: Literal["default", "operator", "simulation"] = "default"
+    waypoints: list[RouteWaypoint] = Field(default_factory=list)
+    points_of_interest: list[PointOfInterest] = Field(default_factory=list)
+
+
+class PointOfInterestCapture(DogOpsModel):
+    id: str
+    run_id: str
+    poi_id: str
+    ts: float
+    image_path: str | None = None
+    description: str
+    analysis: str
+    detected_entities: list[str] = Field(default_factory=list)
+    source: str = "simulation"
+    vlm_provider: str = "deterministic"
+    needs_api_key: bool = False
+
+
+class SensorReading(DogOpsModel):
+    id: str
+    run_id: str
+    poi_id: str
+    name: str
+    value: bool | str | int | float
+    unit: str = ""
+    status: Literal["normal", "warning", "critical", "unknown"] = "unknown"
+    source: str = "simulation"
+    notes: str = ""
+
+
 class DogOpsState(DogOpsModel):
     run: MissionRun
     site: SiteConfig
@@ -352,6 +453,10 @@ class DogOpsState(DogOpsModel):
     work_orders: list[WorkOrder] = Field(default_factory=list)
     nav_events: list[NavEvent] = Field(default_factory=list)
     nav_summary: NavSummary | None = None
+    site_map: SiteMap = Field(default_factory=SiteMap)
+    route_plan: RoutePlan = Field(default_factory=RoutePlan)
+    poi_captures: list[PointOfInterestCapture] = Field(default_factory=list)
+    sensor_readings: list[SensorReading] = Field(default_factory=list)
     what_changed: list[str] = Field(default_factory=list)
 
 

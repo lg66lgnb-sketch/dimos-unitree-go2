@@ -14,5 +14,9 @@ def test_report_contains_closed_loop_facts(tmp_path) -> None:
     assert "PKG-104 wrong zone and blocking COOLING_1" in report
     assert "INC-001 P1 blocked_cooling" in report
     assert "PKG-103 missing_package" in report
+    assert "Map: mapped" in report
+    assert "Route: " in report
+    assert "TEMP_1 thermometer reading is 27.4 C" in report
+    assert "temperature: 27.4C [normal]" in report
     assert "What changed: PKG-104 moved from COOLING_1/RACK_ROW_A to QA_HOLD" in report
     assert "Nav: 4/4 waypoints reached, 1 tag-search recovery, 0 safety stops" in report

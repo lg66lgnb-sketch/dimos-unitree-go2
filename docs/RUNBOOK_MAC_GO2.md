@@ -51,6 +51,16 @@ If this fails, fix the DimOS environment before asking Codex to implement DogOps
 
 ## Real Go2 Network Check
 
+For native simulation/replay on macOS, first inspect and, if needed, prepare the local LCM multicast route and socket buffers:
+
+```bash
+./scripts/macos_dimos_lcm_network.sh status
+./scripts/macos_dimos_lcm_network.sh dry-run-apply
+./scripts/macos_dimos_lcm_network.sh apply
+```
+
+See [macos_dimos_lcm_network.md](macos_dimos_lcm_network.md) for snapshot and restore steps.
+
 Set the IP once known:
 
 ```bash

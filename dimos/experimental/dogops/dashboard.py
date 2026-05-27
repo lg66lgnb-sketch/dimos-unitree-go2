@@ -16,6 +16,15 @@ from typing import Any
 from urllib.parse import urlparse
 
 from dimos.experimental.dogops.dashboard_static import write_dashboard_html
+from dimos.experimental.dogops.mapping import (
+    add_point_of_interest,
+    add_waypoint,
+    build_simulated_site_map,
+    simulate_poi_captures,
+)
+from dimos.experimental.dogops.models import NavAction, NavEvent
+from dimos.experimental.dogops.nav_eval import summarize_nav_events
+from dimos.experimental.dogops.rerun_sim import RERUN_COMMAND_FILENAME
 from dimos.experimental.dogops.store import DogOpsStore
 
 try:  # pragma: no cover - exercised only inside a full DimOS checkout.
@@ -29,6 +38,9 @@ except ModuleNotFoundError:
 
 
 DEFAULT_JOG_DURATION_S = 0.35
+PACKAGE_DIR = Path(__file__).parent
+REPO_ROOT = PACKAGE_DIR.parents[2]
+RERUN_WEB_VIEWER_DIR = REPO_ROOT / "node_modules" / "@rerun-io" / "web-viewer"
 MAX_JOG_DURATION_S = 1.20
 MAX_LINEAR_SPEED = 0.22
 MAX_ANGULAR_SPEED = 0.45
@@ -127,6 +139,16 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path in {"/", "/dashboard.html"}:
             self._send_file(self.run_dir / "dashboard.html", "text/html; charset=utf-8")
+        elif path.startswith("/assets/"):
+            asset = _resolve_dashboard_asset(path)
+            if asset is None:
+                self._send_json({"error": "asset_not_found", "path": path}, HTTPStatus.NOT_FOUND)
+            else:
+                self._send_file(*asset)
+        elif path.startswith("/evidence/"):
+            filename = Path(path).name
+            content_type = "image/svg+xml" if filename.endswith(".svg") else "application/octet-stream"
+            self._send_file(self.run_dir / "evidence" / filename, content_type)
         elif path == "/api/state":
             self._send_file(self.run_dir / "state.json", "application/json")
         elif path == "/api/report":
@@ -134,6 +156,18 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/nav":
             report = self._read_json(self.run_dir / "report.json")
             self._send_json(report.get("nav_summary") or {})
+        elif path == "/api/map":
+            self._send_file(self.run_dir / "map.json", "application/json")
+        elif path == "/api/route":
+            self._send_file(self.run_dir / "route_plan.json", "application/json")
+        elif path == "/api/poi":
+            report = self._read_json(self.run_dir / "report.json")
+            self._send_json(
+                {
+                    "captures": report.get("poi_captures") or [],
+                    "readings": report.get("sensor_readings") or [],
+                }
+            )
         else:
             self._send_json({"error": "not_found", "path": path}, HTTPStatus.NOT_FOUND)
 
@@ -144,6 +178,21 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
             self._mark_work_order_ready(work_order_id)
         elif path == "/api/operator/event":
             self._record_operator_event()
+        elif path == "/api/map/explore":
+            if self._authorize_dashboard_mutation():
+                self._explore_map()
+        elif path == "/api/route/waypoints":
+            if self._authorize_dashboard_mutation():
+                self._add_route_waypoint()
+        elif path == "/api/route/pois":
+            if self._authorize_dashboard_mutation():
+                self._add_route_poi()
+        elif path == "/api/route/run":
+            if self._authorize_dashboard_mutation():
+                self._run_route_plan()
+        elif path == "/api/rerun/replay_map":
+            if self._authorize_dashboard_mutation():
+                self._replay_rerun_map()
         elif path == "/api/robot/jog":
             if self._authorize_robot_control():
                 self._robot_jog()
@@ -166,7 +215,7 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
                 store.update_work_order(work_order)
                 store.write_state(state.run.id)
                 store.write_report(state.run.id)
-                write_dashboard_html(self.run_dir)
+                write_dashboard_html(self.run_dir, robot_control_token=self.robot_control_token)
                 self._send_json({"ok": True, "work_order_id": work_order_id, "state": "ready_to_verify"})
                 return
         self._send_json(
@@ -180,6 +229,143 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         with events_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, sort_keys=True) + "\n")
         self._send_json({"ok": True, "path": str(events_path)})
+
+    def _explore_map(self) -> None:
+        store = DogOpsStore.load_existing(self.run_dir)
+        state = store.state
+        assert state is not None
+        site_map = build_simulated_site_map(state.site, state.nav_events)
+        store.set_site_map(site_map)
+        store.write_state(state.run.id)
+        store.write_report(state.run.id)
+        command = _write_rerun_command(self.run_dir, "replay_mapping")
+        write_dashboard_html(self.run_dir, robot_control_token=self.robot_control_token)
+        self._send_json(
+            {
+                "ok": True,
+                "rerun": command,
+                "map": {
+                    "status": site_map.status,
+                    "coverage_ratio": site_map.coverage_ratio,
+                    "features": len(site_map.features),
+                },
+            }
+        )
+
+    def _add_route_waypoint(self) -> None:
+        payload = self._read_body_json()
+        target_id = str(payload.get("target_id") or "").strip()
+        if not target_id:
+            self._send_json({"ok": False, "error": "missing_target_id"}, HTTPStatus.BAD_REQUEST)
+            return
+        store = DogOpsStore.load_existing(self.run_dir)
+        state = store.state
+        assert state is not None
+        try:
+            add_waypoint(state.route_plan, state.site, target_id)
+        except KeyError:
+            self._send_json(
+                {"ok": False, "error": "unknown_target", "target_id": target_id},
+                HTTPStatus.BAD_REQUEST,
+            )
+            return
+        store.set_route_plan(state.route_plan)
+        store.write_state(state.run.id)
+        store.write_report(state.run.id)
+        write_dashboard_html(self.run_dir, robot_control_token=self.robot_control_token)
+        self._send_json(
+            {
+                "ok": True,
+                "waypoints": len(state.route_plan.waypoints),
+                "route_plan": state.route_plan.model_dump(mode="json"),
+            }
+        )
+
+    def _add_route_poi(self) -> None:
+        payload = self._read_body_json()
+        target_id = str(payload.get("target_id") or "").strip()
+        if not target_id:
+            self._send_json({"ok": False, "error": "missing_target_id"}, HTTPStatus.BAD_REQUEST)
+            return
+        reading_keys = payload.get("reading_keys")
+        if reading_keys is not None and not isinstance(reading_keys, list):
+            self._send_json({"ok": False, "error": "bad_reading_keys"}, HTTPStatus.BAD_REQUEST)
+            return
+        store = DogOpsStore.load_existing(self.run_dir)
+        state = store.state
+        assert state is not None
+        try:
+            add_point_of_interest(
+                state.route_plan,
+                state.site,
+                target_id,
+                waypoint_id=payload.get("waypoint_id"),
+                reading_keys=[str(item) for item in reading_keys] if reading_keys else None,
+            )
+        except KeyError:
+            self._send_json(
+                {"ok": False, "error": "unknown_target", "target_id": target_id},
+                HTTPStatus.BAD_REQUEST,
+            )
+            return
+        store.set_route_plan(state.route_plan)
+        store.write_state(state.run.id)
+        store.write_report(state.run.id)
+        write_dashboard_html(self.run_dir, robot_control_token=self.robot_control_token)
+        self._send_json(
+            {
+                "ok": True,
+                "points_of_interest": len(state.route_plan.points_of_interest),
+                "route_plan": state.route_plan.model_dump(mode="json"),
+            }
+        )
+
+    def _run_route_plan(self) -> None:
+        store = DogOpsStore.load_existing(self.run_dir)
+        state = store.state
+        assert state is not None
+        next_nav_index = len(state.nav_events) + 1
+        for offset, waypoint in enumerate(state.route_plan.waypoints):
+            store.append_nav_event(
+                NavEvent(
+                    id=f"NAV-{next_nav_index + offset:03d}",
+                    run_id=state.run.id,
+                    ts=time.time(),
+                    action=NavAction.goto,
+                    target_id=waypoint.target_id,
+                    success=True,
+                    elapsed_s=3.0 + (offset * 0.5),
+                    retries=0,
+                    guided=False,
+                    note="operator route simulation",
+                )
+            )
+        state.nav_summary = summarize_nav_events(state.run.id, state.nav_events)
+        site_map = build_simulated_site_map(state.site, state.nav_events)
+        store.set_site_map(site_map)
+        captures, readings = simulate_poi_captures(
+            run_id=state.run.id,
+            plan=state.route_plan,
+            evidence_dir=self.run_dir / "evidence",
+        )
+        store.replace_poi_results(captures, readings)
+        store.write_state(state.run.id)
+        store.write_report(state.run.id)
+        command = _write_rerun_command(self.run_dir, "replay_route")
+        write_dashboard_html(self.run_dir, robot_control_token=self.robot_control_token)
+        self._send_json(
+            {
+                "ok": True,
+                "rerun": command,
+                "waypoints_run": len(state.route_plan.waypoints),
+                "captures": len(captures),
+                "readings": len(readings),
+            }
+        )
+
+    def _replay_rerun_map(self) -> None:
+        command = _write_rerun_command(self.run_dir, "replay_mapping")
+        self._send_json({"ok": True, "rerun": command})
 
     def _robot_jog(self) -> None:
         payload = self._read_body_json()
@@ -296,6 +482,19 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
 
         return True
 
+    def _authorize_dashboard_mutation(self) -> bool:
+        host = self.headers.get("Host", "")
+        if not _is_loopback_host(_host_name(host)):
+            self._send_json({"ok": False, "error": "dashboard_local_only"}, HTTPStatus.FORBIDDEN)
+            return False
+
+        origin = self.headers.get("Origin")
+        if origin and not _origin_matches_host(origin, host):
+            self._send_json({"ok": False, "error": "dashboard_bad_origin"}, HTTPStatus.FORBIDDEN)
+            return False
+
+        return True
+
     def _send_file(self, path: Path, content_type: str) -> None:
         if not path.exists():
             self._send_json({"error": "missing_file", "path": str(path)}, HTTPStatus.NOT_FOUND)
@@ -343,6 +542,19 @@ def _run_robot_call(fn: Any) -> Any:
     if "error" in result:
         raise result["error"]
     return result.get("value")
+
+
+def _write_rerun_command(run_dir: Path, action: str) -> dict[str, object]:
+    command = {
+        "id": f"{action}-{time.time_ns()}",
+        "action": action,
+        "created_at": time.time(),
+    }
+    (run_dir / RERUN_COMMAND_FILENAME).write_text(
+        json.dumps(command, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    return command
 
 
 def _resolve_motion_request(
@@ -405,6 +617,28 @@ def _origin_matches_host(origin: str, host_header: str) -> bool:
     if not _is_loopback_host(origin_host):
         return False
     return origin_host == request_host and origin_port == request_port
+
+
+def _resolve_dashboard_asset(path: str) -> tuple[Path, str] | None:
+    if path == "/assets/rerun-web-viewer.js":
+        return PACKAGE_DIR / "static" / "rerun-web-viewer.js", "application/javascript; charset=utf-8"
+
+    vendor_prefix = "/assets/vendor/@rerun-io/web-viewer/"
+    if not path.startswith(vendor_prefix):
+        return None
+
+    filename = Path(path).name
+    asset_files = {
+        "index.js": ("index.js", "application/javascript; charset=utf-8"),
+        "re_viewer": ("re_viewer.js", "application/javascript; charset=utf-8"),
+        "re_viewer.js": ("re_viewer.js", "application/javascript; charset=utf-8"),
+        "re_viewer_bg.wasm": ("re_viewer_bg.wasm", "application/wasm"),
+    }
+    asset_file = asset_files.get(filename)
+    if asset_file is None:
+        return None
+    asset_name, content_type = asset_file
+    return RERUN_WEB_VIEWER_DIR / asset_name, content_type
 
 
 def _publish_robot_jog(

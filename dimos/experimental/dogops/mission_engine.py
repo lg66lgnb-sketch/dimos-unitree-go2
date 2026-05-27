@@ -19,6 +19,11 @@ from dimos.experimental.dogops.models import (
     WorkOrder,
     WorkOrderState,
 )
+from dimos.experimental.dogops.mapping import (
+    build_default_route_plan,
+    build_simulated_site_map,
+    simulate_poi_captures,
+)
 from dimos.experimental.dogops.nav_eval import summarize_nav_events
 from dimos.experimental.dogops.report import assert_report_has_closed_loop
 from dimos.experimental.dogops.store import DogOpsStore
@@ -44,6 +49,8 @@ class OfflineMissionEngine:
         assert state is not None
 
         self._record_nav_events(run.id)
+        self._map_open_space(state)
+        self._install_default_route_plan(state)
         self._localize_home(run.id)
         self._scan("scan_inbound", run.id, state)
         self._scan("inspect_cooling", run.id, state)
@@ -53,6 +60,7 @@ class OfflineMissionEngine:
         self._scan("verify_cooling_after_fix", run.id, state, source="simulated_human_fix")
         self._verify_work_order("WO-001", state)
         self._scan("scan_qa_hold", run.id, state)
+        self._capture_points_of_interest(run.id, state)
 
         state.nav_summary = summarize_nav_events(run.id, state.nav_events)
         summary = "Closed INC-001 after simulated human remediation; PKG-103 remains missing."
@@ -80,6 +88,22 @@ class OfflineMissionEngine:
                 note=sim_event.note,
             )
             self.store.append_nav_event(event)
+
+    def _map_open_space(self, state: DogOpsState) -> None:
+        site_map = build_simulated_site_map(self.config.site, state.nav_events)
+        self.store.set_site_map(site_map)
+        state.what_changed.append(
+            f"Mapped open space with {len(site_map.features)} landmarks and "
+            f"{site_map.coverage_ratio:.0%} simulated coverage."
+        )
+
+    def _install_default_route_plan(self, state: DogOpsState) -> None:
+        route_plan = build_default_route_plan(self.config.site)
+        self.store.set_route_plan(route_plan)
+        state.what_changed.append(
+            f"Route plan contains {len(route_plan.waypoints)} waypoints and "
+            f"{len(route_plan.points_of_interest)} photo points."
+        )
 
     def _localize_home(self, run_id: str) -> None:
         self._obs_count += 1
@@ -248,6 +272,19 @@ class OfflineMissionEngine:
             ]
             self.store.update_incident(incident)
             self.store.update_work_order(work_order)
+
+    def _capture_points_of_interest(self, run_id: str, state: DogOpsState) -> None:
+        captures, readings = simulate_poi_captures(
+            run_id=run_id,
+            plan=state.route_plan,
+            evidence_dir=self.store.evidence_dir,
+        )
+        self.store.replace_poi_results(captures, readings)
+        if readings:
+            summary = "; ".join(
+                f"{reading.name}={reading.value}{reading.unit}" for reading in readings[:3]
+            )
+            state.what_changed.append(f"POI readings analyzed: {summary}.")
 
     @staticmethod
     def _get_incident(incident_id: str, state: DogOpsState) -> Incident:

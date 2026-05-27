@@ -13,7 +13,11 @@ from dimos.experimental.dogops.models import (
     NavEvent,
     Observation,
     PackageStatus,
+    PointOfInterestCapture,
     PolicyConfig,
+    RoutePlan,
+    SensorReading,
+    SiteMap,
     SiteConfig,
     WorkOrder,
 )
@@ -112,6 +116,43 @@ class DogOpsStore:
         state = self._require_state(nav_event.run_id)
         state.nav_events.append(nav_event)
         self._append_jsonl("nav_events.jsonl", nav_event.model_dump(mode="json"))
+
+    def set_site_map(self, site_map: SiteMap) -> None:
+        state = self._require_state_by_any_run()
+        state.site_map = site_map
+        self._write_json(self.root / "map.json", site_map.model_dump(mode="json"))
+
+    def set_route_plan(self, route_plan: RoutePlan) -> None:
+        state = self._require_state_by_any_run()
+        state.route_plan = route_plan
+        self._write_json(self.root / "route_plan.json", route_plan.model_dump(mode="json"))
+
+    def append_poi_capture(self, capture: PointOfInterestCapture) -> None:
+        state = self._require_state(capture.run_id)
+        state.poi_captures.append(capture)
+        self._append_jsonl("poi_captures.jsonl", capture.model_dump(mode="json"))
+
+    def append_sensor_reading(self, reading: SensorReading) -> None:
+        state = self._require_state(reading.run_id)
+        state.sensor_readings.append(reading)
+        self._append_jsonl("sensor_readings.jsonl", reading.model_dump(mode="json"))
+
+    def replace_poi_results(
+        self,
+        captures: list[PointOfInterestCapture],
+        readings: list[SensorReading],
+    ) -> None:
+        state = self._require_state_by_any_run()
+        state.poi_captures = captures
+        state.sensor_readings = readings
+        self._rewrite_jsonl(
+            "poi_captures.jsonl",
+            [capture.model_dump(mode="json") for capture in captures],
+        )
+        self._rewrite_jsonl(
+            "sensor_readings.jsonl",
+            [reading.model_dump(mode="json") for reading in readings],
+        )
 
     def write_state(self, run_id: str) -> Path:
         state = self._require_state(run_id)

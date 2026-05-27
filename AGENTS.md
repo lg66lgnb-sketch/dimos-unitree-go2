@@ -22,20 +22,19 @@
 - Prefer running code over guessing. Read full errors, logs, and stack traces before editing.
 - After two failed fixes for the same issue, stop and summarize facts learned before changing strategy.
 - Validate DimOS registry/MCP early. Do not leave `dimos list | rg dogops` until final polish.
+- Use `$DIMOS_ROOT` / `DOGOPS_DIMOS_ROOT` for full-DimOS validation; never hard-code a contributor's local DimOS path in product code or docs.
 - For real-Go2 runs, keep speed/route conservative, verify `unitree-go2` before `unitree-go2-dogops`, and always run/know `uv run dimos stop --force`.
 
 ## Git and GitHub
-- Never commit or push directly to `main`/`master`; use a task branch or worktree.
+- Default to a dedicated git worktree for each non-trivial Codex thread. Do not work on a branch already used by another active thread.
+- Never commit or push directly to `main`/`master`; use a task branch in an isolated worktree.
 - At task start run: `git status -sb`, `git fetch --prune origin`, `git branch --show-current`, and `gh auth status`.
-- If Codex `gh` auth/API checks fail ambiguously, retry with approved network before declaring auth blocked.
 - Do not switch branches, pull, rebase, reset, stash, or discard local changes unless needed and safe.
 - When creating a task branch, base it on the current remote default branch.
-- Name task branches `<github-login>/<short-task>`, not `codex/...`.
 - Before committing, inspect `git diff` and commit only relevant files.
-- Before pushing, fetch again, verify branch/account, inspect commits for privacy/security issues, get explicit confirmation, and push only the current task branch.
+- Before pushing, fetch again, verify branch/account, and push only the current task branch.
 - Open draft PRs for non-trivial work; include summary, checks run, failures, and risks.
-- If `gh` is available when opening a PR, pass explicit `--title` and `--body`; do not rely on defaults.
-- For PR review requests, suggest `$simple-pr-review-loop` for standard review/fix cycles or `$deep-pr-review-loop` for adversarial subagent-backed review.
+- Clean up local worktrees after their branch is merged or no longer needed: confirm they are clean, remove with `git worktree remove <path>`, then prune stale metadata. Never remove a worktree that has uncommitted or unpushed work.
 - Never force-push shared branches. If explicitly needed on your own branch, use `--force-with-lease`.
 - Do not add `Co-Authored-By` unless explicitly requested.
 
@@ -52,12 +51,6 @@
 - Each subagent must read `SPEC.md`, this file, and `STATUS.md` if backlog-related.
 - Each subagent must report changed files, checks run, failures, and remaining risks.
 - Merge only after the main worktree passes the relevant checks.
-
-## Repo-local Codex skills
-- This repo vendors Codex skills under `.codex/skills/` so every Codex user gets the same review workflows.
-- Use `$simple-pr-review-loop` for normal PR/branch hardening: review, fix P0/P1/P2 findings, verify, commit, push, and re-review.
-- Use `$deep-pr-review-loop` for adversarial review loops, subagent review lenses, claim/spec validation, test adequacy review, or when a normal review may miss deeper route/state issues.
-- If those skill names are not listed in the current Codex session, read `.codex/skills/simple-pr-review-loop/SKILL.md` or `.codex/skills/deep-pr-review-loop/SKILL.md` directly and follow that workflow.
 
 ## Failure memory
 - Record repeated failures in `docs/FAILURE_MEMORY.md` before changing strategy.

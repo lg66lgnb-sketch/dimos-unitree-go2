@@ -3,8 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from dimos.experimental.dogops.dashboard import DogOpsDashboardModule
+from dimos.experimental.dogops.live_map import DogOpsLiveMapModule
 from dimos.experimental.dogops.nav_eval import DogOpsNavEvalModule
 from dimos.experimental.dogops.observation_module import DogOpsObservationModule
+from dimos.experimental.dogops.route_executor import DogOpsRouteExecutorModule
 from dimos.experimental.dogops.skills import DogOpsSkillContainer
 
 
@@ -15,6 +17,9 @@ class DogOpsBlueprintMetadata:
     robot_model: str = "unitree_go2"
     requires_mcp_client: bool = False
     fallback: bool = True
+
+    def global_config(self, **_: object) -> DogOpsBlueprintMetadata:
+        return self
 
 
 def build_unitree_go2_dogops_blueprint() -> object:
@@ -27,6 +32,8 @@ def build_unitree_go2_dogops_blueprint() -> object:
             name="unitree-go2-dogops",
             modules=(
                 "unitree_go2_markers",
+                "DogOpsLiveMapModule",
+                "DogOpsRouteExecutorModule",
                 "DogOpsObservationModule",
                 "DogOpsSkillContainer",
                 "McpServer",
@@ -37,12 +44,14 @@ def build_unitree_go2_dogops_blueprint() -> object:
 
     return autoconnect(
         unitree_go2_markers,
+        DogOpsLiveMapModule.blueprint(),
+        DogOpsRouteExecutorModule.blueprint(),
         DogOpsObservationModule.blueprint(),
         DogOpsSkillContainer.blueprint(),
         DogOpsDashboardModule.blueprint(),
         DogOpsNavEvalModule.blueprint(),
         McpServer.blueprint(),
-    ).global_config(n_workers=12, robot_model="unitree_go2")
+    )
 
 
 unitree_go2_dogops = build_unitree_go2_dogops_blueprint()

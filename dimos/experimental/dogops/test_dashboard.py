@@ -9,7 +9,7 @@ import pytest
 
 from dimos.experimental.dogops import dashboard
 from dimos.experimental.dogops.dashboard import DogOpsDashboardModule, make_dashboard_server
-from dimos.experimental.dogops.dashboard_static import write_dashboard_html
+from dimos.experimental.dogops.dashboard_static import dimos_viewer_urls, write_dashboard_html
 from dimos.experimental.dogops.mission_engine import run_offline_simulation
 
 
@@ -54,6 +54,29 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert "DogOps SiteOps Agent" in content
     assert "PKG-104" in content
     assert "INC-001" in content
+    assert "Live Inspection Console" in content
+    assert "Needs Attention" in content
+    assert "Machine Readings" in content
+    assert "Floor Changes" in content
+    assert "Route and inspection points" in content
+    assert 'data-map-viewer' in content
+    assert 'data-rerun-source-url="rerun+http://127.0.0.1:9877/proxy"' in content
+    assert 'data-rerun-module-url="/assets/rerun-web-viewer.js"' in content
+    assert 'data-rerun-asset-base-url="/assets/vendor/@rerun-io/web-viewer/"' in content
+    assert 'data-rerun-canvas' in content
+    assert 'data-viewer-offline' in content
+    assert 'class="map-target-overlay" data-route-map' in content
+    assert "data-viewer-offline data-route-map" not in content
+    assert "Offline map artifact" in content
+    assert "Inspection Evidence" in content
+    assert 'data-route-action="explore"' in content
+    assert 'data-route-action="replay-map"' in content
+    assert 'data-route-action="add-waypoint"' in content
+    assert 'data-route-action="add-poi"' in content
+    assert 'data-map-click-mode="waypoint"' in content
+    assert 'data-map-click-mode="poi"' in content
+    assert 'data-map-target-id="COOLING_1"' in content
+    assert "/evidence/" in content
     assert "Navigation Eval" in content
     assert "Robot Control" in content
     assert 'data-command="forward"' in content
@@ -64,6 +87,28 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert 'data-motion="step"' in content
     assert 'data-motion="walk"' in content
     assert "X-DogOps-Control-Token" in content
+
+
+def test_dashboard_viewer_urls_default_local_and_remote_gated(monkeypatch) -> None:
+    monkeypatch.setenv("DOGOPS_RERUN_SOURCE_URL", "rerun+http://10.0.0.5:9877/proxy")
+    monkeypatch.setenv("DOGOPS_RERUN_WEB_VIEWER_MODULE_URL", "https://cdn.example/viewer.js")
+    monkeypatch.setenv("DOGOPS_RERUN_WEB_VIEWER_ASSET_BASE_URL", "https://cdn.example/assets/")
+    monkeypatch.setenv("DOGOPS_COMMAND_CENTER_URL", "http://10.0.0.5:7779/command-center")
+
+    assert dimos_viewer_urls() == {
+        "rerun_source": "rerun+http://127.0.0.1:9877/proxy",
+        "web_viewer_module": "/assets/rerun-web-viewer.js",
+        "web_viewer_asset_base": "/assets/vendor/@rerun-io/web-viewer/",
+        "command_center": "http://127.0.0.1:7779/command-center",
+    }
+
+    monkeypatch.setenv("DOGOPS_ALLOW_REMOTE_VIEWER", "1")
+    assert dimos_viewer_urls() == {
+        "rerun_source": "rerun+http://10.0.0.5:9877/proxy",
+        "web_viewer_module": "https://cdn.example/viewer.js",
+        "web_viewer_asset_base": "https://cdn.example/assets/",
+        "command_center": "http://10.0.0.5:7779/command-center",
+    }
 
 
 def test_dashboard_module_writes_dashboard_and_reports_status(tmp_path) -> None:
@@ -93,6 +138,9 @@ def test_dashboard_api_serves_state_report_and_nav(tmp_path) -> None:
         state = _get_json(f"{base_url}/api/state")
         report = _get_json(f"{base_url}/api/report")
         nav = _get_json(f"{base_url}/api/nav")
+        site_map = _get_json(f"{base_url}/api/map")
+        route = _get_json(f"{base_url}/api/route")
+        poi = _get_json(f"{base_url}/api/poi")
     finally:
         server.shutdown()
         server.server_close()
@@ -102,6 +150,56 @@ def test_dashboard_api_serves_state_report_and_nav(tmp_path) -> None:
     assert state["run"]["state"] == "done"  # type: ignore[index]
     assert report["manifest_exceptions"] == 2
     assert nav["waypoints_reached"] == 4
+    assert site_map["status"] == "mapped"
+    assert site_map["dimos_schema"] == "dimos.web.websocket_vis.v1"
+    assert site_map["dimos_costmap"]["type"] == "costmap"  # type: ignore[index]
+    assert site_map["dimos_path"]["type"] == "path"  # type: ignore[index]
+    assert site_map["robot_pose"]["source"] in {"nav_event", "dimos_odom"}  # type: ignore[index]
+    assert len(route["waypoints"]) >= 5  # type: ignore[arg-type]
+    assert len(poi["captures"]) == 3  # type: ignore[arg-type]
+
+
+def test_dashboard_route_editor_mutates_local_run(tmp_path) -> None:
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        map_status, map_result = _post_json(f"{base_url}/api/map/explore", {})
+        replay_status, replay_result = _post_json(f"{base_url}/api/rerun/replay_map", {})
+        waypoint_status, waypoint_result = _post_json(
+            f"{base_url}/api/route/waypoints",
+            {"target_id": "NO_GO_1"},
+        )
+        poi_status, poi_result = _post_json(
+            f"{base_url}/api/route/pois",
+            {"target_id": "TEMP_1", "reading_keys": ["TEMP_1.temperature_celsius"]},
+        )
+        run_status, run_result = _post_json(f"{base_url}/api/route/run", {})
+        poi = _get_json(f"{base_url}/api/poi")
+        rerun_command = json.loads((run_dir / "rerun_command.json").read_text(encoding="utf-8"))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert map_status == 200
+    assert map_result["map"]["status"] == "mapped"  # type: ignore[index]
+    assert map_result["rerun"]["action"] == "replay_mapping"  # type: ignore[index]
+    assert replay_status == 200
+    assert replay_result["rerun"]["action"] == "replay_mapping"  # type: ignore[index]
+    assert waypoint_status == 200
+    assert waypoint_result["waypoints"] >= 6
+    assert poi_status == 200
+    assert poi_result["points_of_interest"] >= 4
+    assert run_status == 200
+    assert run_result["captures"] >= 4
+    assert run_result["rerun"]["action"] == "replay_route"  # type: ignore[index]
+    assert rerun_command["action"] == "replay_route"
+    assert len(poi["readings"]) >= 4  # type: ignore[arg-type]
 
 
 def test_dashboard_robot_jog_sends_low_speed_bounded_pulse(tmp_path, monkeypatch) -> None:

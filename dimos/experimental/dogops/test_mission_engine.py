@@ -19,3 +19,15 @@ def test_offline_simulation_closes_blocked_cooling_and_leaves_missing_package(tm
     assert state.package_statuses["PKG-104"].observed_zone_id == "QA_HOLD"
     assert state.nav_summary is not None
     assert state.nav_summary.waypoints_reached == 4
+    assert state.site_map.status == "mapped"
+    assert state.site_map.dimos_schema == "dimos.web.websocket_vis.v1"
+    assert state.site_map.dimos_costmap is not None
+    assert state.site_map.dimos_path is not None
+    assert state.site_map.robot_pose is not None
+    assert state.site_map.cell_stats["known"] > 0
+    assert state.site_map.coverage_ratio > 0.4
+    assert len(state.route_plan.waypoints) >= 5
+    assert len(state.route_plan.points_of_interest) == 3
+    assert len(state.poi_captures) == 3
+    assert any(reading.name == "temperature" for reading in state.sensor_readings)
+    assert state.poi_captures[0].image_path is not None

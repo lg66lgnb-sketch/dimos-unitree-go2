@@ -7,6 +7,7 @@ from dimos.experimental.dogops.models import (
     PackageState,
     WorkOrderState,
 )
+from dimos.experimental.dogops.mapping import map_summary
 
 
 def _value(value: object) -> object:
@@ -70,6 +71,14 @@ def build_report_data(state: DogOpsState) -> dict[str, object]:
             for incident in open_incidents
         ],
         "what_changed": state.what_changed,
+        "map": map_summary(state.site_map),
+        "route_plan": state.route_plan.model_dump(mode="json"),
+        "poi_captures": [
+            capture.model_dump(mode="json") for capture in state.poi_captures
+        ],
+        "sensor_readings": [
+            reading.model_dump(mode="json") for reading in state.sensor_readings
+        ],
         "nav_summary": nav.model_dump(mode="json") if nav else None,
         "packages": [status.model_dump(mode="json") for status in package_statuses],
         "incidents": [incident.model_dump(mode="json") for incident in state.incidents],
@@ -112,8 +121,31 @@ def render_report_markdown(state: DogOpsState) -> str:
             f"{nav.safety_stops} safety stops"
         )
 
+    lines.append(
+        "Map: "
+        f"{state.site_map.status}, {state.site_map.coverage_ratio:.0%} coverage, "
+        f"{len(state.site_map.features)} landmarks"
+    )
+    lines.append(
+        "Route: "
+        f"{len(state.route_plan.waypoints)} waypoints, "
+        f"{len(state.route_plan.points_of_interest)} photo points"
+    )
+
     for changed in state.what_changed:
         lines.append(f"What changed: {changed}")
+
+    lines.extend(["", "Point-of-interest results:"])
+    for capture in state.poi_captures:
+        lines.append(f"- {capture.poi_id}: {capture.analysis}")
+
+    if state.sensor_readings:
+        lines.extend(["", "Readings:"])
+        for reading in state.sensor_readings:
+            value = f"{reading.value}{reading.unit}" if reading.unit else str(reading.value)
+            lines.append(
+                f"- {reading.poi_id} {reading.name}: {value} [{reading.status}]"
+            )
 
     lines.extend(["", "Incidents:"])
     for incident in state.incidents:

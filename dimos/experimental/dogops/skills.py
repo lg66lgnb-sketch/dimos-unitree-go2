@@ -15,15 +15,26 @@ from dimos.experimental.dogops.config_loader import (
     load_site_config as read_site_config,
 )
 from dimos.experimental.dogops.mission_engine import run_offline_simulation
+from dimos.experimental.dogops.mapping import (
+    add_point_of_interest,
+    add_waypoint,
+    build_simulated_site_map,
+    map_summary,
+    simulate_poi_captures,
+)
 from dimos.experimental.dogops.models import (
     Incident,
     IncidentState,
     IncidentType,
     MissionState,
+    NavAction,
+    NavEvent,
+    RoutePlan,
     Severity,
     WorkOrder,
     WorkOrderState,
 )
+from dimos.experimental.dogops.nav_eval import summarize_nav_events
 from dimos.experimental.dogops.report import build_report_data
 from dimos.experimental.dogops.store import DogOpsStore
 
@@ -352,6 +363,164 @@ class DogOpsSkillContainer(Module):
             skill="nav_eval_report",
             run_id=state.run.id,
             nav_summary=state.nav_summary.model_dump(mode="json") if state.nav_summary else None,
+        )
+
+    @skill
+    def map_open_space(self) -> str:
+        store = self._require_store("map_open_space")
+        if isinstance(store, str):
+            return store
+        state = store.state
+        assert state is not None
+        site_map = build_simulated_site_map(state.site, state.nav_events)
+        store.set_site_map(site_map)
+        store.write_state(state.run.id)
+        store.write_report(state.run.id)
+        return _json(
+            ok=True,
+            skill="map_open_space",
+            run_id=state.run.id,
+            map=map_summary(site_map),
+        )
+
+    @skill
+    def set_route_plan(self, plan_json: str) -> str:
+        store = self._require_store("set_route_plan")
+        if isinstance(store, str):
+            return store
+        state = store.state
+        assert state is not None
+        try:
+            route_plan = RoutePlan.model_validate_json(plan_json)
+        except ValueError as exc:
+            return _json(ok=False, skill="set_route_plan", error="invalid_plan", message=str(exc))
+        store.set_route_plan(route_plan)
+        store.write_state(state.run.id)
+        store.write_report(state.run.id)
+        return _json(
+            ok=True,
+            skill="set_route_plan",
+            waypoints=len(route_plan.waypoints),
+            points_of_interest=len(route_plan.points_of_interest),
+        )
+
+    @skill
+    def add_route_waypoint(self, target_id: str) -> str:
+        store = self._require_store("add_route_waypoint")
+        if isinstance(store, str):
+            return store
+        state = store.state
+        assert state is not None
+        try:
+            add_waypoint(state.route_plan, state.site, target_id)
+        except KeyError:
+            return _json(
+                ok=False,
+                skill="add_route_waypoint",
+                error="unknown_target",
+                target_id=target_id,
+            )
+        store.set_route_plan(state.route_plan)
+        store.write_state(state.run.id)
+        store.write_report(state.run.id)
+        return _json(
+            ok=True,
+            skill="add_route_waypoint",
+            target_id=target_id,
+            waypoints=len(state.route_plan.waypoints),
+        )
+
+    @skill
+    def add_point_of_interest(self, target_id: str, reading_keys_json: str = "[]") -> str:
+        store = self._require_store("add_point_of_interest")
+        if isinstance(store, str):
+            return store
+        state = store.state
+        assert state is not None
+        try:
+            reading_keys = json.loads(reading_keys_json)
+        except json.JSONDecodeError:
+            reading_keys = []
+        if not isinstance(reading_keys, list):
+            reading_keys = []
+        try:
+            add_point_of_interest(
+                state.route_plan,
+                state.site,
+                target_id,
+                reading_keys=[str(item) for item in reading_keys],
+            )
+        except KeyError:
+            return _json(
+                ok=False,
+                skill="add_point_of_interest",
+                error="unknown_target",
+                target_id=target_id,
+            )
+        store.set_route_plan(state.route_plan)
+        store.write_state(state.run.id)
+        store.write_report(state.run.id)
+        return _json(
+            ok=True,
+            skill="add_point_of_interest",
+            target_id=target_id,
+            points_of_interest=len(state.route_plan.points_of_interest),
+        )
+
+    @skill
+    def run_route_plan(self) -> str:
+        store = self._require_store("run_route_plan")
+        if isinstance(store, str):
+            return store
+        state = store.state
+        assert state is not None
+        next_nav_index = len(state.nav_events) + 1
+        for offset, waypoint in enumerate(state.route_plan.waypoints):
+            store.append_nav_event(
+                NavEvent(
+                    id=f"NAV-{next_nav_index + offset:03d}",
+                    run_id=state.run.id,
+                    ts=time.time(),
+                    action=NavAction.goto,
+                    target_id=waypoint.target_id,
+                    success=True,
+                    elapsed_s=3.0 + (offset * 0.5),
+                    note="operator route simulation",
+                )
+            )
+        state.nav_summary = summarize_nav_events(state.run.id, state.nav_events)
+        site_map = build_simulated_site_map(state.site, state.nav_events)
+        store.set_site_map(site_map)
+        captures, readings = simulate_poi_captures(
+            run_id=state.run.id,
+            plan=state.route_plan,
+            evidence_dir=self.run_dir / "evidence",
+        )
+        store.replace_poi_results(captures, readings)
+        store.write_state(state.run.id)
+        store.write_report(state.run.id)
+        return _json(
+            ok=True,
+            skill="run_route_plan",
+            run_id=state.run.id,
+            waypoints_run=len(state.route_plan.waypoints),
+            captures=len(captures),
+            readings=len(readings),
+        )
+
+    @skill
+    def poi_report(self) -> str:
+        store = self._require_store("poi_report")
+        if isinstance(store, str):
+            return store
+        state = store.state
+        assert state is not None
+        return _json(
+            ok=True,
+            skill="poi_report",
+            run_id=state.run.id,
+            captures=[capture.model_dump(mode="json") for capture in state.poi_captures],
+            readings=[reading.model_dump(mode="json") for reading in state.sensor_readings],
         )
 
     @skill

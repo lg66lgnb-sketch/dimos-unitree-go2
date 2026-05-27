@@ -2,13 +2,13 @@
 
 ## 90-second script
 
-Target fallback level: L0 or L1 because the real Go2 is available.
+Target fallback level: L0 or L1 because the real Unitree Go2 Air is available.
 
 ```text
-L0 = full autonomous Go2 + DogOps dashboard + MCP
-L1 = Go2 scans tags + guided navigation + dashboard
-L2 = Go2 movement/tag video + offline dashboard/report
-L3 = offline product demo + recorded Go2 clip only
+L0 = full autonomous Go2 Air + DogOps dashboard + MCP
+L1 = Go2 Air scans tags + guided navigation + dashboard
+L2 = Go2 Air movement/tag video + offline dashboard/report
+L3 = offline product demo + recorded Go2 Air clip only
 ```
 
 State the fallback level in the final report/video if it is not L0.
@@ -17,7 +17,7 @@ State the fallback level in the final report/video if it is not L0.
 
 Say:
 
-> DogOps is a DimOS SiteOps Agent. It combines shipping and receiving, warehouse inspection, physical SRE, and navigation evaluation on a Unitree Go2.
+> DogOps is a DimOS SiteOps Agent. It combines shipping and receiving, warehouse inspection, physical SRE, and navigation evaluation on a Unitree Go2 Air.
 
 Show dashboard title and arena.
 
@@ -33,6 +33,14 @@ Fallback if MCP is blocked but the local product works:
 
 ```bash
 uv run python -m dimos.experimental.dogops.cli simulate --out .dogops/runs/latest
+```
+
+Show the dashboard map panel after mission start:
+
+```text
+Map: mapped
+Route: HOME -> INBOUND_DOCK -> COOLING_1 -> TEMP_1 -> QA_HOLD -> HOME
+Photo points: COOLING_1, TEMP_1, QA_HOLD
 ```
 
 ### 15-30s — inbound dock
@@ -104,6 +112,8 @@ Incidents opened: 2
 Work orders verified closed: 1
 Open exception: PKG-103 missing
 Nav: 5/5 waypoints reached, 1 recovery, 0 safety stops
+Map: mapped, local coverage visible
+POI readings: TEMP_1 27.4 C normal
 What changed: PKG-104 moved from COOLING_1 to QA_HOLD; INC-001 resolved.
 ```
 
@@ -113,9 +123,9 @@ What changed: PKG-104 moved from COOLING_1 to QA_HOLD; INC-001 resolved.
 
 ## Live demo fallback language
 
-If using the real Go2 with guided navigation:
+If using the real Go2 Air with guided navigation:
 
-> This is running on the Go2 with guided navigation for safety. DogOps records that intervention in the nav metrics while the SiteOps loop, work-order lifecycle, verification, and report run live.
+> This is running on the Go2 Air with guided navigation for safety. DogOps records that intervention in the nav metrics while the SiteOps loop, work-order lifecycle, verification, and report run live.
 
 If guided mode is used:
 

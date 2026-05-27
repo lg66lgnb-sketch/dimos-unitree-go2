@@ -1,4 +1,0 @@
-interface:
-  display_name: "Deep PR Review Loop"
-  short_description: "Adversarial PR review loop"
-  default_prompt: "Use $deep-pr-review-loop on this branch: search for P0/P1/P2 issues, fix actionable findings, verify, push, and repeat until no active P0/P1/P2 remain."

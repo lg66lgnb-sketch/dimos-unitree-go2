@@ -1,6 +1,6 @@
 # DogOps Hardware Handoff
 
-This is the Mac/Go2 handoff checklist. The real Go2 is available, so final validation should happen from the full DimOS checkout at `$DIMOS_ROOT`.
+This is the Mac/Go2 Air handoff checklist. The real Unitree Go2 Air is available, so final validation should happen from the full DimOS checkout at `$DIMOS_ROOT`.
 
 Do not use UTM unless the active thread is explicitly a VM-only development thread.
 
@@ -134,8 +134,8 @@ Collect:
 
 If guided navigation is used:
 
-> This is running on the Go2 with guided navigation for safety. DogOps records that intervention in the nav metrics while the SiteOps loop, work-order lifecycle, verification, and report run live.
+> This is running on the Go2 Air with guided navigation for safety. DogOps records that intervention in the nav metrics while the SiteOps loop, work-order lifecycle, verification, and report run live.
 
 If MCP or real-time streams fail:
 
-> This run uses the deterministic DogOps dashboard/report fallback with real Go2 movement evidence. Guided or offline steps are recorded honestly in the navigation metrics.
+> This run uses the deterministic DogOps dashboard/report fallback with real Go2 Air movement evidence. Guided or offline steps are recorded honestly in the navigation metrics.

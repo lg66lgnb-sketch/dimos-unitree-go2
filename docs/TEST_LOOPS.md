@@ -2,7 +2,7 @@
 
 ## Principle
 
-Use fast, narrow checks, but do not defer DimOS registry or real-Go2 validation until the end. The real dog is available, so hardware readiness is part of the core loop.
+Use fast, narrow checks, but do not defer DimOS registry or real Go2 Air validation until the end. The real dog is available, so hardware readiness is part of the core loop.
 
 After two failed corrections on the same issue, stop and write a failure-memory entry before continuing.
 
@@ -39,6 +39,12 @@ uv run python -m dimos.experimental.dogops.cli validate \
   --manifest examples/dogops/manifest_demo.yaml \
   --mission examples/dogops/mission_demo.yaml
 uv run python -m dimos.experimental.dogops.cli simulate --out .dogops/runs/latest
+uv run python -m dimos.experimental.dogops.cli map --run .dogops/runs/latest
+uv run python -m dimos.experimental.dogops.cli plan \
+  --run .dogops/runs/latest \
+  --add-waypoint TEMP_1 \
+  --add-poi TEMP_1
+uv run python -m dimos.experimental.dogops.cli run-plan --run .dogops/runs/latest
 cat .dogops/runs/latest/report.md
 ```
 
@@ -51,6 +57,9 @@ INC-001 P1 opened
 WO-001 ready/verified closed after human fix
 PKG-103 missing/open
 nav metrics present
+map and route artifacts present
+map.json includes DimOS-compatible costmap/path, robot pose, and DogOps overlays
+POI photos/readings present
 ```
 
 ## Part B: Dashboard
@@ -63,10 +72,30 @@ sleep 2
 curl -fsS http://127.0.0.1:8765/api/state | jq .
 curl -fsS http://127.0.0.1:8765/api/report | jq .
 curl -fsS http://127.0.0.1:8765/api/nav | jq .
+curl -fsS http://127.0.0.1:8765/api/map | jq .
+curl -fsS http://127.0.0.1:8765/api/route | jq .
+curl -fsS http://127.0.0.1:8765/api/poi | jq .
 kill "$DASH_PID"
 ```
 
 If port `8765` is busy, use another port and record it.
+
+For visual Rerun-map validation without the real Go2, also run:
+
+```bash
+uv run python -m dimos.experimental.dogops.cli rerun-sim --run .dogops/runs/latest
+```
+
+Then open the dashboard and confirm the standard map panel connects to Rerun; the SVG map is only the offline fallback.
+
+This is a lightweight 2D fallback. To validate the real 3D mapping look, run the native DimOS Go2 Air simulator first:
+
+```bash
+uv run dimos --simulation run unitree-go2
+uv run python -m dimos.experimental.dogops.cli rerun-sim --run .dogops/runs/latest --view-mode native-3d
+```
+
+The native DimOS simulator owns the lidar/point-cloud/global-map stream; DogOps only overlays route waypoints, POIs, obstacles, labels, and report evidence.
 
 Dashboard manual control has a separate regression contract because the dashboard UI can change while the basic movement capability should persist:
 
@@ -82,6 +111,9 @@ These tests must prove the underlying path still uses native Go2 Sport `Move` pl
 Run this as soon as the blueprint exists:
 
 ```bash
+export DIMOS_ROOT=/path/to/dimos
+./scripts/sync_into_dimos.sh
+cd "$DIMOS_ROOT"
 uv run pytest -q dimos/experimental/dogops
 CI=1 uv run pytest -q -o addopts='' dimos/robot/test_all_blueprints_generation.py || true
 git diff -- dimos/robot/all_blueprints.py
@@ -92,6 +124,9 @@ uv run dimos status || true
 uv run dimos mcp list-tools | rg 'run_mission|scan_zone|verify_work_order|nav_eval_report'
 uv run dimos stop --force || true
 ```
+
+Run these commands in the full DimOS checkout, not in the standalone DogOps pack. The sync
+script copies only DogOps-owned code/config paths and refuses non-DimOS targets.
 
 If replay deploys modules but `dimos status` or MCP discovery cannot see a running instance, document the exact blocker, check for lingering replay processes, and keep direct skill/CLI fallback working.
 
@@ -145,6 +180,7 @@ Each movement must report observed odometry (`cm` or `deg`). A successful HTTP r
 git status --short
 uv run pytest -q dimos/experimental/dogops
 uv run python -m dimos.experimental.dogops.cli simulate --out .dogops/runs/latest
+uv run python -m dimos.experimental.dogops.cli run-plan --run .dogops/runs/latest
 uv run ruff check dimos/experimental/dogops dimos/robot || true
 uv run dimos list | rg dogops
 git diff --check

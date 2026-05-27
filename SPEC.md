@@ -45,6 +45,7 @@ site policy + receiving manifest
 - API keys: none required. Gemini/OpenAI can be optional only.
 - Demo: both 90-second video and live demo.
 - Props available: paper boxes, PVC barrier tape, AprilTag 36h11 prints, quick clamps, small traffic cones, sticky A4 paper, pens, power bank, thermometer.
+- First physical demo should keep object classes intentionally narrow: about five traffic cones, three boxes, and one readable sign/thermometer station. Add more object categories only after the map/route/POI/report loop is stable.
 
 **Build rule:** The project must be useful and demoable after each major part. Do not create a fragile all-or-nothing build.
 
@@ -73,6 +74,16 @@ A shipment has arrived. One package is in the wrong zone and physically blocks c
 > DogOps receives a manifest, scans incoming packages, detects a misplaced package blocking cooling, opens a P1 work order, watches a human fix it, revisits the exact asset, verifies closure, and reports both SiteOps and navigation metrics.
 
 **Do not call this “patrol” in the main pitch.** Call it “inspection,” “work-order closure,” “facility operations,” “SiteOps,” or “physical SRE.”
+
+### Primary end-user stories
+
+DogOps is built for local facility operators who need physical-world status without turning every asset into an internet-connected device:
+
+- As a factory safety owner, I want the dog to visit important non-networked machines and report their visible/manual readings, so I can see overheating, warning states, or other machine errors early enough to react.
+- As a warehouse operations owner, I want the dog to compare the floor against the last inspection run, so I can see new obstructions, misplaced packages, blocked assets, or other orderliness issues that need a human fix.
+- As a local operator, I want route setup, live map context, manual safety controls, readings, photos, and “what changed” in one dashboard, so I can run the inspection without understanding DimOS internals.
+
+The dashboard should therefore prioritize current robot state, live map context, readings that need attention, floor changes since the last run, and the next human action. Raw navigation/debug detail belongs behind secondary views.
 
 ---
 
@@ -191,6 +202,8 @@ dimos/experimental/dogops/
   detector.py
   store.py
   mission_engine.py
+  live_map.py
+  route_executor.py
   observation_module.py
   skills.py
   nav_eval.py
@@ -686,6 +699,12 @@ mark_ready_to_verify(work_order_id: str) -> str
 verify_work_order(work_order_id: str) -> str
 what_changed(since_run_id: str | None = None) -> str
 nav_eval_report(run_id: str | None = None) -> str
+map_open_space() -> str
+set_route_plan(plan_json: str) -> str
+add_route_waypoint(target_id: str) -> str
+add_point_of_interest(target_id: str, reading_keys_json: str = "[]") -> str
+run_route_plan() -> str
+poi_report() -> str
 dock_align(dock_id: str = "DOCK_1") -> str
 portal_entry(portal_id: str = "PORTAL_1") -> str
 stop_mission() -> str
@@ -715,6 +734,12 @@ uv run python -m dimos.experimental.dogops.cli validate \
   --manifest examples/dogops/manifest_demo.yaml \
   --mission examples/dogops/mission_demo.yaml
 
+uv run python -m dimos.experimental.dogops.cli start \
+  --site examples/dogops/site_demo.yaml \
+  --manifest examples/dogops/manifest_demo.yaml \
+  --mission examples/dogops/mission_demo.yaml \
+  --out .dogops/runs/latest
+
 uv run python -m dimos.experimental.dogops.cli simulate \
   --site examples/dogops/site_demo.yaml \
   --manifest examples/dogops/manifest_demo.yaml \
@@ -724,6 +749,17 @@ uv run python -m dimos.experimental.dogops.cli simulate \
 uv run python -m dimos.experimental.dogops.cli report \
   --run .dogops/runs/latest \
   --out .dogops/runs/latest/report.md
+
+uv run python -m dimos.experimental.dogops.cli map \
+  --run .dogops/runs/latest
+
+uv run python -m dimos.experimental.dogops.cli plan \
+  --run .dogops/runs/latest \
+  --add-waypoint TEMP_1 \
+  --add-poi TEMP_1
+
+uv run python -m dimos.experimental.dogops.cli run-plan \
+  --run .dogops/runs/latest
 
 uv run python -m dimos.experimental.dogops.cli serve \
   --run .dogops/runs/latest \
@@ -817,9 +853,29 @@ GET /                  -> HTML dashboard
 GET /api/state         -> current run state JSON
 GET /api/report        -> report JSON
 GET /api/nav           -> nav eval JSON
+GET /api/map           -> local map JSON
+GET /api/route         -> route plan JSON
+GET /api/poi           -> point-of-interest captures/readings JSON
+POST /api/map/explore  -> create/refresh simulated open-space map
+POST /api/route/waypoints -> add route waypoint by known target ID
+POST /api/route/pois   -> add point of interest by known target ID
+POST /api/route/run    -> simulate route execution and POI capture analysis
 POST /api/work_orders/{id}/ready_to_verify -> mark ready
 POST /api/operator/event -> record manual/guided event
 ```
+
+Map payloads must reuse the existing DimOS Go2 map/navigation stack:
+
+- Do not build a new DogOps SLAM/map system. Use `VoxelGridMapper`, `CostMapper`, `ReplanningAStarPlanner`, `WavefrontFrontierExplorer`, `PatrollingModule`, and `MovementManager` through `unitree_go2_markers` / `unitree_go2_dogops`.
+- “What the dog mapped” is DimOS `global_costmap` / `OccupancyGrid` with values `-1` unknown, `0` free, and `100` occupied.
+- “Where he should go” is DogOps `RoutePlan` waypoints overlaid on that map.
+- “How he will get there” is DimOS planner `Path`.
+- “Where he is now” is DimOS `odom` / `PoseStamped`.
+- `DogOpsLiveMapModule` subscribes to `global_costmap`, `path`, and `odom`, persists full costmap snapshots into `site_map.dimos_costmap`, persists planner path into `site_map.dimos_path`, persists the latest robot pose, and computes known/free/occupied coverage stats.
+- Keep DogOps semantic overlays separate: zones, no-go areas, assets, package tags, incidents, POIs, and route waypoints. Do not treat policy no-go zones as physical obstacles unless a future planner integration explicitly injects them into costmaps.
+- The dashboard standard map panel embeds the real Rerun WebViewer (`@rerun-io/web-viewer`) against the local DimOS Rerun bridge. DogOps route/POI/report controls are overlaid around that map surface; `map.json` remains only the fallback artifact view for offline reports/tests.
+- `dogops rerun-sim` is only a lightweight 2D fallback stream. For real DimOS/MuJoCo-style 3D mapping visuals, run the native Unitree Go2 Air simulator path, for example `uv run dimos --simulation run unitree-go2`, then publish DogOps overlays with `dogops rerun-sim --view-mode native-3d` to the same local Rerun source.
+- Future alternative: make the DimOS/Rerun page the parent shell and embed DogOps as a side panel, or add a deeper Rerun click-coordinate bridge if the WebViewer exposes stable world-coordinate events.
 
 If the dashboard exposes direct Go2 manual controls, they must be conservative, measurable, and independent of the dashboard UI shape:
 
@@ -842,8 +898,9 @@ Required panels:
 4. Verification status.
 5. What changed.
 6. Navigation eval.
-7. Evidence images if available.
-8. Optional stretch: dock/portal readiness.
+7. Map and route editor with waypoints and POIs.
+8. Evidence images and reading analysis for each POI.
+9. Optional stretch: dock/portal readiness.
 
 ### 13.3 Report files
 
@@ -856,12 +913,16 @@ Every run writes:
   incidents.jsonl
   work_orders.jsonl
   nav_events.jsonl
+  map.json
+  route_plan.json
+  poi_captures.jsonl
+  sensor_readings.jsonl
   state.json
   report.json
   report.md
   dashboard.html
   evidence/
-    *.jpg or *.png
+    *.jpg, *.png, or simulator-generated *.svg
 ```
 
 The live dashboard can poll `state.json` every second. This is robust and easy.
@@ -883,6 +944,10 @@ update_incident(incident) -> None
 append_work_order(work_order) -> None
 update_work_order(work_order) -> None
 append_nav_event(nav_event) -> None
+set_site_map(site_map) -> None
+set_route_plan(route_plan) -> None
+append_poi_capture(capture) -> None
+append_sensor_reading(reading) -> None
 load_state(run_id) -> DogOpsState
 write_state(run_id) -> Path
 write_report(run_id) -> Path
@@ -941,6 +1006,9 @@ Must demonstrate in simulation:
 - `INC-001` verified closed.
 - `PKG-103` remains missing/open.
 - nav summary exists.
+- local map exists.
+- route plan has waypoints and POIs.
+- POI photo analysis and readings are present without cloud keys.
 
 Exit path if Part A gets stuck:
 
@@ -968,11 +1036,14 @@ uv run python -m dimos.experimental.dogops.cli simulate --out .dogops/runs/lates
 uv run python -m dimos.experimental.dogops.cli serve --run .dogops/runs/latest --port 8765
 curl -fsS http://127.0.0.1:8765/api/state | jq .run_id
 curl -fsS http://127.0.0.1:8765/api/report | jq .summary
+curl -fsS http://127.0.0.1:8765/api/map | jq .status
+curl -fsS http://127.0.0.1:8765/api/route | jq '.waypoints | length'
+curl -fsS http://127.0.0.1:8765/api/poi | jq '.readings | length'
 ```
 
 Visual success:
 
-- dashboard shows manifest, incidents, work orders, nav metrics, and what changed.
+- dashboard shows map, route plan, POI photos/readings, manifest, incidents, work orders, nav metrics, and what changed.
 
 Exit path:
 
@@ -1102,7 +1173,7 @@ Stretch order:
 2. `portal_entry(PORTAL_1)` fake elevator/threshold panel.
 3. Optional Gemini/LLM summary, behind env flag.
 4. Optional thermometer manual input UI.
-5. Optional Rerun overlay improvements.
+5. Optional live Rerun viewer link/recording polish.
 
 ---
 

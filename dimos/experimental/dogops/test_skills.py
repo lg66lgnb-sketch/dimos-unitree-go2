@@ -36,6 +36,21 @@ def test_skill_container_runs_closed_loop_and_reports_state(tmp_path) -> None:
     nav = _payload(skills.nav_eval_report())
     assert nav["nav_summary"]["waypoints_reached"] == 4  # type: ignore[index]
 
+    site_map = _payload(skills.map_open_space())
+    assert site_map["map"]["status"] == "mapped"  # type: ignore[index]
+
+    route = _payload(skills.add_route_waypoint("NO_GO_1"))
+    assert route["waypoints"] >= 6
+
+    poi = _payload(skills.add_point_of_interest("TEMP_1", '["TEMP_1.temperature_celsius"]'))
+    assert poi["points_of_interest"] >= 4
+
+    route_run = _payload(skills.run_route_plan())
+    assert route_run["captures"] >= 4
+
+    poi_report = _payload(skills.poi_report())
+    assert "temperature" in str(poi_report["readings"])
+
 
 def test_skill_container_work_order_methods_are_idempotent(tmp_path) -> None:
     skills = DogOpsSkillContainer(run_dir=tmp_path / "latest")
