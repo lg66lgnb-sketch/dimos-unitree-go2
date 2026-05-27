@@ -59,6 +59,8 @@ def test_build_mapping_frames_grows_lidar_map(tmp_path) -> None:
     assert len(frames[-1].mapped_free_points) >= len(frames[0].mapped_free_points)
     assert any(frame.lidar_rays for frame in frames)
     assert any(frame.lidar_hits for frame in frames)
+    assert any(frame.current_object_points for frame in frames)
+    assert any("PKG-104" in label for frame in frames for label in frame.mapped_object_labels)
 
 
 def test_demo_simulation_adds_obstacles_and_camera_frames(tmp_path) -> None:
@@ -90,7 +92,17 @@ class _FakeRerun:
             self.args = args
             self.kwargs = kwargs
 
+    class Points2D:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self.args = args
+            self.kwargs = kwargs
+
     class LineStrips3D:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self.args = args
+            self.kwargs = kwargs
+
+    class LineStrips2D:
         def __init__(self, *args: object, **kwargs: object) -> None:
             self.args = args
             self.kwargs = kwargs
@@ -128,6 +140,18 @@ def test_native_3d_mode_logs_world_overlays_without_forcing_2d_blueprint(tmp_pat
     assert "world/dogops/sim/objects" in paths
     assert "dogops/map/costmap" not in paths
     assert rr.blueprints == []
+
+
+def test_dogops_2d_mode_labels_map_owned_pois_and_objects(tmp_path) -> None:
+    state = run_offline_simulation(out=tmp_path / "latest")
+    rr = _FakeRerun()
+
+    log_state_to_rerun(rr, state, view_mode="dogops-2d", include_camera=False)
+    payload_by_path = {path: payload for path, payload in rr.logs}
+
+    assert payload_by_path["dogops/map/targets"].kwargs["show_labels"] is True
+    assert payload_by_path["dogops/map/pois"].kwargs["show_labels"] is True
+    assert payload_by_path["dogops/sim/objects"].kwargs["show_labels"] is True
 
 
 def test_native_3d_stream_requires_existing_dimos_rerun_source(monkeypatch) -> None:

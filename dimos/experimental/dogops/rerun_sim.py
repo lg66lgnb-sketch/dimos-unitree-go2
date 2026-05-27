@@ -76,6 +76,10 @@ class SimFrame:
     robot_path: list[list[float]]
     mapped_free_points: list[list[float]]
     mapped_occupied_points: list[list[float]]
+    mapped_object_points: list[list[float]]
+    mapped_object_labels: list[str]
+    current_object_points: list[list[float]]
+    current_object_labels: list[str]
     lidar_rays: list[list[list[float]]]
     lidar_hits: list[list[float]]
 
@@ -178,6 +182,9 @@ def build_mapping_frames(
 
     samples = _sample_path(path_world, max_frames=max_frames)
     known_cells = _known_cell_points(site_map, projection)
+    obstacles = demo_obstacles(state)
+    obstacle_points = [obstacle.point for obstacle in obstacles]
+    obstacle_labels = [obstacle.label for obstacle in obstacles]
     frames: list[SimFrame] = []
     for index, robot_world in enumerate(samples):
         prefix_world = samples[: index + 1]
@@ -185,7 +192,22 @@ def build_mapping_frames(
         robot_point = projection.pixel(robot_world[0], robot_world[1])
         mapped_free = _visible_points(prefix_px, known_cells["free"], radius_px=150.0)
         mapped_occupied = _visible_points(prefix_px, known_cells["occupied"], radius_px=150.0)
+        mapped_object_indexes = _visible_point_indexes(
+            prefix_px,
+            obstacle_points,
+            radius_px=150.0,
+        )
+        current_object_indexes = _visible_point_indexes(
+            [robot_point],
+            obstacle_points,
+            radius_px=170.0,
+        )
+        mapped_object_points = [obstacle_points[item] for item in mapped_object_indexes]
+        mapped_object_labels = [obstacle_labels[item] for item in mapped_object_indexes]
+        current_object_points = [obstacle_points[item] for item in current_object_indexes]
+        current_object_labels = [obstacle_labels[item] for item in current_object_indexes]
         lidar_hits = _visible_points([robot_point], known_cells["occupied"], radius_px=170.0)[:24]
+        lidar_hits = current_object_points + lidar_hits
         if len(lidar_hits) < 8:
             lidar_hits.extend(
                 _visible_points([robot_point], known_cells["free"], radius_px=150.0)[
@@ -203,6 +225,10 @@ def build_mapping_frames(
                 robot_path=prefix_px,
                 mapped_free_points=mapped_free,
                 mapped_occupied_points=mapped_occupied,
+                mapped_object_points=mapped_object_points,
+                mapped_object_labels=mapped_object_labels,
+                current_object_points=current_object_points,
+                current_object_labels=current_object_labels,
                 lidar_rays=lidar_rays,
                 lidar_hits=lidar_hits,
             )
@@ -503,8 +529,8 @@ def log_state_to_rerun(
         scene.target_points,
         scene.target_labels,
         [226, 232, 240, 255],
-        3.5,
-        show_labels=False,
+        4.5,
+        show_labels=True,
     )
     _log_points(
         rr,
@@ -512,8 +538,8 @@ def log_state_to_rerun(
         scene.poi_points,
         scene.poi_labels,
         [245, 158, 11, 255],
-        6.0,
-        show_labels=False,
+        8.0,
+        show_labels=True,
     )
     if scene.robot_point is None:
         rr.log("dogops/map/robot", rr.Clear(recursive=True))
@@ -525,7 +551,7 @@ def log_state_to_rerun(
                 radii=[8.0],
                 colors=[[248, 250, 252, 255]],
                 labels=["Go2"],
-                show_labels=False,
+                show_labels=True,
             ),
         )
     _log_line(rr, "dogops/map/robot_heading", scene.robot_heading, [248, 250, 252, 255], "heading")
@@ -819,6 +845,21 @@ def _visible_points(
     return visible
 
 
+def _visible_point_indexes(
+    sample_points_px: list[list[float]],
+    points_px: list[list[float]],
+    *,
+    radius_px: float,
+) -> list[int]:
+    if not sample_points_px or not points_px:
+        return []
+    visible: list[int] = []
+    for index, point in enumerate(points_px):
+        if any(math.dist(point, sample) <= radius_px for sample in sample_points_px):
+            visible.append(index)
+    return visible
+
+
 def _heading_target(samples: list[list[float]], index: int) -> list[float]:
     if index + 1 < len(samples):
         return samples[index + 1]
@@ -981,8 +1022,8 @@ def _log_mapping_frame(rr: Any, frame: SimFrame) -> None:
         "dogops/lidar/mapped_free",
         frame.mapped_free_points,
         ["free"] * len(frame.mapped_free_points),
-        [59, 130, 246, 210],
-        2.1,
+        [59, 130, 246, 235],
+        2.6,
         show_labels=False,
     )
     _log_points(
@@ -990,9 +1031,18 @@ def _log_mapping_frame(rr: Any, frame: SimFrame) -> None:
         "dogops/lidar/mapped_occupied",
         frame.mapped_occupied_points,
         ["occupied"] * len(frame.mapped_occupied_points),
-        [239, 68, 68, 235],
-        3.2,
+        [239, 68, 68, 255],
+        4.4,
         show_labels=False,
+    )
+    _log_points(
+        rr,
+        "dogops/lidar/mapped_objects",
+        frame.mapped_object_points,
+        frame.mapped_object_labels,
+        [245, 158, 11, 255],
+        7.5,
+        show_labels=True,
     )
     _log_points(
         rr,
@@ -1000,8 +1050,17 @@ def _log_mapping_frame(rr: Any, frame: SimFrame) -> None:
         frame.lidar_hits,
         ["lidar"] * len(frame.lidar_hits),
         [45, 212, 191, 255],
-        3.0,
+        4.6,
         show_labels=False,
+    )
+    _log_points(
+        rr,
+        "dogops/lidar/current_object_hits",
+        frame.current_object_points,
+        frame.current_object_labels,
+        [253, 224, 71, 255],
+        9.5,
+        show_labels=True,
     )
     rr.log("dogops/lidar/current_rays", rr.Clear(recursive=True))
     if frame.lidar_rays:
@@ -1023,7 +1082,7 @@ def _log_mapping_frame(rr: Any, frame: SimFrame) -> None:
             radii=[8.0],
             colors=[[248, 250, 252, 255]],
             labels=["Go2 mapping"],
-            show_labels=False,
+            show_labels=True,
         ),
     )
     _log_line(rr, "dogops/map/robot_heading", frame.robot_heading, [248, 250, 252, 255], "heading")
@@ -1050,10 +1109,10 @@ def _log_demo_obstacles(rr: Any, obstacles: list[SimObstacle]) -> None:
         "dogops/sim/objects",
         rr.Points2D(
             [obstacle.point for obstacle in obstacles],
-            radii=[7.0 if obstacle.kind != "cone" else 5.0 for obstacle in obstacles],
+            radii=[9.0 if obstacle.kind != "cone" else 6.5 for obstacle in obstacles],
             colors=[colors.get(obstacle.kind, [226, 232, 240, 255]) for obstacle in obstacles],
             labels=[obstacle.label for obstacle in obstacles],
-            show_labels=False,
+            show_labels=True,
         ),
     )
 

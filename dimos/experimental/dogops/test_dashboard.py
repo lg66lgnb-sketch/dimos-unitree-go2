@@ -135,6 +135,8 @@ def test_dashboard_rerun_sim_mode_keeps_rerun_as_primary_map(tmp_path) -> None:
     assert 'if (dogopsRuntimeMode === "offline")' in content
     assert 'data-rerun-canvas' in content
     assert 'data-viewer-offline hidden' in content
+    assert 'class="map-target-overlay" data-route-map' not in content
+    assert 'data-map-click-mode="inspection"' not in content
 
 
 def test_dashboard_viewer_urls_default_local_and_remote_gated(monkeypatch) -> None:

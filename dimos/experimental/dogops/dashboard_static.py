@@ -1265,6 +1265,20 @@ def map_viewer_panel(
         if rerun_embed_url
         else '<div class="rerun-canvas" data-rerun-canvas></div>'
     )
+    map_click_controls = (
+        ""
+        if runtime == "rerun-sim"
+        else (
+            '<div class="map-click-modes" aria-label="Map drawing mode">'
+            '<button type="button" data-map-click-mode="inspection" aria-pressed="false">Inspection Point Mode</button>'
+            "</div>"
+        )
+    )
+    target_overlay = (
+        ""
+        if runtime == "rerun-sim"
+        else f'<div class="map-target-overlay" data-route-map>{map_target_overlay(site_map, route_plan)}</div>'
+    )
     return (
         "<div>"
         '<div class="map-viewer" data-map-viewer '
@@ -1290,9 +1304,7 @@ def map_viewer_panel(
         '<button type="button" data-route-action="run">Run Route</button>'
         '<button type="button" data-route-action="replay-map">Replay Map</button>'
         "</div>"
-        '<div class="map-click-modes" aria-label="Map drawing mode">'
-        '<button type="button" data-map-click-mode="inspection" aria-pressed="false">Inspection Point Mode</button>'
-        "</div>"
+        + map_click_controls +
         '<div class="map-click-hint" data-map-click-status>Map authoring idle.</div>'
         '<div class="route-status" data-route-status>Route editor ready</div>'
         "</div>"
@@ -1305,7 +1317,7 @@ def map_viewer_panel(
         + motion_panel +
         "</div>"
         + rerun_surface
-        + f'<div class="map-target-overlay" data-route-map>{map_target_overlay(site_map, route_plan)}</div>'
+        + target_overlay +
         '<div class="viewer-offline" data-viewer-offline hidden>'
         f'<div class="map-viz">{map_svg(site_map, route_plan)}</div>'
         "</div>"
