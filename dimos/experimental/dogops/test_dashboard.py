@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from html import unescape
 import json
 import math
 from pathlib import Path
@@ -21,10 +22,18 @@ from dimos.experimental.dogops.dashboard_static import (
     write_dashboard_html,
 )
 from dimos.experimental.dogops.live_map import (
-    LIVE_TOPIC_MAX_AGE_S,
     DogOpsLiveMapAdapter,
+    LIVE_TOPIC_MAX_AGE_S,
     _extend_dimos_package_path,
     _grid_to_costmap,
+)
+from dimos.experimental.dogops.map_authoring import (
+    EditableMapEntity,
+    EditableMapPoint,
+    EditableRoute,
+    EditableRouteWaypoint,
+    MapAuthoringState,
+    save_map_authoring,
 )
 from dimos.experimental.dogops.mission_engine import run_offline_simulation
 
@@ -32,6 +41,19 @@ from dimos.experimental.dogops.mission_engine import run_offline_simulation
 def _get_json(url: str) -> dict[str, object]:
     with urllib.request.urlopen(url, timeout=5) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def _get_json_with_status(
+    url: str,
+    *,
+    headers: dict[str, str] | None = None,
+) -> tuple[int, dict[str, object]]:
+    request = urllib.request.Request(url, headers=headers or {}, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return exc.status, json.loads(exc.read().decode("utf-8"))
 
 
 def _post_json(
@@ -47,6 +69,39 @@ def _post_json(
         headers=request_headers,
         method="POST",
     )
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return exc.status, json.loads(exc.read().decode("utf-8"))
+
+
+def _put_json(
+    url: str,
+    payload: dict[str, Any],
+    *,
+    headers: dict[str, str] | None = None,
+) -> tuple[int, dict[str, object]]:
+    request_headers = {"Content-Type": "application/json", **(headers or {})}
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers=request_headers,
+        method="PUT",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return exc.status, json.loads(exc.read().decode("utf-8"))
+
+
+def _delete_json(
+    url: str,
+    *,
+    headers: dict[str, str] | None = None,
+) -> tuple[int, dict[str, object]]:
+    request = urllib.request.Request(url, headers=headers or {}, method="DELETE")
     try:
         with urllib.request.urlopen(request, timeout=5) as response:
             return response.status, json.loads(response.read().decode("utf-8"))
@@ -79,31 +134,46 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert 'data-live-path' in content
     assert 'data-live-target' in content
     assert "refreshDimOSMap" in content
+    assert 'data-map-edit-action="run_route"' in content
+    assert 'data-map-edit-action="stop_route"' in content
+    assert 'data-route-execution-status' in content
+    assert "/api/map/routes/follow" in content
+    assert "/api/map/routes/stop" in content
+    assert "/api/map/routes/status" in content
     assert "map-point" in content
     assert "map-robot-core" in content
     assert "free grid" in content
     assert "tag return" in content
     assert "no-go cost" in content
-    assert content.index("Rerun Map") < content.index("Mission Map")
-    assert 'data-map-viewer' in content
-    assert 'data-rerun-source-url="rerun+http://127.0.0.1:9877/proxy"' in content
-    assert 'data-rerun-canvas' in content
-    assert 'data-viewer-offline' in content
-    assert 'data-rerun-action="focus"' in content
-    assert 'data-rerun-action="replay"' in content
-    assert '"/assets/rerun-web-viewer.js"' in content
-    assert 'data-rerun-frame' not in content
+    assert 'data-rerun-surface' in content
+    assert 'data-rerun-connect' in content
+    assert 'data-rerun-frame' in content
+    assert 'data-rerun-url=' in content
     assert 'data-rerun-web-link' in content
+    assert "Rerun Web Visualization" in content
+    assert "connectRerunSurface" in content
     assert 'data-map-command-status' in content
-    assert 'data-map-action="map_from_scratch"' in content
-    assert 'data-map-action="return_home"' in content
-    assert 'data-map-action="arm_poi"' in content
-    assert 'data-map-action="run_poi_route"' in content
     assert 'data-map-action="arm_go_to"' in content
+    assert 'data-map-edit-mode="home"' in content
+    assert 'data-map-edit-mode="no_go"' in content
+    assert 'data-map-edit-action="use_observation"' in content
+    assert 'data-map-edit-action="delete_selected"' in content
+    assert 'data-map-edit-action="route_select"' in content
+    assert 'data-map-edit-action="route_up"' in content
+    assert 'data-map-edit-action="route_down"' in content
+    assert 'data-map-edit-action="publish_no_go"' in content
+    assert 'data-map-edit-action="export"' in content
+    assert 'data-map-authoring-status' in content
+    assert "/api/map/authoring" in content
+    assert "/api/map/entities" in content
+    assert "/api/map/no_go_shapes" in content
+    assert "/api/map/no_go_shapes/publish" in content
+    assert "/api/map/tag_bindings" in content
+    assert "/from_observation" in content
+    assert "if (!current.selected_route_id) return null" in content
+    assert "selected_route_id: route.id" in content
     assert 'data-go-to-marker' in content
     assert "/api/robot/go_to" in content
-    assert "/api/route/poi" in content
-    assert "/api/route/pois/run" in content
     assert "worldFromSvgEvent" in content
     assert "map-zone no-go" not in content
     assert "OBS-003" in content
@@ -137,6 +207,48 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert 'data-motion="step"' in content
     assert 'data-motion="walk"' in content
     assert "X-DogOps-Control-Token" in content
+
+
+def test_dashboard_static_embeds_full_authoring_state(tmp_path) -> None:
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    save_map_authoring(
+        run_dir,
+        MapAuthoringState(
+            site_id="dogops_demo_site",
+            entities=[
+                EditableMapEntity(
+                    id="CHECKPOINT_X",
+                    kind="checkpoint",
+                    label="Checkpoint X",
+                    pose=EditableMapPoint(x=1.0, y=2.0),
+                )
+            ],
+            routes=[
+                EditableRoute(
+                    id="ROUTE_X",
+                    label="Route X",
+                    waypoints=[
+                        EditableRouteWaypoint(
+                            id="WP_X",
+                            label="Waypoint X",
+                            pose=EditableMapPoint(x=3.0, y=4.0),
+                        )
+                    ],
+                )
+            ],
+        ),
+    )
+
+    content = write_dashboard_html(run_dir).read_text(encoding="utf-8")
+    match = re.search(r'data-map-authoring="([^"]+)"', content)
+    assert match is not None
+    authoring = json.loads(unescape(match.group(1)))
+
+    assert authoring["entities"][0]["id"] == "CHECKPOINT_X"
+    assert authoring["routes"][0]["waypoints"][0]["id"] == "WP_X"
+    assert not isinstance(authoring["entities"], int)
+    assert not isinstance(authoring["routes"], int)
 
 
 def test_dashboard_map_layer_controls_match_svg_layers(tmp_path) -> None:
@@ -177,26 +289,6 @@ def test_dashboard_rerun_web_url_stays_loopback_only() -> None:
     assert dashboard_static._trusted_rerun_web_url("javascript:alert(1)") == fallback
 
 
-def test_dashboard_rerun_source_url_stays_loopback_only() -> None:
-    fallback = "rerun+http://127.0.0.1:9877/proxy"
-
-    assert dashboard_static._trusted_rerun_source_url(None) == fallback
-    assert (
-        dashboard_static._trusted_rerun_source_url("rerun+http://127.0.0.1:9877/proxy")
-        == fallback
-    )
-    assert (
-        dashboard_static._trusted_rerun_source_url("rerun+ws://localhost:9877/proxy")
-        == "rerun+ws://localhost:9877/proxy"
-    )
-    assert dashboard_static._trusted_rerun_source_url("http://127.0.0.1:9877") == fallback
-    assert (
-        dashboard_static._trusted_rerun_source_url("rerun+https://rerun.example.com/proxy")
-        == fallback
-    )
-    assert dashboard_static._trusted_rerun_source_url("javascript:alert(1)") == fallback
-
-
 def test_dashboard_module_writes_dashboard_and_reports_status(tmp_path) -> None:
     run_dir = tmp_path / "latest"
     run_offline_simulation(out=run_dir)
@@ -221,12 +313,11 @@ def test_dashboard_api_serves_state_report_and_nav(tmp_path) -> None:
     try:
         with urllib.request.urlopen(f"{base_url}/", timeout=5) as response:
             html = response.read().decode("utf-8")
-        with urllib.request.urlopen(f"{base_url}/assets/rerun-web-viewer.js", timeout=5) as response:
-            rerun_asset = response.read().decode("utf-8")
         state = _get_json(f"{base_url}/api/state")
         report = _get_json(f"{base_url}/api/report")
         nav = _get_json(f"{base_url}/api/nav")
         map_data = _get_json(f"{base_url}/api/map")
+        authoring = _get_json(f"{base_url}/api/map/authoring")
         route = _get_json(f"{base_url}/api/route")
         poi = _get_json(f"{base_url}/api/poi")
     finally:
@@ -235,7 +326,6 @@ def test_dashboard_api_serves_state_report_and_nav(tmp_path) -> None:
         thread.join(timeout=5)
 
     assert "DogOps SiteOps Agent" in html
-    assert "mountDogOpsRerunViewer" in rerun_asset
     assert state["run"]["state"] == "done"  # type: ignore[index]
     assert report["manifest_exceptions"] == 2
     assert report["checkpoints_verified"] == 4
@@ -260,6 +350,360 @@ def test_dashboard_api_serves_state_report_and_nav(tmp_path) -> None:
     assert any(package["id"] == "PKG-104" for package in map_data["packages"])
     assert map_data["live"]["source"] == "DimOS live LCM topics"  # type: ignore[index]
     assert "costmap" in map_data["live"]  # type: ignore[operator]
+    assert authoring["schema_version"] == 1
+    assert authoring["site_id"] == "dogops_demo_site"
+
+
+def test_dashboard_map_authoring_endpoints_persist_and_compose(tmp_path) -> None:
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        status, entity_result = _post_json(
+            f"{base_url}/api/map/entities",
+            {
+                "id": "CHECKPOINT_X",
+                "kind": "checkpoint",
+                "label": "Checkpoint X",
+                "pose": {"x": 7.0, "y": 8.0, "source": "dashboard_edit"},
+                "tag_id": 222,
+            },
+            headers=_robot_headers(server),
+        )
+        status_shape, shape_result = _post_json(
+            f"{base_url}/api/map/no_go_shapes",
+            {
+                "id": "NO_GO_EDIT",
+                "label": "Edited No-Go",
+                "shape": "rectangle",
+                "points": [
+                    {"x": 6.0, "y": 6.0, "source": "dashboard_edit"},
+                    {"x": 7.0, "y": 7.0, "source": "dashboard_edit"},
+                ],
+                "enabled": True,
+            },
+            headers=_robot_headers(server),
+        )
+        status_route, route_result = _post_json(
+            f"{base_url}/api/map/routes",
+            {
+                "id": "ROUTE_EDIT",
+                "label": "Edited Route",
+                "waypoints": [
+                    {
+                        "id": "WP1",
+                        "label": "Waypoint 1",
+                        "target_id": "CHECKPOINT_X",
+                        "pose": {"x": 7.0, "y": 8.0, "source": "dashboard_edit"},
+                    }
+                ],
+            },
+            headers=_robot_headers(server),
+        )
+        map_data = _get_json(f"{base_url}/api/map")
+        with urllib.request.urlopen(f"{base_url}/dashboard.html", timeout=5) as response:
+            html = response.read().decode("utf-8")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 200
+    assert status_shape == 200
+    assert status_route == 200
+    assert entity_result["ok"] is True
+    assert shape_result["authoring"]["no_go_shapes"][0]["dimos_constraint_status"] == "not_supported"  # type: ignore[index]
+    assert route_result["authoring"]["routes"][0]["id"] == "ROUTE_EDIT"  # type: ignore[index]
+    assert (run_dir / "map_authoring.json").exists()
+    assert any(zone["id"] == "CHECKPOINT_X" for zone in map_data["zones"])
+    assert map_data["route"][0]["target_id"] == "CHECKPOINT_X"  # type: ignore[index]
+    assert map_data["no_go_shapes"][0]["id"] == "NO_GO_EDIT"  # type: ignore[index]
+    match = re.search(r'data-map-authoring="([^"]+)"', html)
+    assert match is not None
+    embedded_authoring = json.loads(unescape(match.group(1)))
+    assert embedded_authoring["entities"][0]["id"] == "CHECKPOINT_X"
+    assert embedded_authoring["routes"][0]["id"] == "ROUTE_EDIT"
+
+
+def test_dashboard_map_authoring_rejects_duplicate_tag_binding(tmp_path) -> None:
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    payload = {
+        "tag_id": 222,
+        "entity_id": "CHECKPOINT_X",
+        "label": "Checkpoint X",
+        "binding_kind": "checkpoint",
+    }
+    try:
+        first_status, first = _post_json(
+            f"{base_url}/api/map/tag_bindings",
+            payload,
+            headers=_robot_headers(server),
+        )
+        second_status, second = _post_json(
+            f"{base_url}/api/map/tag_bindings",
+            payload,
+            headers=_robot_headers(server),
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert first_status == 200
+    assert first["ok"] is True
+    assert second_status == 400
+    assert second["ok"] is False
+    assert second["error"] == "invalid_map_authoring"
+
+
+def test_dashboard_map_authoring_write_requires_token(tmp_path) -> None:
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        status, result = _post_json(
+            f"{base_url}/api/map/entities",
+            {
+                "id": "CHECKPOINT_FORBIDDEN",
+                "kind": "checkpoint",
+                "label": "Checkpoint Forbidden",
+                "pose": {"x": 1.0, "y": 2.0, "source": "dashboard_edit"},
+            },
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 403
+    assert result["ok"] is False
+    assert result["error"] == "map_authoring_forbidden"
+    assert not (run_dir / "map_authoring.json").exists()
+
+
+def test_dashboard_map_authoring_write_rejects_cross_origin(tmp_path) -> None:
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        status, result = _post_json(
+            f"{base_url}/api/map/entities",
+            {
+                "id": "CHECKPOINT_BAD_ORIGIN",
+                "kind": "checkpoint",
+                "label": "Checkpoint Bad Origin",
+                "pose": {"x": 1.0, "y": 2.0, "source": "dashboard_edit"},
+            },
+            headers={**_robot_headers(server), "Origin": "https://example.com"},
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 403
+    assert result["ok"] is False
+    assert result["error"] == "map_authoring_bad_origin"
+    assert not (run_dir / "map_authoring.json").exists()
+
+
+def test_dashboard_map_authoring_delete_and_export(tmp_path) -> None:
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        _post_json(
+            f"{base_url}/api/map/entities",
+            {
+                "id": "CHECKPOINT_DELETE",
+                "kind": "checkpoint",
+                "label": "Checkpoint Delete",
+                "pose": {"x": 2.0, "y": 3.0, "source": "dashboard_edit"},
+            },
+            headers=_robot_headers(server),
+        )
+        delete_status, delete_result = _delete_json(
+            f"{base_url}/api/map/entities/CHECKPOINT_DELETE",
+            headers=_robot_headers(server),
+        )
+        export_status, export_result = _post_json(
+            f"{base_url}/api/map/export",
+            {},
+            headers=_robot_headers(server),
+        )
+        authoring = _get_json(f"{base_url}/api/map/authoring")
+        map_data = _get_json(f"{base_url}/api/map")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert delete_status == 200
+    assert delete_result["ok"] is True
+    assert export_status == 200
+    assert export_result["ok"] is True
+    assert not any(
+        entity["id"] == "CHECKPOINT_DELETE"
+        for entity in authoring["entities"]  # type: ignore[index]
+    )
+    assert not any(zone["id"] == "CHECKPOINT_DELETE" for zone in map_data["zones"])
+    site_yaml = (run_dir / "exports" / "site_authoring.yaml")
+    assert site_yaml.exists()
+    assert "CHECKPOINT_DELETE" not in site_yaml.read_text(encoding="utf-8")
+
+
+def test_dashboard_map_authoring_observation_placement_and_route_select(tmp_path) -> None:
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        status_place, placed = _post_json(
+            f"{base_url}/api/map/entities/COOLING_1/from_observation",
+            {"observation_id": "OBS-003", "kind": "asset"},
+            headers=_robot_headers(server),
+        )
+        status_route, route_result = _post_json(
+            f"{base_url}/api/map/routes",
+            {
+                "id": "ROUTE_SELECT",
+                "label": "Route Select",
+                "waypoints": [
+                    {
+                        "id": "WP_SELECT",
+                        "label": "Waypoint Select",
+                        "target_id": "COOLING_1",
+                        "pose": {"x": 8.0, "y": 9.0, "source": "dashboard_edit"},
+                    }
+                ],
+            },
+            headers=_robot_headers(server),
+        )
+        status_select, selected = _post_json(
+            f"{base_url}/api/map/routes/ROUTE_SELECT/select",
+            {},
+            headers=_robot_headers(server),
+        )
+        map_data = _get_json(f"{base_url}/api/map")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status_place == 200
+    assert status_route == 200
+    assert status_select == 200
+    assert placed["authoring"]["entities"][0]["id"] == "COOLING_1"  # type: ignore[index]
+    assert route_result["authoring"]["selected_route_id"] == "ROUTE_SELECT"  # type: ignore[index]
+    assert selected["authoring"]["selected_route_id"] == "ROUTE_SELECT"  # type: ignore[index]
+    assert map_data["authoring"]["selected_route_id"] == "ROUTE_SELECT"  # type: ignore[index]
+    assert map_data["route"][0]["target_id"] == "COOLING_1"  # type: ignore[index]
+
+
+def test_dashboard_no_go_publish_keeps_unsupported_without_publisher(tmp_path) -> None:
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        _post_json(
+            f"{base_url}/api/map/no_go_shapes",
+            {
+                "id": "NO_GO_PUBLISH",
+                "label": "Publish No-Go",
+                "shape": "rectangle",
+                "points": [
+                    {"x": 1.0, "y": 1.0, "source": "dashboard_edit"},
+                    {"x": 2.0, "y": 2.0, "source": "dashboard_edit"},
+                ],
+                "enabled": True,
+            },
+            headers=_robot_headers(server),
+        )
+        status, result = _post_json(
+            f"{base_url}/api/map/no_go_shapes/publish",
+            {},
+            headers=_robot_headers(server),
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 200
+    assert result["ok"] is True
+    assert result["authoring"]["no_go_shapes"][0]["dimos_constraint_status"] == "not_supported"  # type: ignore[index]
+
+
+def test_dashboard_no_go_publish_persists_published_status(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("DOGOPS_NO_GO_PUBLISH_COMMAND", "true")
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        _post_json(
+            f"{base_url}/api/map/no_go_shapes",
+            {
+                "id": "NO_GO_PUBLISH",
+                "label": "Publish No-Go",
+                "shape": "rectangle",
+                "points": [
+                    {"x": 1.0, "y": 1.0, "source": "dashboard_edit"},
+                    {"x": 2.0, "y": 2.0, "source": "dashboard_edit"},
+                ],
+                "enabled": True,
+            },
+            headers=_robot_headers(server),
+        )
+        status, result = _post_json(
+            f"{base_url}/api/map/no_go_shapes/publish",
+            {},
+            headers=_robot_headers(server),
+        )
+        authoring = _get_json(f"{base_url}/api/map/authoring")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 200
+    assert result["authoring"]["no_go_shapes"][0]["dimos_constraint_status"] == "published"  # type: ignore[index]
+    assert authoring["no_go_shapes"][0]["dimos_constraint_status"] == "published"  # type: ignore[index]
 
 
 def test_dashboard_map_data_projects_site_route_and_observations(tmp_path) -> None:
@@ -942,21 +1386,105 @@ def test_dashboard_robot_go_to_rejects_bad_target(tmp_path, monkeypatch) -> None
     assert result["error"] == "invalid_go_to_target"
 
 
-def test_dashboard_robot_map_from_scratch_starts_exploration(tmp_path, monkeypatch) -> None:
-    calls: list[tuple[str, dict[str, object]]] = []
+def test_dashboard_route_follow_stop_and_status_endpoints(tmp_path, monkeypatch) -> None:
+    calls: list[tuple[str | None, bool]] = []
+    timeouts: list[float] = []
 
-    monkeypatch.setattr(
-        dashboard,
-        "_start_robot_map",
-        lambda robot_ip: {"connected": True, "robot_ip": robot_ip},
+    def fake_follow(route_id: str | None, dry_run: bool) -> dict[str, object]:
+        calls.append((route_id, dry_run))
+        return {
+            "transport": "dimos_mcp",
+            "skill": "follow_route",
+            "mcp_result": {
+                "ok": True,
+                "route_id": route_id,
+                "state": "completed",
+                "route_execution": {"route_id": route_id, "state": "completed"},
+            },
+        }
+
+    def fake_stop() -> dict[str, object]:
+        return {
+            "transport": "dimos_mcp",
+            "skill": "stop_route",
+            "mcp_result": {"ok": True, "state": "stopped", "route_execution": {"state": "stopped"}},
+        }
+
+    monkeypatch.setattr(dashboard, "_run_robot_follow_route", fake_follow)
+    monkeypatch.setattr(dashboard, "_run_robot_stop_route", fake_stop)
+    monkeypatch.setattr(dashboard, "_run_route_hard_stop", lambda robot_ip: {"robot_ip": robot_ip})
+    original_run_robot_call = dashboard._run_robot_call
+
+    def tracking_run_robot_call(fn: Any, *, timeout_s: float = dashboard.ROBOT_CALL_TIMEOUT_S) -> object:
+        timeouts.append(timeout_s)
+        return original_run_robot_call(fn, timeout_s=timeout_s)
+
+    monkeypatch.setattr(dashboard, "_run_robot_call", tracking_run_robot_call)
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    save_map_authoring(
+        run_dir,
+        MapAuthoringState(
+            selected_route_id="ROUTE_A",
+            routes=[
+                EditableRoute(
+                    id="ROUTE_A",
+                    label="Route A",
+                    waypoints=[
+                        EditableRouteWaypoint(
+                            id="WP-1",
+                            label="Waypoint 1",
+                            pose=EditableMapPoint(x=1.0, y=2.0),
+                        )
+                    ],
+                )
+            ],
+        ),
     )
-    monkeypatch.setattr(dashboard, "_reset_robot_map_origin", lambda robot_ip: True)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
 
-    def fake_mcp(skill_name: str, args: dict[str, object]) -> dict[str, object]:
-        calls.append((skill_name, args))
-        return {"transport": "dimos_mcp", "skill": skill_name}
+    try:
+        status_follow, follow_result = _post_json(
+            f"{base_url}/api/map/routes/follow",
+            {"route_id": "ROUTE_A", "dry_run": True},
+            headers=_robot_headers(server),
+        )
+        status_status, status_result = _get_json_with_status(
+            f"{base_url}/api/map/routes/status",
+            headers=_robot_headers(server),
+        )
+        status_stop, stop_result = _post_json(
+            f"{base_url}/api/map/routes/stop",
+            {},
+            headers=_robot_headers(server),
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
-    monkeypatch.setattr(dashboard, "_call_dimos_mcp_skill", fake_mcp)
+    assert status_follow == 200
+    assert follow_result["ok"] is True
+    assert follow_result["command"] == "follow_route"
+    assert follow_result["route_execution"]["state"] == "completed"  # type: ignore[index]
+    assert follow_result["authoring"]["selected_route_id"] == "ROUTE_A"  # type: ignore[index]
+    assert calls == [("ROUTE_A", True)]
+    assert timeouts[0] == dashboard.DIMOS_ROUTE_CALL_TIMEOUT_S
+    assert status_status == 200
+    assert status_result["ok"] is True
+    assert status_result["route_execution"]["state"] == "idle"  # type: ignore[index]
+    assert status_stop == 200
+    assert stop_result["ok"] is True
+    assert stop_result["command"] == "stop_route"
+    assert stop_result["route_execution"]["state"] == "stopped"  # type: ignore[index]
+    assert stop_result["hard_stop"]["ok"] is True  # type: ignore[index]
+    assert stop_result["hard_stop"]["robot_ip"] == "192.168.12.1"  # type: ignore[index]
+
+
+def test_dashboard_route_status_requires_token(tmp_path) -> None:
     run_dir = tmp_path / "latest"
     run_offline_simulation(out=run_dir)
     server = make_dashboard_server(run_dir, "127.0.0.1", 0)
@@ -965,146 +1493,14 @@ def test_dashboard_robot_map_from_scratch_starts_exploration(tmp_path, monkeypat
     base_url = f"http://127.0.0.1:{server.server_address[1]}"
 
     try:
-        status, result = _post_json(
-            f"{base_url}/api/robot/map_from_scratch",
-            {"command": "map_from_scratch"},
-            headers=_robot_headers(server),
-        )
+        status, result = _get_json_with_status(f"{base_url}/api/map/routes/status")
     finally:
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
 
-    assert status == 200
-    assert result["ok"] is True
-    assert result["command"] == "map_from_scratch"
-    assert result["origin_set"] is True
-    assert calls == [("begin_exploration", {})]
-
-
-def test_dashboard_robot_return_home_uses_home_pose(tmp_path, monkeypatch) -> None:
-    calls: list[tuple[float, float]] = []
-
-    def fake_go_to(x: float, y: float) -> dict[str, object]:
-        calls.append((x, y))
-        return {"transport": "dimos_mcp", "skill": "go_to"}
-
-    monkeypatch.setattr(dashboard, "_run_robot_go_to", fake_go_to)
-    run_dir = tmp_path / "latest"
-    state = run_offline_simulation(out=run_dir)
-    home = next(zone for zone in state.site.zones if zone.id == "HOME")
-    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    base_url = f"http://127.0.0.1:{server.server_address[1]}"
-
-    try:
-        status, result = _post_json(
-            f"{base_url}/api/robot/return_home",
-            {"command": "return_home"},
-            headers=_robot_headers(server),
-        )
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=5)
-
-    assert status == 200
-    assert result["ok"] is True
-    assert result["target_id"] == "HOME"
-    assert calls == [(home.pose_hint.x, home.pose_hint.y)]
-
-
-def test_dashboard_route_poi_add_clear_and_map_projection(tmp_path) -> None:
-    run_dir = tmp_path / "latest"
-    run_offline_simulation(out=run_dir)
-    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    base_url = f"http://127.0.0.1:{server.server_address[1]}"
-
-    try:
-        status, result = _post_json(
-            f"{base_url}/api/route/poi",
-            {"command": "add_poi", "x": 1.5, "y": -0.25},
-            headers=_robot_headers(server),
-        )
-        map_data = _get_json(f"{base_url}/api/map")
-        poi_data = _get_json(f"{base_url}/api/poi")
-        clear_status, clear_result = _post_json(
-            f"{base_url}/api/route/poi/clear",
-            {"command": "clear_pois"},
-            headers=_robot_headers(server),
-        )
-        cleared = _get_json(f"{base_url}/api/poi")
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=5)
-
-    assert status == 200
-    assert result["ok"] is True
-    assert result["poi"]["id"] == "POI-001"  # type: ignore[index]
-    assert map_data["operator_pois"][0]["x"] == 1.5  # type: ignore[index]
-    assert poi_data["operator_pois"][0]["id"] == "POI-001"  # type: ignore[index]
-    assert clear_status == 200
-    assert clear_result["ok"] is True
-    assert cleared["operator_pois"] == []
-
-
-def test_dashboard_route_pois_run_captures_images_and_returns_home(tmp_path, monkeypatch) -> None:
-    go_to_calls: list[tuple[float, float]] = []
-    mcp_calls: list[tuple[str, dict[str, object]]] = []
-
-    def fake_go_to(x: float, y: float) -> dict[str, object]:
-        go_to_calls.append((x, y))
-        return {"transport": "dimos_mcp", "skill": "go_to"}
-
-    def fake_mcp(skill_name: str, args: dict[str, object]) -> dict[str, object]:
-        mcp_calls.append((skill_name, args))
-        return {"transport": "dimos_mcp", "skill": skill_name}
-
-    monkeypatch.setattr(dashboard, "_run_robot_go_to", fake_go_to)
-    monkeypatch.setattr(dashboard, "_call_dimos_mcp_skill", fake_mcp)
-    run_dir = tmp_path / "latest"
-    state = run_offline_simulation(out=run_dir)
-    home = next(zone for zone in state.site.zones if zone.id == "HOME")
-    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    base_url = f"http://127.0.0.1:{server.server_address[1]}"
-
-    try:
-        _post_json(
-            f"{base_url}/api/route/poi",
-            {"command": "add_poi", "x": 1.5, "y": -0.25},
-            headers=_robot_headers(server),
-        )
-        status, result = _post_json(
-            f"{base_url}/api/route/pois/run",
-            {"command": "run_poi_route", "arrival_timeout_s": 0},
-            headers=_robot_headers(server),
-        )
-        poi_data = _get_json(f"{base_url}/api/poi")
-        image_path = poi_data["poi_captures"][0]["image_path"]  # type: ignore[index]
-        with urllib.request.urlopen(f"{base_url}/{image_path}", timeout=5) as response:
-            image_payload = response.read().decode("utf-8")
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=5)
-
-    assert status == 200
-    assert result["ok"] is True
-    assert len(result["captures"]) == 1
-    assert go_to_calls == [(1.5, -0.25), (home.pose_hint.x, home.pose_hint.y)]
-    assert mcp_calls == [("observe", {})]
-    assert poi_data["poi_captures"][0]["poi_id"] == "POI-001"  # type: ignore[index]
-    assert any(
-        capture["source"] == "robot_poi_capture"
-        for capture in poi_data["captures"]  # type: ignore[index]
-    )
-    assert "Robot observe image placeholder" in image_payload
+    assert status == 403
+    assert result["error"] == "map_authoring_forbidden"
 
 
 def test_dimos_mcp_call_command_prefers_configured_prefix(monkeypatch) -> None:

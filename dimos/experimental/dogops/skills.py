@@ -30,6 +30,13 @@ from dimos.experimental.dogops.models import (
     WorkOrderState,
 )
 from dimos.experimental.dogops.report import build_report_data
+from dimos.experimental.dogops.live_map import DogOpsLiveMapAdapter
+from dimos.experimental.dogops.route_executor import (
+    CallableGoalPublisher,
+    ClickedPointGoalPublisher,
+    DogOpsRouteExecutor,
+    RouteExecutionError,
+)
 from dimos.experimental.dogops.store import DogOpsStore
 
 try:  # pragma: no cover - exercised only inside a full DimOS checkout.
@@ -98,6 +105,8 @@ class DogOpsSkillContainer(Module):
         policy_path: str | Path = DEFAULT_POLICY,
         run_dir: str | Path = ".dogops/runs/latest",
         go_to_handler: Callable[[float, float, float, str], object] | None = None,
+        route_stop_handler: Callable[[], object] | None = None,
+        live_map_adapter: DogOpsLiveMapAdapter | None = None,
         **_: object,
     ) -> None:
         if _:
@@ -108,6 +117,8 @@ class DogOpsSkillContainer(Module):
         self.policy_path = Path(policy_path)
         self.run_dir = Path(run_dir)
         self._go_to_handler = go_to_handler
+        self._route_stop_handler = route_stop_handler
+        self._live_map_adapter = live_map_adapter
 
     @skill
     def load_site_config(self, path: str = str(DEFAULT_SITE)) -> str:
@@ -225,6 +236,88 @@ class DogOpsSkillContainer(Module):
             y=y_f,
             z=z_f,
             frame_id=frame,
+        )
+
+    @skill
+    def follow_route(self, route_id: str | None = None, dry_run: bool = False) -> str:
+        """Follow the selected authored DogOps route waypoint by waypoint."""
+        publisher = self._route_goal_publisher()
+        if not dry_run and publisher is None:
+            return _json(
+                ok=False,
+                skill="follow_route",
+                error="navigation_stream_unavailable",
+                message="DogOps follow_route needs the DimOS clicked_point stream or a handler.",
+            )
+        live_adapter = self._live_map_adapter or DogOpsLiveMapAdapter()
+        executor = DogOpsRouteExecutor(
+            self.run_dir,
+            goal_publisher=publisher,
+            stop_handler=self._route_stop_handler,
+            live_snapshot_reader=live_adapter.snapshot if not dry_run else None,
+        )
+        try:
+            state = executor.follow_route(route_id, dry_run=dry_run)
+        except RouteExecutionError as exc:
+            return _json(
+                ok=False,
+                skill="follow_route",
+                error="route_execution_rejected",
+                message=str(exc),
+            )
+        return _json(
+            ok=state.state == "completed",
+            skill="follow_route",
+            route_id=state.route_id,
+            state=state.state,
+            active_waypoint_id=state.active_waypoint_id,
+            waypoints_total=state.waypoints_total,
+            waypoints_reached=state.waypoints_reached,
+            transport=state.transport,
+            dry_run=dry_run,
+            last_error=state.last_error,
+            route_execution=state.model_dump(mode="json"),
+        )
+
+    @skill
+    def stop_route(self) -> str:
+        """Request that a running DogOps authored route stop."""
+        executor = DogOpsRouteExecutor(self.run_dir, stop_handler=self._route_stop_handler)
+        try:
+            state = executor.stop_route()
+        except RouteExecutionError as exc:
+            return _json(
+                ok=False,
+                skill="stop_route",
+                error="route_execution_rejected",
+                message=str(exc),
+            )
+        return _json(
+            ok=state.last_error is None,
+            skill="stop_route",
+            route_id=state.route_id,
+            state=state.state,
+            active_waypoint_id=state.active_waypoint_id,
+            last_error=state.last_error,
+            route_execution=state.model_dump(mode="json"),
+        )
+
+    @skill
+    def route_status(self) -> str:
+        """Return the current DogOps authored-route execution state."""
+        executor = DogOpsRouteExecutor(self.run_dir)
+        state = executor.status()
+        return _json(
+            ok=True,
+            skill="route_status",
+            route_id=state.route_id,
+            state=state.state,
+            active_waypoint_id=state.active_waypoint_id,
+            waypoints_total=state.waypoints_total,
+            waypoints_reached=state.waypoints_reached,
+            transport=state.transport,
+            last_error=state.last_error,
+            route_execution=state.model_dump(mode="json"),
         )
 
     @skill
@@ -662,6 +755,14 @@ class DogOpsSkillContainer(Module):
         if not self._state_file().exists():
             return _json(ok=False, skill=skill_name, error="missing_run", run_dir=str(self.run_dir))
         return DogOpsStore.load_existing(self.run_dir)
+
+    def _route_goal_publisher(self) -> CallableGoalPublisher | ClickedPointGoalPublisher | None:
+        if self._go_to_handler is not None:
+            return CallableGoalPublisher(self._go_to_handler)
+        publisher = getattr(self, "clicked_point", None)
+        if publisher is None or not hasattr(publisher, "publish"):
+            return None
+        return ClickedPointGoalPublisher(publisher, PointStamped)
 
 
 def _find_incident(incidents: list[Incident], incident_id: str) -> Incident | None:

@@ -19,6 +19,8 @@ import time
 from typing import Any
 from urllib.parse import urlparse
 
+from pydantic import ValidationError
+
 from dimos.experimental.dogops.dashboard_static import (
     build_map_data,
     build_poi_data,
@@ -26,14 +28,30 @@ from dimos.experimental.dogops.dashboard_static import (
     write_dashboard_html,
 )
 from dimos.experimental.dogops.live_map import DogOpsLiveMapAdapter
-from dimos.experimental.dogops.models import (
-    NavAction,
-    NavEvent,
-    Observation,
-    OperatorPointOfInterest,
-    PoiCapture,
-    Pose2D,
+from dimos.experimental.dogops.map_authoring import (
+    EditableIncidentLocation,
+    EditableMapEntity,
+    EditableNoGoShape,
+    EditableRoute,
+    EditableTagBinding,
+    MapAuthoringState,
+    delete_entity,
+    delete_no_go_shape,
+    delete_route,
+    delete_tag_binding,
+    export_authoring_yaml,
+    load_map_authoring,
+    replace_entity,
+    replace_incident_location,
+    replace_no_go_shape,
+    replace_route,
+    replace_tag_binding,
+    save_map_authoring,
+    select_route,
+    publish_no_go_constraints,
+    validation_error_message,
 )
+from dimos.experimental.dogops.route_executor import load_route_execution, request_route_stop
 from dimos.experimental.dogops.store import DogOpsStore
 
 try:  # pragma: no cover - exercised only inside a full DimOS checkout.
@@ -50,18 +68,13 @@ DEFAULT_JOG_DURATION_S = 0.35
 MAX_JOG_DURATION_S = 2.00
 MAX_LINEAR_SPEED = 0.65
 MAX_ANGULAR_SPEED = 1.10
-POI_ROUTE_DEFAULT_TIMEOUT_S = 45.0
-POI_ROUTE_MAX_TIMEOUT_S = 120.0
-POI_ROUTE_DEFAULT_TOLERANCE_M = 0.45
 ROBOT_CALL_TIMEOUT_S = 8.0
 DIMOS_MCP_CALL_TIMEOUT_S = 12.0
+DIMOS_ROUTE_CALL_TIMEOUT_S = 180.0
 WEBRTC_COMMAND_TIMEOUT_S = 2.0
 HARD_STOP_REPEATS = 6
 HARD_STOP_INTERVAL_S = 0.05
 ROBOT_POSE_HISTORY_LIMIT = 240
-PACKAGE_DIR = Path(__file__).parent
-REPO_ROOT = PACKAGE_DIR.parents[2]
-RERUN_WEB_VIEWER_DIR = REPO_ROOT / "node_modules" / "@rerun-io" / "web-viewer"
 MOTION_PROFILES: dict[str, tuple[float, float, float]] = {
     "nudge": (0.35, 1.0, 1.0),
     "step": (1.00, 2.3, 2.0),
@@ -89,6 +102,7 @@ DEFAULT_ROBOT_IP = (
 )
 _ROBOT_SESSIONS: dict[str, _RobotMotionSession] = {}
 _ROBOT_SESSIONS_LOCK = threading.Lock()
+_AUTHORING_LOCK = threading.Lock()
 _LIVE_MAP_ADAPTER = DogOpsLiveMapAdapter()
 
 
@@ -100,8 +114,8 @@ class DogOpsDashboardServer(ThreadingHTTPServer):
         *,
         live_map_adapter: DogOpsLiveMapAdapter,
     ) -> None:
-        self.live_map_adapter = live_map_adapter
         super().__init__(server_address, handler_class)
+        self.live_map_adapter = live_map_adapter
 
     def server_close(self) -> None:
         stop = getattr(self.live_map_adapter, "stop", None)
@@ -179,20 +193,6 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path in {"/", "/dashboard.html"}:
             self._send_file(self.run_dir / "dashboard.html", "text/html; charset=utf-8")
-        elif path.startswith("/assets/"):
-            asset = _resolve_dashboard_asset(path)
-            if asset is None:
-                self._send_json({"error": "asset_not_found", "path": path}, HTTPStatus.NOT_FOUND)
-            else:
-                asset_path, content_type = asset
-                self._send_file(asset_path, content_type)
-        elif path.startswith("/evidence/"):
-            evidence = self._resolve_evidence_file(path)
-            if evidence is None:
-                self._send_json({"error": "evidence_not_found", "path": path}, HTTPStatus.NOT_FOUND)
-            else:
-                evidence_path, content_type = evidence
-                self._send_file(evidence_path, content_type)
         elif path == "/api/state":
             self._send_file(self.run_dir / "state.json", "application/json")
         elif path == "/api/report":
@@ -203,14 +203,29 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/map":
             state = self._read_json(self.run_dir / "state.json")
             report = self._read_json(self.run_dir / "report.json")
-            self._send_json(build_map_data(state, report, live_overlay=_LIVE_MAP_ADAPTER.snapshot()))
+            authoring = self._load_authoring(state)
+            self._send_json(
+                build_map_data(
+                    state,
+                    report,
+                    live_overlay=_LIVE_MAP_ADAPTER.snapshot(),
+                    authoring=authoring.model_dump(mode="json"),
+                )
+            )
+        elif path == "/api/map/authoring":
+            state = self._read_json(self.run_dir / "state.json")
+            self._send_json(self._load_authoring(state).model_dump(mode="json"))
+        elif path == "/api/map/routes/status":
+            if self._authorize_map_authoring_write():
+                self._route_execution_status()
         elif path == "/api/robot/pose":
             if self._authorize_local_read():
                 self._send_json(_robot_pose_snapshot(self.robot_ip))
         elif path == "/api/route":
             state = self._read_json(self.run_dir / "state.json")
             report = self._read_json(self.run_dir / "report.json")
-            self._send_json(build_route_data(state, report))
+            authoring = self._load_authoring(state)
+            self._send_json(build_route_data(state, report, authoring=authoring.model_dump(mode="json")))
         elif path == "/api/poi":
             state = self._read_json(self.run_dir / "state.json")
             report = self._read_json(self.run_dir / "report.json")
@@ -237,32 +252,433 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/robot/map_start":
             if self._authorize_robot_control():
                 self._robot_map_start()
-        elif path == "/api/robot/map_from_scratch":
-            if self._authorize_robot_control():
-                self._robot_map_from_scratch()
-        elif path == "/api/robot/stop_mapping":
-            if self._authorize_robot_control():
-                self._robot_stop_mapping()
         elif path == "/api/robot/map_origin":
             if self._authorize_robot_control():
                 self._robot_map_origin()
-        elif path == "/api/robot/return_home":
-            if self._authorize_robot_control():
-                self._robot_return_home()
-        elif path == "/api/route/poi":
-            if self._authorize_robot_control():
-                self._route_poi_add()
-        elif path == "/api/route/poi/clear":
-            if self._authorize_robot_control():
-                self._route_poi_clear()
-        elif path == "/api/route/pois/run":
-            if self._authorize_robot_control():
-                self._route_pois_run()
+        elif path == "/api/map/entities":
+            if self._authorize_map_authoring_write():
+                self._upsert_map_entity()
+        elif path == "/api/map/no_go_shapes":
+            if self._authorize_map_authoring_write():
+                self._upsert_no_go_shape()
+        elif path == "/api/map/routes":
+            if self._authorize_map_authoring_write():
+                self._upsert_map_route()
+        elif path == "/api/map/routes/follow":
+            if self._authorize_map_authoring_write():
+                self._follow_map_route()
+        elif path == "/api/map/routes/stop":
+            if self._authorize_map_authoring_write():
+                self._stop_map_route()
+        elif path.startswith("/api/map/incidents/") and path.endswith("/location"):
+            if self._authorize_map_authoring_write():
+                parts = path.split("/")
+                incident_id = parts[4] if len(parts) >= 6 else ""
+                self._upsert_incident_location(incident_id)
+        elif path == "/api/map/tag_bindings":
+            if self._authorize_map_authoring_write():
+                self._upsert_tag_binding()
+        elif path == "/api/map/export":
+            if self._authorize_map_authoring_write():
+                self._export_map_authoring()
+        elif path == "/api/map/no_go_shapes/publish":
+            if self._authorize_map_authoring_write():
+                self._publish_no_go_shapes()
+        elif path.startswith("/api/map/entities/") and path.endswith("/from_observation"):
+            if self._authorize_map_authoring_write():
+                parts = path.split("/")
+                entity_id = parts[4] if len(parts) >= 6 else ""
+                self._place_entity_from_observation(entity_id)
+        elif path.startswith("/api/map/routes/") and path.endswith("/select"):
+            if self._authorize_map_authoring_write():
+                parts = path.split("/")
+                route_id = parts[4] if len(parts) >= 6 else ""
+                self._select_map_route(route_id)
+        else:
+            self._send_json({"error": "not_found", "path": path}, HTTPStatus.NOT_FOUND)
+
+    def do_PUT(self) -> None:
+        path = urlparse(self.path).path
+        if path == "/api/map/authoring":
+            if self._authorize_map_authoring_write():
+                self._replace_map_authoring()
+        elif path.startswith("/api/map/entities/"):
+            if self._authorize_map_authoring_write():
+                self._upsert_map_entity(path.split("/")[-1])
+        elif path.startswith("/api/map/no_go_shapes/"):
+            if self._authorize_map_authoring_write():
+                self._upsert_no_go_shape(path.split("/")[-1])
+        elif path.startswith("/api/map/routes/"):
+            if self._authorize_map_authoring_write():
+                self._upsert_map_route(path.split("/")[-1])
+        else:
+            self._send_json({"error": "not_found", "path": path}, HTTPStatus.NOT_FOUND)
+
+    def do_DELETE(self) -> None:
+        path = urlparse(self.path).path
+        if path.startswith("/api/map/entities/"):
+            if self._authorize_map_authoring_write():
+                self._delete_map_entity(path.split("/")[-1])
+        elif path.startswith("/api/map/no_go_shapes/"):
+            if self._authorize_map_authoring_write():
+                self._delete_no_go_shape(path.split("/")[-1])
+        elif path.startswith("/api/map/routes/"):
+            if self._authorize_map_authoring_write():
+                self._delete_map_route(path.split("/")[-1])
+        elif path.startswith("/api/map/tag_bindings/"):
+            if self._authorize_map_authoring_write():
+                self._delete_tag_binding(path.split("/")[-1])
         else:
             self._send_json({"error": "not_found", "path": path}, HTTPStatus.NOT_FOUND)
 
     def log_message(self, format: str, *args: object) -> None:
         return
+
+    def _load_authoring(self, state: dict[str, Any] | None = None) -> MapAuthoringState:
+        if state is None:
+            state = self._read_json(self.run_dir / "state.json")
+        site_id = str((state.get("site") or {}).get("site_id") or "")
+        return load_map_authoring(self.run_dir, site_id=site_id)
+
+    def _send_authoring(self, authoring: MapAuthoringState) -> None:
+        state = self._read_json(self.run_dir / "state.json")
+        report = self._read_json(self.run_dir / "report.json")
+        payload = authoring.model_dump(mode="json")
+        self._send_json(
+            {
+                "ok": True,
+                "authoring": payload,
+                "map": build_map_data(
+                    state,
+                    report,
+                    live_overlay=_LIVE_MAP_ADAPTER.snapshot(),
+                    authoring=payload,
+                ),
+            }
+        )
+
+    def _handle_authoring_error(self, exc: Exception) -> None:
+        message = (
+            validation_error_message(exc)
+            if isinstance(exc, (ValidationError, ValueError))
+            else str(exc)
+        )
+        self._send_json(
+            {"ok": False, "error": "invalid_map_authoring", "message": message},
+            HTTPStatus.BAD_REQUEST,
+        )
+
+    def _persist_authoring_mutation(self, mutate: Any) -> MapAuthoringState:
+        with _AUTHORING_LOCK:
+            authoring = mutate(self._load_authoring())
+            self._save_authoring(authoring)
+            return authoring
+
+    def _save_authoring(self, authoring: MapAuthoringState) -> None:
+        save_map_authoring(self.run_dir, authoring)
+        write_dashboard_html(self.run_dir, robot_control_token=self.robot_control_token)
+
+    def _replace_map_authoring(self) -> None:
+        state = self._read_json(self.run_dir / "state.json")
+        payload = self._read_body_json()
+        payload.setdefault("site_id", str((state.get("site") or {}).get("site_id") or ""))
+        try:
+            authoring = MapAuthoringState.model_validate(payload)
+            with _AUTHORING_LOCK:
+                self._save_authoring(authoring)
+        except (ValidationError, ValueError) as exc:
+            self._handle_authoring_error(exc)
+            return
+        self._send_authoring(authoring)
+
+    def _upsert_map_entity(self, entity_id: str | None = None) -> None:
+        payload = self._read_body_json()
+        if entity_id:
+            payload["id"] = entity_id
+        try:
+            entity = EditableMapEntity.model_validate(payload)
+            authoring = self._persist_authoring_mutation(
+                lambda existing: replace_entity(existing, entity)
+            )
+        except (ValidationError, ValueError) as exc:
+            self._handle_authoring_error(exc)
+            return
+        self._send_authoring(authoring)
+
+    def _place_entity_from_observation(self, entity_id: str) -> None:
+        payload = self._read_body_json()
+        state = self._read_json(self.run_dir / "state.json")
+        try:
+            observation = _resolve_observation(state, payload)
+            pose = _observation_pose(state, observation)
+            existing = _authored_or_site_entity(state, self._load_authoring(), entity_id)
+            if existing is None:
+                existing = {
+                    "id": entity_id,
+                    "kind": str(payload.get("kind") or "checkpoint"),
+                    "label": entity_id,
+                }
+            existing["pose"] = {
+                "x": pose[0],
+                "y": pose[1],
+                "theta_deg": pose[2],
+                "source": "observation",
+            }
+            if observation.get("tag_id") is not None:
+                existing["tag_id"] = observation.get("tag_id")
+            entity = EditableMapEntity.model_validate(existing)
+            authoring = self._persist_authoring_mutation(
+                lambda current: replace_entity(current, entity)
+            )
+        except (ValidationError, ValueError) as exc:
+            self._handle_authoring_error(exc)
+            return
+        self._send_authoring(authoring)
+
+    def _delete_map_entity(self, entity_id: str) -> None:
+        authoring = self._persist_authoring_mutation(
+            lambda existing: delete_entity(existing, entity_id)
+        )
+        self._send_authoring(authoring)
+
+    def _upsert_no_go_shape(self, shape_id: str | None = None) -> None:
+        payload = self._read_body_json()
+        if shape_id:
+            payload["id"] = shape_id
+        payload.setdefault("dimos_constraint_status", "not_supported")
+        try:
+            shape = EditableNoGoShape.model_validate(payload)
+            authoring = self._persist_authoring_mutation(
+                lambda existing: replace_no_go_shape(existing, shape)
+            )
+        except (ValidationError, ValueError) as exc:
+            self._handle_authoring_error(exc)
+            return
+        self._send_authoring(authoring)
+
+    def _delete_no_go_shape(self, shape_id: str) -> None:
+        authoring = self._persist_authoring_mutation(
+            lambda existing: delete_no_go_shape(existing, shape_id)
+        )
+        self._send_authoring(authoring)
+
+    def _upsert_map_route(self, route_id: str | None = None) -> None:
+        payload = self._read_body_json()
+        if route_id:
+            payload["id"] = route_id
+        try:
+            route = EditableRoute.model_validate(payload)
+            authoring = self._persist_authoring_mutation(
+                lambda existing: replace_route(existing, route)
+            )
+        except (ValidationError, ValueError) as exc:
+            self._handle_authoring_error(exc)
+            return
+        self._send_authoring(authoring)
+
+    def _delete_map_route(self, route_id: str) -> None:
+        authoring = self._persist_authoring_mutation(
+            lambda existing: delete_route(existing, route_id)
+        )
+        self._send_authoring(authoring)
+
+    def _select_map_route(self, route_id: str) -> None:
+        try:
+            authoring = self._persist_authoring_mutation(
+                lambda existing: select_route(existing, route_id)
+            )
+        except (ValidationError, ValueError) as exc:
+            self._handle_authoring_error(exc)
+            return
+        self._send_authoring(authoring)
+
+    def _follow_map_route(self) -> None:
+        payload = self._read_body_json()
+        route_id = payload.get("route_id")
+        route_id_arg = str(route_id).strip() if route_id is not None else None
+        dry_run = bool(payload.get("dry_run", False))
+        try:
+            result = _run_robot_call(
+                lambda: _run_robot_follow_route(route_id_arg, dry_run),
+                timeout_s=DIMOS_ROUTE_CALL_TIMEOUT_S,
+            )
+        except ModuleNotFoundError as exc:
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": "dimos_mcp_unavailable",
+                    "message": str(exc),
+                    **self._route_execution_payload(),
+                },
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            return
+        except TimeoutError as exc:
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": "follow_route_timeout",
+                    "message": str(exc),
+                    **self._route_execution_payload(),
+                },
+                HTTPStatus.GATEWAY_TIMEOUT,
+            )
+            return
+        except Exception as exc:
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": "follow_route_failed",
+                    "message": str(exc),
+                    **self._route_execution_payload(),
+                },
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            return
+
+        route_execution = _mcp_route_execution(result)
+        self._send_json(
+            {
+                "ok": True,
+                "command": "follow_route",
+                **(result or {}),
+                **self._route_execution_payload(route_execution=route_execution),
+            }
+        )
+
+    def _stop_map_route(self) -> None:
+        request_route_stop(self.run_dir)
+        hard_stop: dict[str, Any] = {"attempted": True, "ok": False}
+        try:
+            hard_stop_result = _run_robot_call(lambda: _run_route_hard_stop(self.robot_ip))
+        except Exception as exc:
+            hard_stop["error"] = str(exc)
+        else:
+            hard_stop.update({"ok": True, **(hard_stop_result or {})})
+        try:
+            result = _run_robot_call(_run_robot_stop_route)
+        except ModuleNotFoundError as exc:
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": "dimos_mcp_unavailable",
+                    "message": str(exc),
+                    "hard_stop": hard_stop,
+                    **self._route_execution_payload(),
+                },
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            return
+        except TimeoutError as exc:
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": "stop_route_timeout",
+                    "message": str(exc),
+                    "hard_stop": hard_stop,
+                    **self._route_execution_payload(),
+                },
+                HTTPStatus.GATEWAY_TIMEOUT,
+            )
+            return
+        except Exception as exc:
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": "stop_route_failed",
+                    "message": str(exc),
+                    "hard_stop": hard_stop,
+                    **self._route_execution_payload(),
+                },
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            return
+
+        route_execution = _mcp_route_execution(result)
+        self._send_json(
+            {
+                "ok": True,
+                "command": "stop_route",
+                "hard_stop": hard_stop,
+                **(result or {}),
+                **self._route_execution_payload(route_execution=route_execution),
+            }
+        )
+
+    def _route_execution_status(self) -> None:
+        self._send_json({"ok": True, **self._route_execution_payload()})
+
+    def _route_execution_payload(
+        self,
+        *,
+        route_execution: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        state = self._read_json(self.run_dir / "state.json")
+        authoring = self._load_authoring(state)
+        return {
+            "route_execution": route_execution
+            or load_route_execution(self.run_dir).model_dump(mode="json"),
+            "authoring": authoring.model_dump(mode="json"),
+            "live": _LIVE_MAP_ADAPTER.snapshot(),
+        }
+
+    def _upsert_incident_location(self, incident_id: str) -> None:
+        payload = self._read_body_json()
+        payload["incident_id"] = incident_id or payload.get("incident_id")
+        try:
+            location = EditableIncidentLocation.model_validate(payload)
+            authoring = self._persist_authoring_mutation(
+                lambda existing: replace_incident_location(existing, location)
+            )
+        except (ValidationError, ValueError) as exc:
+            self._handle_authoring_error(exc)
+            return
+        self._send_authoring(authoring)
+
+    def _upsert_tag_binding(self) -> None:
+        payload = self._read_body_json()
+        try:
+            binding = EditableTagBinding.model_validate(payload)
+
+            def add_binding(existing: MapAuthoringState) -> MapAuthoringState:
+                if any(item.tag_id == binding.tag_id for item in existing.tag_bindings):
+                    raise ValueError(f"duplicate tag id: {binding.tag_id}")
+                return replace_tag_binding(existing, binding)
+
+            authoring = self._persist_authoring_mutation(add_binding)
+        except (ValidationError, ValueError) as exc:
+            self._handle_authoring_error(exc)
+            return
+        self._send_authoring(authoring)
+
+    def _delete_tag_binding(self, tag_id: str) -> None:
+        try:
+            parsed_tag_id = int(tag_id)
+        except ValueError:
+            self._send_json(
+                {"ok": False, "error": "invalid_tag_id", "tag_id": tag_id},
+                HTTPStatus.BAD_REQUEST,
+            )
+            return
+        authoring = self._persist_authoring_mutation(
+            lambda existing: delete_tag_binding(existing, parsed_tag_id)
+        )
+        self._send_authoring(authoring)
+
+    def _export_map_authoring(self) -> None:
+        authoring = self._load_authoring()
+        paths = export_authoring_yaml(self.run_dir, authoring)
+        self._send_json({"ok": True, "exports": paths})
+
+    def _publish_no_go_shapes(self) -> None:
+        try:
+            with _AUTHORING_LOCK:
+                authoring = publish_no_go_constraints(self._load_authoring())
+                self._save_authoring(authoring)
+        except (ValidationError, ValueError) as exc:
+            self._handle_authoring_error(exc)
+            return
+        self._send_authoring(authoring)
 
     def _mark_work_order_ready(self, work_order_id: str) -> None:
         store = DogOpsStore.load_existing(self.run_dir)
@@ -389,7 +805,7 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         payload = self._read_body_json()
         try:
             x, y = _go_to_target(payload)
-        except ValueError as exc:
+        except (ValidationError, ValueError) as exc:
             self._send_json(
                 {"ok": False, "error": "invalid_go_to_target", "message": str(exc)},
                 HTTPStatus.BAD_REQUEST,
@@ -462,74 +878,6 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
 
         self._send_json({"ok": True, "command": "map_start", **result})
 
-    def _robot_map_from_scratch(self) -> None:
-        robot_ip = self.robot_ip
-        try:
-            pose_result = _run_robot_call(lambda: _start_robot_map(robot_ip))
-            origin_set = _reset_robot_map_origin(robot_ip)
-            exploration = _run_robot_call(lambda: _call_dimos_mcp_skill("begin_exploration", {}))
-        except ModuleNotFoundError as exc:
-            self._send_json(
-                {
-                    "ok": False,
-                    "error": "dimos_mapping_unavailable",
-                    "message": str(exc),
-                },
-                HTTPStatus.SERVICE_UNAVAILABLE,
-            )
-            return
-        except TimeoutError as exc:
-            self._send_json(
-                {"ok": False, "error": "map_from_scratch_timeout", "message": str(exc)},
-                HTTPStatus.GATEWAY_TIMEOUT,
-            )
-            return
-        except Exception as exc:
-            self._send_json(
-                {"ok": False, "error": "map_from_scratch_failed", "message": str(exc)},
-                HTTPStatus.INTERNAL_SERVER_ERROR,
-            )
-            return
-
-        self._send_json(
-            {
-                "ok": True,
-                "command": "map_from_scratch",
-                "origin_set": bool(origin_set),
-                "safety": "DimOS exploration and navigation stack",
-                "pose": pose_result,
-                **(exploration or {}),
-            }
-        )
-
-    def _robot_stop_mapping(self) -> None:
-        try:
-            result = _run_robot_call(lambda: _call_dimos_mcp_skill("end_exploration", {}))
-        except ModuleNotFoundError as exc:
-            self._send_json(
-                {
-                    "ok": False,
-                    "error": "dimos_mapping_unavailable",
-                    "message": str(exc),
-                },
-                HTTPStatus.SERVICE_UNAVAILABLE,
-            )
-            return
-        except TimeoutError as exc:
-            self._send_json(
-                {"ok": False, "error": "stop_mapping_timeout", "message": str(exc)},
-                HTTPStatus.GATEWAY_TIMEOUT,
-            )
-            return
-        except Exception as exc:
-            self._send_json(
-                {"ok": False, "error": "stop_mapping_failed", "message": str(exc)},
-                HTTPStatus.INTERNAL_SERVER_ERROR,
-            )
-            return
-
-        self._send_json({"ok": True, "command": "stop_mapping", **(result or {})})
-
     def _robot_map_origin(self) -> None:
         robot_ip = self.robot_ip
         try:
@@ -548,176 +896,6 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
             return
 
         self._send_json({"ok": bool(result), "command": "map_origin"})
-
-    def _robot_return_home(self) -> None:
-        try:
-            home = _home_target(DogOpsStore.load_existing(self.run_dir).state)
-            result = _run_robot_call(lambda: _run_robot_go_to(home["x"], home["y"]))
-        except ModuleNotFoundError as exc:
-            self._send_json(
-                {
-                    "ok": False,
-                    "error": "dimos_mcp_unavailable",
-                    "message": str(exc),
-                },
-                HTTPStatus.SERVICE_UNAVAILABLE,
-            )
-            return
-        except TimeoutError as exc:
-            self._send_json(
-                {"ok": False, "error": "return_home_timeout", "message": str(exc)},
-                HTTPStatus.GATEWAY_TIMEOUT,
-            )
-            return
-        except Exception as exc:
-            self._send_json(
-                {"ok": False, "error": "return_home_failed", "message": str(exc)},
-                HTTPStatus.INTERNAL_SERVER_ERROR,
-            )
-            return
-
-        self._send_json(
-            {
-                "ok": True,
-                "command": "return_home",
-                "target_id": home["target_id"],
-                "x": home["x"],
-                "y": home["y"],
-                **(result or {}),
-            }
-        )
-
-    def _route_poi_add(self) -> None:
-        payload = self._read_body_json()
-        try:
-            x, y = _go_to_target(payload)
-        except ValueError as exc:
-            self._send_json(
-                {"ok": False, "error": "invalid_poi_target", "message": str(exc)},
-                HTTPStatus.BAD_REQUEST,
-            )
-            return
-
-        store = DogOpsStore.load_existing(self.run_dir)
-        state = store.state
-        assert state is not None
-        poi = OperatorPointOfInterest(
-            id=_next_poi_id(state.operator_pois),
-            label=str(payload.get("label") or f"POI {len(state.operator_pois) + 1}"),
-            x=x,
-            y=y,
-            created_at=time.time(),
-        )
-        state.operator_pois.append(poi)
-        _write_dashboard_state(store, self.robot_control_token)
-        self._send_json({"ok": True, "command": "add_poi", "poi": poi.model_dump(mode="json")})
-
-    def _route_poi_clear(self) -> None:
-        store = DogOpsStore.load_existing(self.run_dir)
-        state = store.state
-        assert state is not None
-        state.operator_pois.clear()
-        state.poi_captures.clear()
-        _write_dashboard_state(store, self.robot_control_token)
-        self._send_json({"ok": True, "command": "clear_pois"})
-
-    def _route_pois_run(self) -> None:
-        payload = self._read_body_json()
-        store = DogOpsStore.load_existing(self.run_dir)
-        state = store.state
-        assert state is not None
-        timeout_s = _bounded_float(
-            payload.get("arrival_timeout_s"),
-            default=POI_ROUTE_DEFAULT_TIMEOUT_S,
-            minimum=0.0,
-            maximum=POI_ROUTE_MAX_TIMEOUT_S,
-        )
-        tolerance_m = _bounded_float(
-            payload.get("arrival_tolerance_m"),
-            default=POI_ROUTE_DEFAULT_TOLERANCE_M,
-            minimum=0.1,
-            maximum=2.0,
-        )
-        captures: list[dict[str, Any]] = []
-
-        try:
-            for index, poi in enumerate(state.operator_pois, 1):
-                started = time.time()
-                move_result = _run_robot_call(lambda poi=poi: _run_robot_go_to(poi.x, poi.y))
-                arrived = _wait_for_robot_near(poi.x, poi.y, timeout_s, tolerance_m)
-                capture = _capture_poi(store, poi, index, arrived=arrived)
-                captures.append(
-                    {
-                        "poi": poi.model_dump(mode="json"),
-                        "capture": capture.model_dump(mode="json"),
-                        "move": move_result,
-                        "arrived": arrived,
-                    }
-                )
-                state.nav_events.append(
-                    NavEvent(
-                        id=f"NAV-POI-{index:03d}",
-                        run_id=state.run.id,
-                        ts=started,
-                        action=NavAction.goto,
-                        target_id=poi.id,
-                        success=arrived,
-                        elapsed_s=max(0.0, time.time() - started),
-                        note="operator POI capture route",
-                    )
-                )
-                poi.status = "captured" if arrived else "captured_no_arrival_confirmed"
-
-            home = _home_target(state)
-            return_home = _run_robot_call(lambda: _run_robot_go_to(home["x"], home["y"]))
-        except ModuleNotFoundError as exc:
-            self._send_json(
-                {
-                    "ok": False,
-                    "error": "dimos_mcp_unavailable",
-                    "message": str(exc),
-                    "captures": captures,
-                },
-                HTTPStatus.SERVICE_UNAVAILABLE,
-            )
-            return
-        except TimeoutError as exc:
-            self._send_json(
-                {
-                    "ok": False,
-                    "error": "poi_route_timeout",
-                    "message": str(exc),
-                    "captures": captures,
-                },
-                HTTPStatus.GATEWAY_TIMEOUT,
-            )
-            return
-        except Exception as exc:
-            self._send_json(
-                {
-                    "ok": False,
-                    "error": "poi_route_failed",
-                    "message": str(exc),
-                    "captures": captures,
-                },
-                HTTPStatus.INTERNAL_SERVER_ERROR,
-            )
-            return
-
-        _write_dashboard_state(store, self.robot_control_token)
-        self._send_json(
-            {
-                "ok": True,
-                "command": "run_poi_route",
-                "captures": captures,
-                "return_home": {
-                    "target_id": home["target_id"],
-                    "x": home["x"],
-                    "y": home["y"],
-                    **(return_home or {}),
-                },
-            }
-        )
 
     def _authorize_local_read(self) -> bool:
         host = self.headers.get("Host", "")
@@ -741,6 +919,25 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         provided = self.headers.get(ROBOT_CONTROL_TOKEN_HEADER, "")
         if not secrets.compare_digest(provided, expected):
             self._send_json({"ok": False, "error": "robot_control_forbidden"}, HTTPStatus.FORBIDDEN)
+            return False
+
+        return True
+
+    def _authorize_map_authoring_write(self) -> bool:
+        host = self.headers.get("Host", "")
+        if not _is_loopback_host(_host_name(host)):
+            self._send_json({"ok": False, "error": "map_authoring_local_only"}, HTTPStatus.FORBIDDEN)
+            return False
+
+        origin = self.headers.get("Origin")
+        if origin and not _origin_matches_host(origin, host):
+            self._send_json({"ok": False, "error": "map_authoring_bad_origin"}, HTTPStatus.FORBIDDEN)
+            return False
+
+        expected = self.robot_control_token
+        provided = self.headers.get(ROBOT_CONTROL_TOKEN_HEADER, "")
+        if not secrets.compare_digest(provided, expected):
+            self._send_json({"ok": False, "error": "map_authoring_forbidden"}, HTTPStatus.FORBIDDEN)
             return False
 
         return True
@@ -774,183 +971,8 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length)
         return json.loads(raw.decode("utf-8"))
 
-    def _resolve_evidence_file(self, path: str) -> tuple[Path, str] | None:
-        relative = path.removeprefix("/evidence/")
-        if not relative or relative.startswith(("/", ".")) or ".." in Path(relative).parts:
-            return None
-        evidence_root = (self.run_dir / "evidence").resolve()
-        candidate = (evidence_root / relative).resolve()
-        if evidence_root not in {candidate, *candidate.parents} or not candidate.exists():
-            return None
-        return candidate, _content_type(candidate)
 
-
-def _write_dashboard_state(store: DogOpsStore, robot_control_token: str | None) -> None:
-    state = store.state
-    if state is None:
-        raise RuntimeError("DogOps run has no loaded state")
-    store.write_state(state.run.id)
-    store.write_report(state.run.id)
-    write_dashboard_html(store.root, robot_control_token=robot_control_token)
-
-
-def _next_poi_id(existing: list[OperatorPointOfInterest]) -> str:
-    used = {poi.id for poi in existing}
-    index = len(existing) + 1
-    while True:
-        candidate = f"POI-{index:03d}"
-        if candidate not in used:
-            return candidate
-        index += 1
-
-
-def _home_target(state: Any) -> dict[str, Any]:
-    site = getattr(state, "site", None)
-    zones = getattr(site, "zones", []) if site is not None else []
-    for zone in zones:
-        if getattr(zone, "id", "") == "HOME" or str(getattr(zone, "zone_kind", "")) == "home":
-            pose = getattr(zone, "pose_hint", None)
-            if pose is not None and pose.x is not None and pose.y is not None:
-                return {"target_id": getattr(zone, "id", "HOME"), "x": float(pose.x), "y": float(pose.y)}
-    return {"target_id": "HOME", "x": 0.0, "y": 0.0}
-
-
-def _bounded_float(value: Any, *, default: float, minimum: float, maximum: float) -> float:
-    try:
-        resolved = float(value)
-    except (TypeError, ValueError):
-        resolved = default
-    if not math.isfinite(resolved):
-        resolved = default
-    return max(minimum, min(resolved, maximum))
-
-
-def _wait_for_robot_near(x: float, y: float, timeout_s: float, tolerance_m: float) -> bool:
-    deadline = time.time() + timeout_s
-    while True:
-        pose = _latest_robot_map_pose()
-        if pose is not None and math.hypot(pose["x"] - x, pose["y"] - y) <= tolerance_m:
-            return True
-        if time.time() >= deadline:
-            return False
-        time.sleep(0.2)
-
-
-def _latest_robot_map_pose() -> dict[str, float] | None:
-    live = _LIVE_MAP_ADAPTER.snapshot()
-    if isinstance(live, dict):
-        pose = live.get("robot_pose")
-        if isinstance(pose, dict):
-            try:
-                return {"x": float(pose["x"]), "y": float(pose["y"])}
-            except (KeyError, TypeError, ValueError):
-                pass
-    with _ROBOT_SESSIONS_LOCK:
-        sessions = list(_ROBOT_SESSIONS.values())
-    for session in sessions:
-        snapshot = session.pose_snapshot()
-        pose = snapshot.get("pose") if isinstance(snapshot, dict) else None
-        if isinstance(pose, dict):
-            try:
-                return {"x": float(pose["x"]), "y": float(pose["y"])}
-            except (KeyError, TypeError, ValueError):
-                continue
-    return None
-
-
-def _capture_poi(
-    store: DogOpsStore,
-    poi: OperatorPointOfInterest,
-    index: int,
-    *,
-    arrived: bool,
-) -> PoiCapture:
-    state = store.state
-    if state is None:
-        raise RuntimeError("DogOps run has no loaded state")
-    note = "arrived" if arrived else "arrival not confirmed before capture"
-    observe_result: dict[str, Any] | None = None
-    try:
-        observe_result = _call_dimos_mcp_skill("observe", {})
-    except Exception as exc:
-        note = f"{note}; observe unavailable: {exc}"
-
-    image_path = _image_path_from_observe_result(observe_result)
-    if image_path is None:
-        image_path = _write_poi_placeholder(store.root, poi, index, note)
-
-    capture = PoiCapture(
-        id=f"CAP-POI-{index:03d}",
-        poi_id=poi.id,
-        ts=time.time(),
-        x=poi.x,
-        y=poi.y,
-        image_path=image_path,
-        note=note,
-    )
-    state.poi_captures.append(capture)
-    state.observations.append(
-        Observation(
-            id=f"OBS-POI-{index:03d}",
-            ts=capture.ts,
-            run_id=state.run.id,
-            entity_id=poi.id,
-            pose=Pose2D(x=poi.x, y=poi.y, frame=poi.frame_id, source="operator_poi"),
-            image_path=image_path,
-            facts={"operator_poi": poi.id, "arrival_confirmed": arrived},
-            source="robot_poi_capture",
-        )
-    )
-    return capture
-
-
-def _image_path_from_observe_result(result: dict[str, Any] | None) -> str | None:
-    if not isinstance(result, dict):
-        return None
-    candidates = [result, result.get("mcp_result")] if isinstance(result.get("mcp_result"), dict) else [result]
-    for candidate in candidates:
-        if not isinstance(candidate, dict):
-            continue
-        for key in ("image_path", "path", "file", "evidence_path"):
-            value = candidate.get(key)
-            if isinstance(value, str) and value:
-                return value
-    return None
-
-
-def _write_poi_placeholder(root: Path, poi: OperatorPointOfInterest, index: int, note: str) -> str:
-    evidence_dir = root / "evidence"
-    evidence_dir.mkdir(parents=True, exist_ok=True)
-    filename = f"poi-{index:03d}.svg"
-    safe_label = poi.label.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    safe_note = note.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    payload = f"""<svg xmlns="http://www.w3.org/2000/svg" width="720" height="405" viewBox="0 0 720 405">
-  <rect width="720" height="405" fill="#071016"/>
-  <rect x="34" y="34" width="652" height="337" fill="#0d1720" stroke="#52e0c4" stroke-width="2"/>
-  <text x="56" y="92" fill="#e5edf5" font-family="Arial, sans-serif" font-size="32" font-weight="700">{safe_label}</text>
-  <text x="56" y="142" fill="#a9b4c4" font-family="Arial, sans-serif" font-size="22">x={poi.x:.2f}m y={poi.y:.2f}m</text>
-  <text x="56" y="190" fill="#facc15" font-family="Arial, sans-serif" font-size="20">{safe_note}</text>
-  <text x="56" y="320" fill="#64748b" font-family="Arial, sans-serif" font-size="18">Robot observe image placeholder</text>
-</svg>
-"""
-    (evidence_dir / filename).write_text(payload, encoding="utf-8")
-    return f"evidence/{filename}"
-
-
-def _content_type(path: Path) -> str:
-    suffix = path.suffix.lower()
-    if suffix == ".svg":
-        return "image/svg+xml; charset=utf-8"
-    if suffix == ".png":
-        return "image/png"
-    if suffix in {".jpg", ".jpeg"}:
-        return "image/jpeg"
-    if suffix == ".json":
-        return "application/json"
-    return "application/octet-stream"
-
-
-def _run_robot_call(fn: Any) -> Any:
+def _run_robot_call(fn: Any, *, timeout_s: float = ROBOT_CALL_TIMEOUT_S) -> Any:
     result: dict[str, Any] = {}
 
     def target() -> None:
@@ -961,12 +983,93 @@ def _run_robot_call(fn: Any) -> Any:
 
     thread = threading.Thread(target=target, daemon=True)
     thread.start()
-    thread.join(timeout=ROBOT_CALL_TIMEOUT_S)
+    thread.join(timeout=timeout_s)
     if thread.is_alive():
-        raise TimeoutError(f"robot command exceeded {ROBOT_CALL_TIMEOUT_S:.1f}s")
+        raise TimeoutError(f"robot command exceeded {timeout_s:.1f}s")
     if "error" in result:
         raise result["error"]
     return result.get("value")
+
+
+def _resolve_observation(state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    observations = state.get("observations") or []
+    observation_id = payload.get("observation_id")
+    tag_id = payload.get("tag_id")
+    for observation in reversed(observations):
+        if observation_id and observation.get("id") == observation_id:
+            return observation
+        if tag_id is not None and observation.get("tag_id") == int(tag_id):
+            return observation
+        visible_tags = (observation.get("facts") or {}).get("visible_tag_ids")
+        if tag_id is not None and _tag_id_in_visible_tags(int(tag_id), visible_tags):
+            return observation
+    raise ValueError("matching observation not found")
+
+
+def _observation_pose(
+    state: dict[str, Any],
+    observation: dict[str, Any],
+) -> tuple[float, float, float | None]:
+    pose = observation.get("pose") or {}
+    x = _finite_or_none(pose.get("x"))
+    y = _finite_or_none(pose.get("y"))
+    theta = _finite_or_none(pose.get("theta_deg"))
+    if x is not None and y is not None:
+        return x, y, theta
+    zone_id = str(observation.get("zone_id") or "")
+    for zone in (state.get("site") or {}).get("zones") or []:
+        if zone.get("id") != zone_id:
+            continue
+        zone_pose = zone.get("pose_hint") or {}
+        x = _finite_or_none(zone_pose.get("x"))
+        y = _finite_or_none(zone_pose.get("y"))
+        theta = _finite_or_none(zone_pose.get("theta_deg"))
+        if x is not None and y is not None:
+            return x, y, theta
+    raise ValueError("observation has no map pose")
+
+
+def _authored_or_site_entity(
+    state: dict[str, Any],
+    authoring: MapAuthoringState,
+    entity_id: str,
+) -> dict[str, Any] | None:
+    for entity in authoring.entities:
+        if entity.id == entity_id:
+            return entity.model_dump(mode="json")
+    site = state.get("site") or {}
+    for kind, collection in (
+        ("zone", site.get("zones") or []),
+        ("asset", site.get("assets") or []),
+        ("package", site.get("packages") or []),
+    ):
+        for item in collection:
+            if item.get("id") != entity_id:
+                continue
+            return {
+                "id": entity_id,
+                "kind": kind,
+                "label": item.get("display_name") or entity_id,
+                "tag_id": item.get("tag_id"),
+                "zone_id": item.get("zone_id") or item.get("expected_zone_id"),
+            }
+    return None
+
+
+def _tag_id_in_visible_tags(tag_id: int, visible_tags: object) -> bool:
+    if isinstance(visible_tags, str):
+        return str(tag_id) in {item.strip() for item in visible_tags.split(",")}
+    if isinstance(visible_tags, list):
+        return any(str(item) == str(tag_id) for item in visible_tags)
+    return False
+
+
+def _finite_or_none(value: Any) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
 
 
 def _resolve_motion_request(
@@ -1042,28 +1145,6 @@ def _origin_matches_host(origin: str, host_header: str) -> bool:
     return origin_host == request_host and origin_port == request_port
 
 
-def _resolve_dashboard_asset(path: str) -> tuple[Path, str] | None:
-    if path == "/assets/rerun-web-viewer.js":
-        return PACKAGE_DIR / "static" / "rerun-web-viewer.js", "application/javascript; charset=utf-8"
-
-    vendor_prefix = "/assets/vendor/@rerun-io/web-viewer/"
-    if not path.startswith(vendor_prefix):
-        return None
-
-    requested = path.removeprefix(vendor_prefix)
-    asset_files = {
-        "index.js": ("index.js", "application/javascript; charset=utf-8"),
-        "re_viewer": ("re_viewer.js", "application/javascript; charset=utf-8"),
-        "re_viewer.js": ("re_viewer.js", "application/javascript; charset=utf-8"),
-        "re_viewer_bg.wasm": ("re_viewer_bg.wasm", "application/wasm"),
-    }
-    asset_file = asset_files.get(requested)
-    if asset_file is None:
-        return None
-    asset_name, content_type = asset_file
-    return RERUN_WEB_VIEWER_DIR / asset_name, content_type
-
-
 def _publish_robot_jog(
     linear_x: float,
     linear_y: float,
@@ -1092,7 +1173,42 @@ def _run_robot_go_to(x: float, y: float) -> dict[str, Any]:
     return _call_dimos_mcp_skill("go_to", {"x": x, "y": y})
 
 
-def _call_dimos_mcp_skill(skill_name: str, args: dict[str, Any]) -> dict[str, Any]:
+def _run_route_hard_stop(robot_ip: str) -> dict[str, Any]:
+    return _publish_robot_hard_stop(robot_ip)
+
+
+def _run_robot_follow_route(route_id: str | None, dry_run: bool) -> dict[str, Any]:
+    args: dict[str, Any] = {"dry_run": dry_run}
+    if route_id:
+        args["route_id"] = route_id
+    return _call_dimos_mcp_skill("follow_route", args, timeout_s=DIMOS_ROUTE_CALL_TIMEOUT_S)
+
+
+def _run_robot_stop_route() -> dict[str, Any]:
+    return _call_dimos_mcp_skill("stop_route", {})
+
+
+def _run_robot_route_status() -> dict[str, Any]:
+    return _call_dimos_mcp_skill("route_status", {})
+
+
+def _mcp_route_execution(result: Any) -> dict[str, Any] | None:
+    if not isinstance(result, dict):
+        return None
+    mcp_result = result.get("mcp_result")
+    if isinstance(mcp_result, dict) and isinstance(mcp_result.get("route_execution"), dict):
+        return mcp_result["route_execution"]
+    if isinstance(result.get("route_execution"), dict):
+        return result["route_execution"]
+    return None
+
+
+def _call_dimos_mcp_skill(
+    skill_name: str,
+    args: dict[str, Any],
+    *,
+    timeout_s: float = DIMOS_MCP_CALL_TIMEOUT_S,
+) -> dict[str, Any]:
     command = _dimos_mcp_call_command(skill_name, args)
     try:
         result = subprocess.run(
@@ -1102,7 +1218,7 @@ def _call_dimos_mcp_skill(skill_name: str, args: dict[str, Any]) -> dict[str, An
             capture_output=True,
             check=False,
             text=True,
-            timeout=DIMOS_MCP_CALL_TIMEOUT_S,
+            timeout=timeout_s,
         )
     except FileNotFoundError as exc:
         raise ModuleNotFoundError(
@@ -1110,7 +1226,7 @@ def _call_dimos_mcp_skill(skill_name: str, args: dict[str, Any]) -> dict[str, An
         ) from exc
     except subprocess.TimeoutExpired as exc:
         raise TimeoutError(
-            f"dimos mcp call {skill_name} timed out after {DIMOS_MCP_CALL_TIMEOUT_S:.1f}s"
+            f"dimos mcp call {skill_name} timed out after {timeout_s:.1f}s"
         ) from exc
 
     stdout = result.stdout.strip()

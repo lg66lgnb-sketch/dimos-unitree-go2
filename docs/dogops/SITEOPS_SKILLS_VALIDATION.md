@@ -30,7 +30,7 @@ Run this in the full DimOS checkout, not just the project pack:
 
 ```bash
 uv run dimos list | rg dogops
-uv run dimos mcp list-tools | rg 'run_mission|go_to|scan_zone|read_gauge|check_clearance|detect_blocked_aisle|scan_receiving_manifest|verify_work_order|nav_eval_report'
+uv run dimos mcp list-tools | rg 'run_mission|go_to|follow_route|stop_route|route_status|scan_zone|read_gauge|check_clearance|detect_blocked_aisle|scan_receiving_manifest|verify_work_order|nav_eval_report'
 ```
 
 If replay/MCP startup asks for macOS multicast configuration, apply the DimOS
