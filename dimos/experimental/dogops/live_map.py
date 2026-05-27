@@ -8,7 +8,6 @@ import threading
 import time
 from typing import Any
 
-
 LIVE_TOPICS = {
     "global_costmap": "/global_costmap",
     "navigation_costmap": "/navigation_costmap",

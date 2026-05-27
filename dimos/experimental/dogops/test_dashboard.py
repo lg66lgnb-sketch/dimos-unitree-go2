@@ -21,8 +21,8 @@ from dimos.experimental.dogops.dashboard_static import (
     write_dashboard_html,
 )
 from dimos.experimental.dogops.live_map import (
-    DogOpsLiveMapAdapter,
     LIVE_TOPIC_MAX_AGE_S,
+    DogOpsLiveMapAdapter,
     _extend_dimos_package_path,
     _grid_to_costmap,
 )

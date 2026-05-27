@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import time
 from pathlib import Path
+import time
 
 from dimos.experimental.dogops.config_loader import DEFAULT_SITE, load_site_config
 from dimos.experimental.dogops.detector import DetectedTag, DogOpsTagDetector
