@@ -10,6 +10,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from dimos.experimental.dogops.map_authoring import load_map_authoring
+from dimos.experimental.dogops.qr_cargo import get_latest_qr_events
 
 MAP_WIDTH = 920
 MAP_HEIGHT = 560
@@ -39,6 +40,7 @@ def build_map_data(
     *,
     live_overlay: dict[str, Any] | None = None,
     authoring: dict[str, Any] | None = None,
+    qr_events: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     site = state.get("site") or {}
     authoring = authoring or {}
@@ -277,6 +279,8 @@ def build_map_data(
             }
         )
 
+    map_qr_cargo_events = _qr_cargo_overlays(qr_events or [], entity_points)
+
     live = live_overlay or {
         "ok": False,
         "source": "DimOS live LCM topics",
@@ -294,6 +298,11 @@ def build_map_data(
         for group in (map_zones, map_assets, map_packages, map_route, map_observations)
         for item in group
     ]
+    points.extend(
+        (item["x"], item["y"])
+        for item in map_qr_cargo_events
+        if item.get("x") is not None and item.get("y") is not None
+    )
     points.extend(_no_go_shape_points(authoring))
     points.extend(_live_overlay_points(live))
     bounds = _map_bounds(points)
@@ -306,6 +315,7 @@ def build_map_data(
         "route": map_route,
         "observations": map_observations,
         "incidents": map_incidents,
+        "qr_cargo_events": map_qr_cargo_events,
         "no_go_shapes": authoring.get("no_go_shapes") or [],
         "tag_bindings": authoring.get("tag_bindings") or [],
         "authoring": {
@@ -324,6 +334,7 @@ def build_map_data(
             "heatmap": bool((live.get("costmap") or {}).get("cells")) if isinstance(live, dict) else False,
             "path": bool(live.get("path") or live.get("route")) if isinstance(live, dict) else False,
             "robot": bool(live.get("robot_pose")) if isinstance(live, dict) else False,
+            "qr": bool(map_qr_cargo_events),
         },
     }
 
@@ -448,6 +459,82 @@ def _float_or_none(value: Any) -> float | None:
     return result
 
 
+def _qr_cargo_overlays(
+    qr_events: list[dict[str, Any]],
+    entity_points: dict[str, tuple[float, float]],
+) -> list[dict[str, Any]]:
+    overlays: list[dict[str, Any]] = []
+    for event in qr_events:
+        payload = event.get("qr_payload") if isinstance(event.get("qr_payload"), dict) else {}
+        location_node_id = str(payload.get("location_node_id") or "")
+        static_xy = entity_points.get(location_node_id)
+        static_pose = _qr_static_pose(static_xy) if static_xy is not None else None
+        detection_pose = _qr_detection_pose(event.get("robot_pose_at_detection"))
+        map_position = detection_pose or static_pose
+        pose_delta = _qr_pose_delta(detection_pose, static_pose)
+
+        overlay = {
+            "event_id": event.get("event_id"),
+            "warehouse_id": payload.get("warehouse_id"),
+            "location_node_id": location_node_id,
+            "zone": payload.get("zone"),
+            "shelf_id": payload.get("shelf_id"),
+            "cargo_id": payload.get("cargo_id"),
+            "task": payload.get("task"),
+            "timestamp": event.get("timestamp"),
+            "status": event.get("status"),
+            "action_policy": event.get("action_policy") or "report_only",
+            "robot_pose_at_detection": event.get("robot_pose_at_detection"),
+            "static_location_node_pose": static_pose,
+            "map_position": map_position,
+            "pose_delta": pose_delta,
+            "source": event.get("source"),
+            "linked_entity_id": location_node_id if location_node_id in entity_points else None,
+            "qr_payload": payload,
+        }
+        if map_position is not None:
+            overlay["x"] = map_position["x"]
+            overlay["y"] = map_position["y"]
+        overlays.append(overlay)
+    return overlays
+
+
+def _qr_detection_pose(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    point = _xy_point(value)
+    if point is None:
+        return None
+    return {
+        "frame": str(value.get("frame") or "map"),
+        "x": point[0],
+        "y": point[1],
+        "yaw": _float_or_none(value.get("yaw")),
+        "source": "robot_pose_at_detection",
+    }
+
+
+def _qr_static_pose(point: tuple[float, float]) -> dict[str, Any]:
+    return {
+        "frame": "world",
+        "x": point[0],
+        "y": point[1],
+        "theta_deg": None,
+        "source": "site_or_authoring",
+    }
+
+
+def _qr_pose_delta(
+    detection_pose: dict[str, Any] | None,
+    static_pose: dict[str, Any] | None,
+) -> dict[str, float] | None:
+    if detection_pose is None or static_pose is None:
+        return None
+    dx = float(detection_pose["x"]) - float(static_pose["x"])
+    dy = float(detection_pose["y"]) - float(static_pose["y"])
+    return {"dx": dx, "dy": dy, "distance_m": math.hypot(dx, dy)}
+
+
 def build_route_data(
     state: dict[str, Any],
     report: dict[str, Any],
@@ -569,8 +656,9 @@ def render_site_map(
     report: dict[str, Any],
     *,
     authoring: dict[str, Any] | None = None,
+    qr_events: list[dict[str, Any]] | None = None,
 ) -> str:
-    map_data = build_map_data(state, report, authoring=authoring)
+    map_data = build_map_data(state, report, authoring=authoring, qr_events=qr_events)
     if not map_data["zones"]:
         return '<div class="map-empty">Map data unavailable</div>'
 
@@ -598,6 +686,10 @@ def render_site_map(
     incidents = "".join(
         _render_incident(projector, incident) for incident in map_data["incidents"]
     )
+    qr_cargo = "".join(
+        _render_qr_cargo_event(projector, event)
+        for event in map_data["qr_cargo_events"]
+    )
     route = ""
     if route_points:
         route = (
@@ -617,6 +709,7 @@ def render_site_map(
         '<span><i class="legend-tag"></i>tag return</span>'
         '<span><i class="legend-no-go"></i>no-go cost</span>'
         '<span><i class="legend-incident"></i>P1/P2 event</span>'
+        '<span><i class="legend-qr"></i>QR cargo</span>'
         "</div>"
     )
     layer_controls = (
@@ -625,6 +718,7 @@ def render_site_map(
         '<button type="button" data-map-layer="heatmap" aria-pressed="true">Heatmap</button>'
         '<button type="button" data-map-layer="path" aria-pressed="true">Path</button>'
         '<button type="button" data-map-layer="robot" aria-pressed="true">Robot</button>'
+        '<button type="button" data-map-layer="qr" aria-pressed="true">QR</button>'
         "</div>"
     )
     edit_controls = (
@@ -686,6 +780,9 @@ def render_site_map(
             {route}
             <polyline class="map-dimos-path" data-live-path points="" />
           </g>
+          <g data-layer="qr" data-qr-cargo-layer>
+            {qr_cargo}
+          </g>
           <g data-layer="robot">
             {robot}
           </g>
@@ -708,6 +805,7 @@ def render_dashboard_html(
     *,
     robot_control_token: str | None = None,
     authoring: dict[str, Any] | None = None,
+    qr_events: list[dict[str, Any]] | None = None,
 ) -> str:
     run = state["run"]
     nav = report.get("nav_summary") or {}
@@ -725,7 +823,9 @@ def render_dashboard_html(
     )
     mean_target_time_metric = f"{nav.get('mean_elapsed_s', 0):.1f}s"
     route_coverage_metric = f"{float(nav.get('route_coverage', 0.0)) * 100:.0f}%"
-    map_html = render_site_map(state, report, authoring=authoring)
+    qr_events = qr_events or []
+    map_html = render_site_map(state, report, authoring=authoring, qr_events=qr_events)
+    qr_map_data = build_map_data(state, report, authoring=authoring, qr_events=qr_events)
     route_data = build_route_data(state, report, authoring=authoring)
     poi_data = build_poi_data(state, report)
     return f"""<!doctype html>
@@ -969,6 +1069,23 @@ def render_dashboard_html(
       stroke: #fed7aa;
     }}
     .map-observation {{ fill: #05070c; stroke: #a78bfa; stroke-width: 2; }}
+    .map-qr-cargo-ring {{ fill: rgba(250, 204, 21, 0.18); stroke: #facc15; stroke-width: 2.2; }}
+    .map-qr-cargo-core {{ fill: #0f766e; stroke: #d9f99d; stroke-width: 1.4; }}
+    .map-qr-cargo-label {{
+      fill: #fef9c3;
+      font-size: 11px;
+      font-weight: 700;
+      paint-order: stroke;
+      stroke: #05070c;
+      stroke-linejoin: round;
+      stroke-width: 4px;
+    }}
+    .map-qr-cargo-marker.is-selected .map-qr-cargo-ring {{ stroke: #ffffff; stroke-width: 3.2; }}
+    .qr-linked .map-zone-anchor, .qr-linked .map-asset, .qr-linked .map-package {{
+      filter: url(#dogops-map-glow);
+      stroke: #facc15;
+      stroke-width: 3;
+    }}
     .map-observation-ray {{ stroke: #a78bfa; stroke-dasharray: 4 5; stroke-width: 1.2; }}
     .map-incident {{ fill: none; filter: url(#dogops-map-glow); stroke: #fb7185; stroke-width: 2.4; }}
     .map-incident-label {{
@@ -1028,6 +1145,7 @@ def render_dashboard_html(
     .legend-tag {{ background: #a78bfa; }}
     .legend-no-go {{ background: #ef4444; }}
     .legend-incident {{ background: #fb7185; }}
+    .legend-qr {{ background: #facc15; }}
     .map-workflow {{
       align-items: center;
       color: #a9b4c4;
@@ -1233,6 +1351,24 @@ def render_dashboard_html(
     }}
     .robot-status.error {{ color: var(--danger); }}
     .robot-status.ok {{ color: var(--accent); }}
+    .qr-cargo-status {{ color: var(--muted); margin-bottom: 8px; min-height: 18px; }}
+    .qr-cargo-status.ok {{ color: var(--accent); }}
+    .qr-cargo-status.error {{ color: var(--danger); }}
+    .qr-cargo-table {{ overflow-x: auto; }}
+    .qr-cargo-table table {{ min-width: 980px; }}
+    .qr-actions {{ display: flex; flex-wrap: wrap; gap: 6px; min-width: 260px; }}
+    .qr-actions button {{
+      background: #f8fafc;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      color: var(--ink);
+      cursor: pointer;
+      font: inherit;
+      min-height: 30px;
+      padding: 4px 8px;
+    }}
+    .qr-actions button:hover {{ border-color: var(--accent); }}
+    .qr-actions button:disabled {{ cursor: not-allowed; opacity: 0.55; }}
     @media (max-width: 920px) {{
       main {{ gap: 12px; padding: 16px 18px 24px; }}
       section {{ padding: 10px; }}
@@ -1279,6 +1415,10 @@ def render_dashboard_html(
           {metric("Tag Sign-In", checkpoint_metric)}
           {metric("Coverage", route_coverage_metric)}
         </div>
+      </section>
+      <section>
+        <h2>QR Cargo</h2>
+        {qr_cargo_panel(qr_map_data["qr_cargo_events"])}
       </section>
       <section>
         <h2>Robot Control</h2>
@@ -1398,6 +1538,9 @@ def render_dashboard_html(
       const liveRobot = liveMapSvg ? liveMapSvg.querySelector("[data-live-robot]") : null;
       const liveTarget = liveMapSvg ? liveMapSvg.querySelector("[data-live-target]") : null;
       const goToMarker = liveMapSvg ? liveMapSvg.querySelector("[data-go-to-marker]") : null;
+      const qrCargoLayer = liveMapSvg ? liveMapSvg.querySelector("[data-qr-cargo-layer]") : null;
+      const qrCargoRows = document.querySelector("[data-qr-cargo-events]");
+      const qrCargoStatus = document.querySelector("[data-qr-cargo-status]");
       const status = document.querySelector("[data-robot-status]");
       if (!controls || !status) return;
       let motionProfile = "nudge";
@@ -1412,6 +1555,7 @@ def render_dashboard_html(
       let dragMapObject = null;
       let liveMapBounds = null;
       let liveOverlayBounds = null;
+      let latestQrEventsById = new Map();
       try {{
         liveMapBounds = liveMapSvg ? JSON.parse(liveMapSvg.dataset.mapBounds || "{{}}") : null;
       }} catch (_) {{
@@ -1800,6 +1944,193 @@ def render_dashboard_html(
           `translate(${{projected.x.toFixed(1)}} ${{projected.y.toFixed(1)}})`
         );
       }};
+      const clearChildren = (node) => {{
+        if (!node) return;
+        while (node.firstChild) node.removeChild(node.firstChild);
+      }};
+      const qrText = (value, fallback = "unknown") => {{
+        if (value === null || value === undefined || value === "") return fallback;
+        return String(value);
+      }};
+      const formatQrTimestamp = (value) => {{
+        const numeric = Number(value);
+        if (!Number.isFinite(numeric)) return "unknown";
+        return numeric.toFixed(3);
+      }};
+      const formatQrRobotPose = (pose) => {{
+        if (!pose) return "unknown";
+        const x = Number(pose.x);
+        const y = Number(pose.y);
+        const yaw = Number(pose.yaw);
+        if (!Number.isFinite(x) || !Number.isFinite(y)) return "unknown";
+        if (!Number.isFinite(yaw)) return x.toFixed(2) + ", " + y.toFixed(2);
+        return x.toFixed(2) + ", " + y.toFixed(2) + ", yaw " + yaw.toFixed(2);
+      }};
+      const setQrCargoStatus = (text, state = "") => {{
+        if (!qrCargoStatus) return;
+        qrCargoStatus.textContent = text;
+        qrCargoStatus.className = "qr-cargo-status " + state;
+      }};
+      const renderQrCargoRows = (events) => {{
+        if (!qrCargoRows) return;
+        const items = Array.isArray(events) ? events : [];
+        latestQrEventsById = new Map(items.map((event) => [String(event.event_id || ""), event]));
+        clearChildren(qrCargoRows);
+        if (!items.length) {{
+          const row = document.createElement("tr");
+          row.setAttribute("data-qr-empty", "");
+          const cell = document.createElement("td");
+          cell.colSpan = 10;
+          cell.className = "muted";
+          cell.textContent = "No QR cargo events yet";
+          row.appendChild(cell);
+          qrCargoRows.appendChild(row);
+          setQrCargoStatus("QR cargo idle", "");
+          return;
+        }}
+        for (const event of items.slice(0, 50)) {{
+          const eventId = String(event.event_id || "");
+          const row = document.createElement("tr");
+          row.setAttribute("data-qr-event-row", "");
+          row.setAttribute("data-qr-event-id", eventId);
+          const addCell = (text) => {{
+            const cell = document.createElement("td");
+            cell.textContent = text;
+            row.appendChild(cell);
+          }};
+          addCell(formatQrTimestamp(event.timestamp));
+          addCell(qrText(event.warehouse_id));
+          addCell(qrText(event.location_node_id));
+          addCell(qrText(event.cargo_id));
+          addCell([event.zone, event.shelf_id].filter(Boolean).join(" / ") || "unknown");
+          addCell(qrText(event.task));
+          addCell(qrText(event.source));
+          addCell(qrText(event.status) + " / " + qrText(event.action_policy, "report_only"));
+          addCell(formatQrRobotPose(event.robot_pose_at_detection));
+          const actions = document.createElement("td");
+          actions.className = "qr-actions";
+          const addButton = (label, attribute, disabled = false) => {{
+            const button = document.createElement("button");
+            button.type = "button";
+            button.textContent = label;
+            button.setAttribute(attribute, eventId);
+            button.disabled = disabled;
+            actions.appendChild(button);
+          }};
+          addButton("Select on map", "data-qr-select", !event.map_position);
+          addButton("Promote to Package", "data-qr-promote-package");
+          addButton("Promote to Label", "data-qr-promote-label");
+          addButton("Bind Location Node", "data-qr-bind-location");
+          addButton("Copy JSON", "data-qr-copy");
+          row.appendChild(actions);
+          qrCargoRows.appendChild(row);
+        }}
+        setQrCargoStatus("Latest QR cargo events: " + items.length, "ok");
+      }};
+      const renderQrCargoMarkers = (events) => {{
+        if (!qrCargoLayer) return;
+        clearChildren(qrCargoLayer);
+        const items = Array.isArray(events) ? events : [];
+        const svgNS = "http://www.w3.org/2000/svg";
+        for (const event of items) {{
+          if (!event.map_position) continue;
+          const projected = projectLiveOverlayPoint(Number(event.map_position.x), Number(event.map_position.y));
+          if (!projected) continue;
+          const eventId = String(event.event_id || "");
+          const group = document.createElementNS(svgNS, "g");
+          group.setAttribute("class", "map-qr-cargo-marker");
+          group.setAttribute("data-edit-kind", "qr_cargo");
+          group.setAttribute("data-edit-id", eventId);
+          group.setAttribute("data-qr-event-id", eventId);
+          group.setAttribute("data-linked-entity-id", String(event.linked_entity_id || event.location_node_id || ""));
+          const title = document.createElementNS(svgNS, "title");
+          title.textContent = "QR cargo " + qrText(event.cargo_id, "cargo") + " / " + qrText(event.location_node_id);
+          group.appendChild(title);
+          const ring = document.createElementNS(svgNS, "circle");
+          ring.setAttribute("class", "map-qr-cargo-ring");
+          ring.setAttribute("cx", projected.x.toFixed(1));
+          ring.setAttribute("cy", projected.y.toFixed(1));
+          ring.setAttribute("r", "14");
+          group.appendChild(ring);
+          const core = document.createElementNS(svgNS, "rect");
+          core.setAttribute("class", "map-qr-cargo-core");
+          core.setAttribute("x", (projected.x - 5).toFixed(1));
+          core.setAttribute("y", (projected.y - 5).toFixed(1));
+          core.setAttribute("width", "10");
+          core.setAttribute("height", "10");
+          core.setAttribute("rx", "1.5");
+          group.appendChild(core);
+          const label = document.createElementNS(svgNS, "text");
+          label.setAttribute("class", "map-qr-cargo-label");
+          label.setAttribute("x", (projected.x + 14).toFixed(1));
+          label.setAttribute("y", (projected.y + 5).toFixed(1));
+          label.textContent = qrText(event.cargo_id, "cargo");
+          group.appendChild(label);
+          qrCargoLayer.appendChild(group);
+        }}
+      }};
+      const clearQrCargoHighlight = () => {{
+        if (!liveMapSvg) return;
+        liveMapSvg.querySelectorAll(".map-qr-cargo-marker.is-selected, .qr-linked").forEach((item) => {{
+          item.classList.remove("is-selected");
+          item.classList.remove("qr-linked");
+        }});
+      }};
+      const highlightLinkedEntity = (linkedId) => {{
+        if (!liveMapSvg || !linkedId) return;
+        liveMapSvg.querySelectorAll("[data-edit-id]").forEach((item) => {{
+          if (item.getAttribute("data-edit-id") === linkedId) item.classList.add("qr-linked");
+        }});
+      }};
+      const highlightQrCargoEvent = (eventId) => {{
+        clearQrCargoHighlight();
+        if (!qrCargoLayer) return;
+        const marker = Array.from(qrCargoLayer.querySelectorAll("[data-qr-event-id]")).find(
+          (item) => item.getAttribute("data-qr-event-id") === eventId
+        );
+        const event = latestQrEventsById.get(eventId);
+        if (marker) {{
+          marker.classList.add("is-selected");
+          marker.scrollIntoView({{block: "nearest", inline: "nearest"}});
+          setQrCargoStatus("Selected QR event " + eventId, "ok");
+        }} else {{
+          setQrCargoStatus("QR event has no map position", "error");
+        }}
+        if (event) highlightLinkedEntity(event.linked_entity_id || event.location_node_id);
+      }};
+      const postQrAction = async (eventId, action) => {{
+        setQrCargoStatus("Saving QR cargo action...", "");
+        try {{
+          const response = await fetch("/api/qr/events/" + encodeURIComponent(eventId) + "/" + action, {{
+            method: "POST",
+            headers: {{
+              "Content-Type": "application/json",
+              "X-DogOps-Control-Token": robotControlToken,
+            }},
+            body: "{{}}",
+          }});
+          const result = await response.json();
+          if (!response.ok || result.ok === false) throw new Error(result.message || result.error || "qr_action_failed");
+          setQrCargoStatus("QR cargo action saved", "ok");
+          await refreshDimOSMap();
+          window.setTimeout(() => window.location.reload(), 150);
+        }} catch (error) {{
+          setQrCargoStatus("QR cargo action failed: " + error.message, "error");
+        }}
+      }};
+      const copyQrEventJson = async (eventId) => {{
+        const event = latestQrEventsById.get(eventId);
+        if (!event) return;
+        const raw = JSON.stringify(event, null, 2);
+        try {{
+          if (!navigator.clipboard) throw new Error("clipboard unavailable");
+          await navigator.clipboard.writeText(raw);
+          setQrCargoStatus("QR event JSON copied", "ok");
+        }} catch (_) {{
+          window.prompt("QR event JSON", raw);
+        }}
+      }};
+
       const updateDimOSMapLayers = (data) => {{
         const live = data && data.live ? data.live : null;
         if (!live) return;
@@ -1807,6 +2138,9 @@ def render_dashboard_html(
         const heatmapCells = renderLiveHeatmap(live.costmap);
         const pathPoints = renderDimOSPath(live.path || live.route || []);
         renderDimOSTarget(live.target);
+        const qrEvents = Array.isArray(data.qr_cargo_events) ? data.qr_cargo_events : [];
+        renderQrCargoMarkers(qrEvents);
+        renderQrCargoRows(qrEvents);
         dimosRobotPoseActive = Boolean(live.robot_pose);
         if (live.robot_pose) {{
           const yawRad = Number.isFinite(live.robot_pose.theta_deg)
@@ -2124,6 +2458,24 @@ def render_dashboard_html(
             await moveSelectedRouteWaypoint(1);
           }} else if (action === "publish_no_go") {{
             await postAuthoring("/api/map/no_go_shapes/publish", {{}});
+          }}
+        }});
+      }}
+      if (qrCargoRows) {{
+        qrCargoRows.addEventListener("click", async (event) => {{
+          const button = event.target.closest("button[data-qr-select], button[data-qr-promote-package], button[data-qr-promote-label], button[data-qr-bind-location], button[data-qr-copy]");
+          if (!button) return;
+          button.blur();
+          if (button.hasAttribute("data-qr-select")) {{
+            highlightQrCargoEvent(button.getAttribute("data-qr-select") || "");
+          }} else if (button.hasAttribute("data-qr-promote-package")) {{
+            await postQrAction(button.getAttribute("data-qr-promote-package") || "", "promote_to_package");
+          }} else if (button.hasAttribute("data-qr-promote-label")) {{
+            await postQrAction(button.getAttribute("data-qr-promote-label") || "", "promote_to_label");
+          }} else if (button.hasAttribute("data-qr-bind-location")) {{
+            await postQrAction(button.getAttribute("data-qr-bind-location") || "", "bind_location_node");
+          }} else if (button.hasAttribute("data-qr-copy")) {{
+            await copyQrEventJson(button.getAttribute("data-qr-copy") || "");
           }}
         }});
       }}
@@ -2540,6 +2892,32 @@ def _render_incident(projector: _MapProjector, incident: dict[str, Any]) -> str:
     )
 
 
+def _render_qr_cargo_event(projector: _MapProjector, event: dict[str, Any]) -> str:
+    position = event.get("map_position")
+    if not isinstance(position, dict):
+        return ""
+    x = projector.x(float(position["x"]))
+    y = projector.y(float(position["y"]))
+    event_id = escape(str(event.get("event_id") or ""))
+    cargo_id = escape(str(event.get("cargo_id") or "cargo"))
+    location_node_id = escape(str(event.get("location_node_id") or "unknown"))
+    title = escape(
+        f"QR cargo {event.get('cargo_id') or 'cargo'} / "
+        f"{event.get('location_node_id') or 'unknown'} / "
+        f"{event.get('action_policy') or 'report_only'}"
+    )
+    return (
+        f'<g class="map-qr-cargo-marker" data-edit-kind="qr_cargo" '
+        f'data-edit-id="{event_id}" data-qr-event-id="{event_id}" '
+        f'data-linked-entity-id="{location_node_id}"><title>{title}</title>'
+        f'<circle class="map-qr-cargo-ring" cx="{x:.1f}" cy="{y:.1f}" r="14" />'
+        f'<rect class="map-qr-cargo-core" x="{x - 5:.1f}" y="{y - 5:.1f}" '
+        f'width="10" height="10" rx="1.5" />'
+        f'<text class="map-qr-cargo-label" x="{x + 14:.1f}" y="{y + 5:.1f}">{cargo_id}</text>'
+        "</g>"
+    )
+
+
 def _render_route_stop(projector: _MapProjector, stop: dict[str, Any], index: int) -> str:
     x = projector.x(float(stop["x"]))
     y = projector.y(float(stop["y"]))
@@ -2593,6 +2971,73 @@ def metric(label: str, value: object) -> str:
         f"<strong>{escape(str(value))}</strong>"
         "</div>"
     )
+
+
+def qr_cargo_panel(events: list[dict[str, Any]]) -> str:
+    rows = []
+    for event in events[:50]:
+        event_id = escape(str(event.get("event_id") or ""))
+        timestamp = _format_timestamp(event.get("timestamp"))
+        robot_pose = _format_qr_robot_pose(event.get("robot_pose_at_detection"))
+        zone_shelf = " / ".join(
+            item
+            for item in [str(event.get("zone") or ""), str(event.get("shelf_id") or "")]
+            if item
+        ) or "unknown"
+        select_disabled = "" if event.get("map_position") else " disabled"
+        rows.append(
+            f'<tr data-qr-event-row data-qr-event-id="{event_id}">'
+            f"<td>{escape(timestamp)}</td>"
+            f"<td>{escape(str(event.get('warehouse_id') or 'unknown'))}</td>"
+            f"<td>{escape(str(event.get('location_node_id') or 'unknown'))}</td>"
+            f"<td>{escape(str(event.get('cargo_id') or 'unknown'))}</td>"
+            f"<td>{escape(zone_shelf)}</td>"
+            f"<td>{escape(str(event.get('task') or 'unknown'))}</td>"
+            f"<td>{escape(str(event.get('source') or 'unknown'))}</td>"
+            f"<td>{escape(str(event.get('status') or 'unknown'))} / "
+            f"{escape(str(event.get('action_policy') or 'report_only'))}</td>"
+            f"<td>{escape(robot_pose)}</td>"
+            '<td class="qr-actions">'
+            f'<button type="button" data-qr-select="{event_id}"{select_disabled}>Select on map</button>'
+            f'<button type="button" data-qr-promote-package="{event_id}">Promote to Package</button>'
+            f'<button type="button" data-qr-promote-label="{event_id}">Promote to Label</button>'
+            f'<button type="button" data-qr-bind-location="{event_id}">Bind Location Node</button>'
+            f'<button type="button" data-qr-copy="{event_id}">Copy JSON</button>'
+            "</td>"
+            "</tr>"
+        )
+    if not rows:
+        rows.append(
+            '<tr data-qr-empty><td colspan="10" class="muted">No QR cargo events yet</td></tr>'
+        )
+    return (
+        '<div class="qr-cargo-status" data-qr-cargo-status>QR cargo idle</div>'
+        '<div class="qr-cargo-table"><table><thead><tr>'
+        '<th>Time</th><th>WH</th><th>Location Node</th><th>Cargo</th>'
+        '<th>Zone/Shelf</th><th>Task</th><th>Source</th><th>Status/Policy</th>'
+        '<th>Robot Pose</th><th>Actions</th></tr></thead>'
+        f'<tbody data-qr-cargo-events>{"".join(rows)}</tbody></table></div>'
+    )
+
+
+def _format_timestamp(value: object) -> str:
+    try:
+        return f"{float(value):.3f}"
+    except (TypeError, ValueError):
+        return "unknown"
+
+
+def _format_qr_robot_pose(value: object) -> str:
+    if not isinstance(value, dict):
+        return "unknown"
+    x = _float_or_none(value.get("x"))
+    y = _float_or_none(value.get("y"))
+    yaw = _float_or_none(value.get("yaw"))
+    if x is None or y is None:
+        return "unknown"
+    if yaw is None:
+        return f"{x:.2f}, {y:.2f}"
+    return f"{x:.2f}, {y:.2f}, yaw {yaw:.2f}"
 
 
 def package_table(packages: list[dict[str, Any]]) -> str:
@@ -2743,6 +3188,7 @@ def write_dashboard_html(run_dir: str | Path, *, robot_control_token: str | None
             report,
             robot_control_token=robot_control_token,
             authoring=authoring,
+            qr_events=get_latest_qr_events(root),
         ),
         encoding="utf-8",
     )

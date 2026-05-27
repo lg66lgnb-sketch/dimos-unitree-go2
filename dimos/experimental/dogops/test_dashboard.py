@@ -241,7 +241,7 @@ def test_dashboard_map_layer_controls_match_svg_layers(tmp_path) -> None:
 
     controls = set(re.findall(r'data-map-layer="([^"]+)"', content))
     layers = set(re.findall(r'data-layer="([^"]+)"', content))
-    assert controls == {"semantic", "heatmap", "path", "robot"}
+    assert controls == {"semantic", "heatmap", "path", "robot", "qr"}
     assert controls <= layers
     assert 'querySelectorAll(`[data-layer="${layer}"]`)' in content
     assert 'item.toggleAttribute("hidden", !pressed)' in content
@@ -1513,3 +1513,123 @@ def test_response_status_code_extracts_go2_sport_response() -> None:
     assert dashboard._response_status_code(response) == 0
     assert dashboard._response_status_code({"data": {"status": {"code": 3203}}}) == 3203
     assert dashboard._response_status_code({}) is None
+
+
+
+def _sample_dashboard_qr_event(location_node_id: str = "COOLING_1") -> dict[str, Any]:
+    event = json.loads(
+        Path("examples/dogops/qr_cargo_event_sample.json").read_text(encoding="utf-8")
+    )
+    payload = dict(event["qr_payload"])
+    payload["location_node_id"] = location_node_id
+    event["qr_payload"] = payload
+    event["qr_payload_raw"] = json.dumps(payload, separators=(",", ":"))
+    event["robot_pose_at_detection"] = {
+        "frame": "map",
+        "x": 3.25,
+        "y": 0.25,
+        "yaw": 0.1,
+    }
+    return event
+
+
+def test_dashboard_qr_event_api_persists_and_composes_overlay(
+    tmp_path, monkeypatch
+) -> None:
+    def fail_robot_call(*_: object, **__: object) -> dict[str, object]:
+        raise AssertionError("QR event ingestion must not trigger robot control")
+
+    monkeypatch.setattr(dashboard, "_run_robot_go_to", fail_robot_call)
+    monkeypatch.setattr(dashboard, "_publish_robot_jog", fail_robot_call)
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    state_before = (run_dir / "state.json").read_text(encoding="utf-8")
+    report_before = (run_dir / "report.json").read_text(encoding="utf-8")
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        missing_status, missing_result = _post_json(
+            f"{base_url}/api/qr/events",
+            _sample_dashboard_qr_event(),
+        )
+        status, result = _post_json(
+            f"{base_url}/api/qr/events",
+            _sample_dashboard_qr_event(),
+            headers=_robot_headers(server),
+        )
+        events = _get_json(f"{base_url}/api/qr/events")
+        latest = _get_json(f"{base_url}/api/qr/events/latest?limit=1")
+        event_id = result["event"]["event_id"]  # type: ignore[index]
+        single = _get_json(f"{base_url}/api/qr/events/{event_id}")
+        map_data = _get_json(f"{base_url}/api/map")
+        html = (run_dir / "dashboard.html").read_text(encoding="utf-8")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert missing_status == 403
+    assert missing_result["error"] == "map_authoring_forbidden"
+    assert status == 201
+    assert result["event"]["action_policy"] == "report_only"  # type: ignore[index]
+    assert (run_dir / "qr_events.jsonl").is_file()
+    assert events["count"] == 1
+    assert latest["events"][0]["event_id"] == event_id  # type: ignore[index]
+    assert single["event"]["event_id"] == event_id  # type: ignore[index]
+    overlay = map_data["qr_cargo_events"][0]  # type: ignore[index]
+    assert overlay["cargo_id"] == "BOX-20260527-018"
+    assert overlay["location_node_id"] == "COOLING_1"
+    assert overlay["map_position"] == {
+        "frame": "map",
+        "x": 3.25,
+        "y": 0.25,
+        "yaw": 0.1,
+        "source": "robot_pose_at_detection",
+    }
+    assert overlay["static_location_node_pose"]["source"] == "site_or_authoring"
+    assert overlay["pose_delta"]["distance_m"] > 0
+    assert map_data["layers"]["qr"] is True  # type: ignore[index]
+    assert "QR Cargo" in html
+    assert "BOX-20260527-018" in html
+    assert (run_dir / "state.json").read_text(encoding="utf-8") == state_before
+    assert (run_dir / "report.json").read_text(encoding="utf-8") == report_before
+    assert not (run_dir / "map_authoring.json").exists()
+
+
+def test_dashboard_qr_promotion_stays_run_local_authoring(tmp_path) -> None:
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        _, result = _post_json(
+            f"{base_url}/api/qr/events",
+            _sample_dashboard_qr_event(location_node_id="WH03-A12-SHELF05"),
+            headers=_robot_headers(server),
+        )
+        event_id = result["event"]["event_id"]  # type: ignore[index]
+        status, promoted = _post_json(
+            f"{base_url}/api/qr/events/{event_id}/promote_to_package",
+            {},
+            headers=_robot_headers(server),
+        )
+        authoring = _get_json(f"{base_url}/api/map/authoring")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 200
+    assert promoted["ok"] is True
+    entity = authoring["entities"][0]  # type: ignore[index]
+    assert entity["id"] == "BOX-20260527-018"
+    assert entity["kind"] == "package"
+    assert entity["source_id"] == event_id
+    assert entity["pose"]["source"] == "qr_cargo_event"
+    assert authoring["routes"] == []
