@@ -577,6 +577,14 @@ def render_site_map(
     bounds = map_data["bounds"]
     bounds_attr = escape(json.dumps(bounds, separators=(",", ":")), quote=True)
     authoring_attr = escape(json.dumps(authoring or {}, separators=(",", ":")), quote=True)
+    home_pose = next((zone for zone in map_data["zones"] if zone.get("id") == "HOME"), None)
+    home_pose_attr = escape(
+        json.dumps(
+            {"x": home_pose["x"], "y": home_pose["y"]} if home_pose else {},
+            separators=(",", ":"),
+        ),
+        quote=True,
+    )
     projector = _MapProjector(bounds)
     route_points = " ".join(
         f"{projector.x(point['x']):.1f},{projector.y(point['y']):.1f}"
@@ -606,6 +614,7 @@ def render_site_map(
         )
     robot = _render_live_robot_pose()
     scan_items = "".join(_render_scan_item(observation) for observation in map_data["observations"])
+    rerun_source_url = _trusted_rerun_source_url(os.environ.get("DOGOPS_RERUN_SOURCE_URL"))
     rerun_web_url = _trusted_rerun_web_url(os.environ.get("DOGOPS_RERUN_WEB_URL"))
     rerun_web_url_attr = escape(rerun_web_url, quote=True)
     legend = (
@@ -629,19 +638,22 @@ def render_site_map(
     )
     edit_controls = (
         '<div class="map-edit-controls" data-map-edit-controls>'
+        '<button type="button" data-map-edit-action="map_from_scratch">Map From Scratch</button>'
+        '<button type="button" data-map-edit-action="return_home">Return Home</button>'
         '<button type="button" data-map-edit-mode="select" aria-pressed="true">Select</button>'
         '<button type="button" data-map-edit-mode="home" aria-pressed="false">Set Home</button>'
         '<button type="button" data-map-edit-mode="zone" aria-pressed="false">Label</button>'
         '<button type="button" data-map-edit-mode="asset" aria-pressed="false">Asset</button>'
         '<button type="button" data-map-edit-mode="package" aria-pressed="false">Package</button>'
         '<button type="button" data-map-edit-mode="no_go" aria-pressed="false">No-Go</button>'
-        '<button type="button" data-map-edit-mode="route" aria-pressed="false">Route</button>'
+        '<button type="button" data-map-edit-mode="route" aria-pressed="false">Add Photo POI</button>'
         '<button type="button" data-map-edit-mode="incident" aria-pressed="false">Incident</button>'
         '<button type="button" data-map-edit-mode="tag" aria-pressed="false">Bind Tag</button>'
         '<button type="button" data-map-edit-action="use_observation">Use Observation</button>'
         '<button type="button" data-map-edit-action="delete_selected">Delete</button>'
         '<button type="button" data-map-edit-action="route_select">Select Route</button>'
-        '<button type="button" data-map-edit-action="run_route">Run Route</button>'
+        '<button type="button" data-map-edit-action="run_route_sim">Simulate POI Route</button>'
+        '<button type="button" data-map-edit-action="run_route">Run POI Route</button>'
         '<button type="button" data-map-edit-action="stop_route">Stop Route</button>'
         '<button type="button" data-map-edit-action="route_up">Route Up</button>'
         '<button type="button" data-map-edit-action="route_down">Route Down</button>'
@@ -653,11 +665,12 @@ def render_site_map(
     )
     return f"""
       <div class="map-shell" data-map-surface>
-        {_render_rerun_surface(rerun_web_url)}
+        {_render_rerun_surface(rerun_source_url, rerun_web_url)}
         {layer_controls}
         {edit_controls}
         <svg class="site-map" role="img" aria-label="DogOps mission map"
           data-live-map-svg data-map-bounds="{bounds_attr}" data-map-authoring="{authoring_attr}"
+          data-home-pose="{home_pose_attr}"
           viewBox="0 0 {MAP_WIDTH} {MAP_HEIGHT}">
           <defs>
             <filter id="dogops-map-glow" x="-50%" y="-50%" width="200%" height="200%">
@@ -837,19 +850,36 @@ def render_dashboard_html(
       background: #03060b;
       border: 1px solid #1d2430;
       border-radius: 8px;
+      contain: layout paint;
       display: grid;
-      min-height: 220px;
+      height: clamp(360px, 44vh, 620px);
+      max-height: 620px;
+      min-height: 360px;
       overflow: hidden;
       position: relative;
     }}
-    .rerun-surface iframe {{
+    .rerun-canvas {{
       background: #03060b;
-      border: 0;
       display: block;
       height: 100%;
-      min-height: 220px;
+      max-height: 100%;
+      min-height: 0;
+      overflow: hidden;
+      position: relative;
       width: 100%;
     }}
+    .rerun-canvas > * {{
+      height: 100% !important;
+      max-height: 100% !important;
+      min-height: 0 !important;
+      width: 100% !important;
+    }}
+    .rerun-canvas canvas {{
+      height: 100%;
+      max-height: 100%;
+      width: 100%;
+    }}
+    .rerun-canvas[hidden] {{ display: none; }}
     .rerun-standby {{
       align-items: center;
       background:
@@ -867,6 +897,18 @@ def render_dashboard_html(
       z-index: 1;
     }}
     .rerun-standby[hidden] {{ display: none; }}
+    .rerun-offline {{
+      align-items: center;
+      color: #d8dee9;
+      display: grid;
+      inset: 0;
+      justify-items: center;
+      padding: 18px;
+      position: absolute;
+      text-align: center;
+      z-index: 2;
+    }}
+    .rerun-offline[hidden] {{ display: none; }}
     .rerun-chip {{
       border: 1px solid #2d3a4f;
       border-radius: 999px;
@@ -1395,7 +1437,6 @@ def render_dashboard_html(
       const mapEditControls = document.querySelector("[data-map-edit-controls]");
       const rerunSurface = document.querySelector("[data-rerun-surface]");
       const rerunConnect = document.querySelector("[data-rerun-connect]");
-      const rerunFrame = document.querySelector("[data-rerun-frame]");
       const rerunStandby = document.querySelector("[data-rerun-standby]");
       const rerunStatus = document.querySelector("[data-rerun-status]");
       const liveMapSvg = document.querySelector("[data-live-map-svg]");
@@ -1424,6 +1465,7 @@ def render_dashboard_html(
       let dragMapObject = null;
       let liveMapBounds = null;
       let liveOverlayBounds = null;
+      let mapHomePose = null;
       try {{
         liveMapBounds = liveMapSvg ? JSON.parse(liveMapSvg.dataset.mapBounds || "{{}}") : null;
       }} catch (_) {{
@@ -1433,6 +1475,11 @@ def render_dashboard_html(
         mapAuthoring = liveMapSvg ? JSON.parse(liveMapSvg.dataset.mapAuthoring || "{{}}") : null;
       }} catch (_) {{
         mapAuthoring = null;
+      }}
+      try {{
+        mapHomePose = liveMapSvg ? JSON.parse(liveMapSvg.dataset.homePose || "{{}}") : null;
+      }} catch (_) {{
+        mapHomePose = null;
       }}
       liveOverlayBounds = liveMapBounds;
       const liveMapSize = {{width: {MAP_WIDTH}, height: {MAP_HEIGHT}}};
@@ -1482,15 +1529,19 @@ def render_dashboard_html(
       const setRerunStatus = (text) => {{
         if (rerunStatus) rerunStatus.textContent = text;
       }};
-      const connectRerunSurface = () => {{
-        if (!rerunSurface || !rerunFrame) return;
-        const url = rerunSurface.getAttribute("data-rerun-url") || "";
-        if (!url) return;
-        if (rerunFrame.getAttribute("src") !== url) {{
-          rerunFrame.setAttribute("src", url);
+      const connectRerunSurface = async ({{replay = false}} = {{}}) => {{
+        if (!rerunSurface) return false;
+        setRerunStatus("Connecting 3D View...");
+        try {{
+          const viewer = window.DogOpsRerunWebViewer || await import("/static/rerun-web-viewer.js?v=dogops-rerun-v2");
+          await viewer.mount(rerunSurface);
+          if (replay && viewer.replay) await viewer.replay(rerunSurface);
+          if (rerunStandby) rerunStandby.hidden = true;
+          return true;
+        }} catch (error) {{
+          setRerunStatus(`3D View unavailable: ${{error.message}}`);
+          return false;
         }}
-        if (rerunStandby) rerunStandby.hidden = true;
-        setRerunStatus("3D View connected");
       }};
       const projectPoseWithBounds = (pose, bounds) => {{
         if (!bounds || !pose) return null;
@@ -1664,13 +1715,54 @@ def render_dashboard_html(
           routeExecutionPolling = false;
         }}
       }};
-      const runSelectedRoute = async () => {{
+      const requestRerunReplay = async (action) => {{
+        try {{
+          const response = await fetch("/api/rerun/replay", {{
+            method: "POST",
+            headers: {{
+              "Content-Type": "application/json",
+              "X-DogOps-Control-Token": robotControlToken,
+            }},
+            body: JSON.stringify({{action}}),
+          }});
+          const result = await response.json();
+          if (!response.ok || result.ok === false) {{
+            throw new Error(result.message || result.error || "rerun_replay_failed");
+          }}
+          await connectRerunSurface({{replay: true}});
+          return true;
+        }} catch (error) {{
+          setMapCommandStatus(`3D replay failed: ${{error.message}}`, "error");
+          return false;
+        }}
+      }};
+      const mapFromScratch = async () => {{
+        setMapCommandStatus("Mapping from scratch in simulation...", "ok");
+        await requestRerunReplay("replay_mapping");
+      }};
+      const returnHome = async () => {{
         const route = selectedRoute();
-        if (!route) {{
-          setRouteExecutionStatus("Execution: select or author a route first", "error");
+        const home = route && Array.isArray(route.waypoints)
+          ? route.waypoints.find((waypoint) => waypoint.target_id === "HOME" || waypoint.label === "HOME")
+          : null;
+        const target = (home && home.pose)
+          || ((mapAuthoring && mapAuthoring.home) ? mapAuthoring.home : null)
+          || mapHomePose;
+        if (!target) {{
+          setMapCommandStatus("Home target unavailable", "error");
           return;
         }}
-        setRouteExecutionStatus(`Execution: starting ${{route.id}}...`, "");
+        setMapCommandStatus("Return home target selected", "ok");
+        await sendGoToTarget({{x: Number(target.x), y: Number(target.y)}});
+      }};
+      const runSelectedRoute = async (dryRun = false) => {{
+        const route = selectedRoute();
+        if (!route) {{
+          setRouteExecutionStatus("Execution: select or author POIs first", "error");
+          return;
+        }}
+        setRouteExecutionStatus(`Execution: starting ${{route.id}}${{dryRun ? " simulation" : ""}}...`, "");
+        await requestRerunReplay("replay_route");
         try {{
           const response = await fetch("/api/map/routes/follow", {{
             method: "POST",
@@ -1678,7 +1770,7 @@ def render_dashboard_html(
               "Content-Type": "application/json",
               "X-DogOps-Control-Token": robotControlToken,
             }},
-            body: JSON.stringify({{route_id: route.id, dry_run: false}}),
+            body: JSON.stringify({{route_id: route.id, dry_run: dryRun}}),
           }});
           const result = await response.json();
           const state = (result.mcp_result && result.mcp_result.route_execution) || result.route_execution || {{}};
@@ -2215,8 +2307,14 @@ def render_dashboard_html(
             await placeSelectedFromObservation();
           }} else if (action === "route_select") {{
             await selectRouteByPrompt();
+          }} else if (action === "map_from_scratch") {{
+            await mapFromScratch();
+          }} else if (action === "return_home") {{
+            await returnHome();
+          }} else if (action === "run_route_sim") {{
+            await runSelectedRoute(true);
           }} else if (action === "run_route") {{
-            await runSelectedRoute();
+            await runSelectedRoute(false);
           }} else if (action === "stop_route") {{
             await stopRouteExecution();
           }} else if (action === "route_up") {{
@@ -2334,11 +2432,73 @@ def _trusted_rerun_web_url(raw_url: str | None) -> str:
     return raw_url
 
 
-def _render_rerun_surface(rerun_web_url: str) -> str:
+def _trusted_rerun_source_url(raw_url: str | None) -> str:
+    fallback = "rerun+http://127.0.0.1:9877/proxy"
+    if not raw_url or not raw_url.startswith("rerun+"):
+        return fallback
+    try:
+        parsed = urlparse(raw_url.removeprefix("rerun+"))
+    except ValueError:
+        return fallback
+    if parsed.scheme not in {"http", "https"}:
+        return fallback
+    host = (parsed.hostname or "").lower()
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        return fallback
+    return raw_url
+
+
+def _with_default_route_authoring(
+    authoring: dict[str, Any],
+    state: dict[str, Any],
+    report: dict[str, Any],
+) -> dict[str, Any]:
+    if authoring.get("routes"):
+        return authoring
+    route_data = build_route_data(state, report, authoring=authoring)
+    waypoints = []
+    for index, stop in enumerate(route_data.get("stops") or [], 1):
+        try:
+            x = float(stop["x"])
+            y = float(stop["y"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        target_id = str(stop.get("target_id") or f"POI_{index}")
+        waypoints.append(
+            {
+                "id": f"POI-{index}",
+                "label": f"Photo POI {index}: {target_id}",
+                "target_id": target_id,
+                "pose": {"x": x, "y": y, "source": "site_config"},
+            }
+        )
+    if not waypoints:
+        return authoring
+    updated = dict(authoring)
+    updated["routes"] = [
+        {
+            "id": "DOGOPS_PHOTO_POI_ROUTE",
+            "label": "DogOps photo POI route",
+            "mission_id": str(state.get("mission_id") or report.get("mission_id") or ""),
+            "waypoints": waypoints,
+        }
+    ]
+    updated["selected_route_id"] = "DOGOPS_PHOTO_POI_ROUTE"
+    return updated
+
+
+def _render_rerun_surface(rerun_source_url: str, rerun_web_url: str) -> str:
+    rerun_source_url_attr = escape(rerun_source_url, quote=True)
     rerun_web_url_attr = escape(rerun_web_url, quote=True)
     return (
-        f'<div class="rerun-surface" data-rerun-surface data-rerun-url="{rerun_web_url_attr}">'
-        '<iframe data-rerun-frame title="3D View" loading="lazy"></iframe>'
+        '<div class="rerun-surface" data-rerun-surface data-map-viewer '
+        f'data-rerun-source-url="{rerun_source_url_attr}" '
+        'data-rerun-asset-base-url="/assets/vendor/@rerun-io/web-viewer/" '
+        'data-rerun-view-mode="dogops-2d">'
+        '<div class="rerun-canvas" data-rerun-canvas hidden></div>'
+        '<div class="rerun-offline" data-viewer-offline hidden>'
+        '<div>3D View unavailable. Start the Rerun stream, then connect again.</div>'
+        "</div>"
         '<div class="rerun-standby" data-rerun-standby>'
         '<span class="rerun-chip">3D View</span>'
         '<div class="rerun-status" data-rerun-status>3D View standby</div>'
@@ -2839,6 +2999,7 @@ def write_dashboard_html(run_dir: str | Path, *, robot_control_token: str | None
         root,
         site_id=str((state.get("site") or {}).get("site_id") or ""),
     ).model_dump(mode="json")
+    authoring = _with_default_route_authoring(authoring, state, report)
     html_path = root / "dashboard.html"
     html_path.write_text(
         render_dashboard_html(

@@ -31,8 +31,10 @@ from dimos.experimental.dogops.live_map import DogOpsLiveMapAdapter
 from dimos.experimental.dogops.map_authoring import (
     EditableIncidentLocation,
     EditableMapEntity,
+    EditableMapPoint,
     EditableNoGoShape,
     EditableRoute,
+    EditableRouteWaypoint,
     EditableTagBinding,
     MapAuthoringState,
     delete_entity,
@@ -51,7 +53,12 @@ from dimos.experimental.dogops.map_authoring import (
     publish_no_go_constraints,
     validation_error_message,
 )
-from dimos.experimental.dogops.route_executor import load_route_execution, request_route_stop
+from dimos.experimental.dogops.route_executor import (
+    DogOpsRouteExecutor,
+    RouteExecutionError,
+    load_route_execution,
+    request_route_stop,
+)
 from dimos.experimental.dogops.store import DogOpsStore
 
 try:  # pragma: no cover - exercised only inside a full DimOS checkout.
@@ -94,6 +101,7 @@ ROBOT_JOG_COMMANDS: dict[str, tuple[float, float, float]] = {
 HARD_STOP_COMMANDS = {"hard_stop", "stop"}
 ROBOT_POSTURE_COMMANDS = {"wake", "balance", "sleep"}
 ROBOT_CONTROL_TOKEN_HEADER = "X-DogOps-Control-Token"
+RERUN_COMMAND_FILENAME = "rerun_command.json"
 DEFAULT_ROBOT_IP = (
     os.environ.get("DOGOPS_ROBOT_IP")
     or os.environ.get("GO2_IP")
@@ -230,6 +238,17 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
             state = self._read_json(self.run_dir / "state.json")
             report = self._read_json(self.run_dir / "report.json")
             self._send_json(build_poi_data(state, report))
+        elif path == "/static/rerun-web-viewer.js":
+            self._send_static_asset(
+                Path(__file__).with_name("static") / "rerun-web-viewer.js",
+                "application/javascript; charset=utf-8",
+            )
+        elif path.startswith("/assets/vendor/@rerun-io/web-viewer/"):
+            relative = path.removeprefix("/assets/vendor/@rerun-io/web-viewer/")
+            self._send_static_asset(
+                _rerun_web_viewer_asset_path(relative),
+                _static_content_type(relative),
+            )
         else:
             self._send_json({"error": "not_found", "path": path}, HTTPStatus.NOT_FOUND)
 
@@ -270,6 +289,9 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/map/routes/stop":
             if self._authorize_map_authoring_write():
                 self._stop_map_route()
+        elif path == "/api/rerun/replay":
+            if self._authorize_map_authoring_write():
+                self._replay_rerun()
         elif path.startswith("/api/map/incidents/") and path.endswith("/location"):
             if self._authorize_map_authoring_write():
                 parts = path.split("/")
@@ -334,11 +356,20 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: object) -> None:
         return
 
-    def _load_authoring(self, state: dict[str, Any] | None = None) -> MapAuthoringState:
+    def _load_authoring(
+        self,
+        state: dict[str, Any] | None = None,
+        *,
+        include_default_route: bool = True,
+    ) -> MapAuthoringState:
         if state is None:
             state = self._read_json(self.run_dir / "state.json")
         site_id = str((state.get("site") or {}).get("site_id") or "")
-        return load_map_authoring(self.run_dir, site_id=site_id)
+        authoring = load_map_authoring(self.run_dir, site_id=site_id)
+        if include_default_route and not authoring.routes:
+            report = self._read_json(self.run_dir / "report.json")
+            authoring = _with_default_inspection_route(authoring, state, report)
+        return authoring
 
     def _send_authoring(self, authoring: MapAuthoringState) -> None:
         state = self._read_json(self.run_dir / "state.json")
@@ -370,7 +401,7 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
 
     def _persist_authoring_mutation(self, mutate: Any) -> MapAuthoringState:
         with _AUTHORING_LOCK:
-            authoring = mutate(self._load_authoring())
+            authoring = mutate(self._load_authoring(include_default_route=False))
             self._save_authoring(authoring)
             return authoring
 
@@ -497,6 +528,31 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         route_id = payload.get("route_id")
         route_id_arg = str(route_id).strip() if route_id is not None else None
         dry_run = bool(payload.get("dry_run", False))
+        if dry_run:
+            try:
+                state = self._run_dashboard_dry_route(route_id_arg)
+            except RouteExecutionError as exc:
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": "route_execution_rejected",
+                        "message": str(exc),
+                        **self._route_execution_payload(),
+                    },
+                    HTTPStatus.BAD_REQUEST,
+                )
+                return
+            self._send_json(
+                {
+                    "ok": True,
+                    "command": "follow_route",
+                    "transport": "dashboard_dry_run",
+                    **self._route_execution_payload(
+                        route_execution=state.model_dump(mode="json")
+                    ),
+                }
+            )
+            return
         try:
             result = _run_robot_call(
                 lambda: _run_robot_follow_route(route_id_arg, dry_run),
@@ -607,6 +663,12 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
 
     def _route_execution_status(self) -> None:
         self._send_json({"ok": True, **self._route_execution_payload()})
+
+    def _run_dashboard_dry_route(self, route_id: str | None) -> Any:
+        state = self._read_json(self.run_dir / "state.json")
+        authoring = self._load_authoring(state)
+        save_map_authoring(self.run_dir, authoring)
+        return DogOpsRouteExecutor(self.run_dir).follow_route(route_id, dry_run=True)
 
     def _route_execution_payload(
         self,
@@ -897,6 +959,23 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
 
         self._send_json({"ok": bool(result), "command": "map_origin"})
 
+    def _replay_rerun(self) -> None:
+        payload = self._read_body_json()
+        action = str(payload.get("action") or "").strip()
+        if action not in {"replay_mapping", "replay_route"}:
+            self._send_json(
+                {"ok": False, "error": "unsupported_rerun_action"},
+                HTTPStatus.BAD_REQUEST,
+            )
+            return
+        command_path = self.run_dir / RERUN_COMMAND_FILENAME
+        command_path.write_text(
+            json.dumps({"action": action, "id": str(time.time_ns())}, sort_keys=True)
+            + "\n",
+            encoding="utf-8",
+        )
+        self._send_json({"ok": True, "action": action})
+
     def _authorize_local_read(self) -> bool:
         host = self.headers.get("Host", "")
         if not _is_loopback_host(_host_name(host)):
@@ -952,6 +1031,17 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
+
+    def _send_static_asset(self, path: Path, content_type: str) -> None:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            self._send_json({"error": "missing_file", "path": str(path)}, HTTPStatus.NOT_FOUND)
+            return
+        if not resolved.exists() or not resolved.is_file():
+            self._send_json({"error": "missing_file", "path": str(path)}, HTTPStatus.NOT_FOUND)
+            return
+        self._send_file(resolved, content_type)
 
     def _send_json(self, payload: Any, status: HTTPStatus = HTTPStatus.OK) -> None:
         raw = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
@@ -1143,6 +1233,75 @@ def _origin_matches_host(origin: str, host_header: str) -> bool:
     if not _is_loopback_host(origin_host):
         return False
     return origin_host == request_host and origin_port == request_port
+
+
+def _rerun_web_viewer_asset_path(relative: str) -> Path:
+    if not relative or relative.startswith("/") or ".." in Path(relative).parts:
+        return Path("__missing__")
+    candidates = [
+        Path.cwd() / "node_modules" / "@rerun-io" / "web-viewer" / relative,
+        Path(__file__).parents[3]
+        / "node_modules"
+        / "@rerun-io"
+        / "web-viewer"
+        / relative,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+        if not candidate.suffix:
+            js_candidate = candidate.with_suffix(".js")
+            if js_candidate.exists():
+                return js_candidate
+    return candidates[0]
+
+
+def _static_content_type(relative: str) -> str:
+    if relative.endswith(".js"):
+        return "application/javascript; charset=utf-8"
+    if "." not in Path(relative).name:
+        return "application/javascript; charset=utf-8"
+    if relative.endswith(".wasm"):
+        return "application/wasm"
+    if relative.endswith(".map"):
+        return "application/json"
+    return "application/octet-stream"
+
+
+def _with_default_inspection_route(
+    authoring: MapAuthoringState,
+    state: dict[str, Any],
+    report: dict[str, Any],
+) -> MapAuthoringState:
+    route_data = build_route_data(state, report, authoring=authoring.model_dump(mode="json"))
+    waypoints: list[EditableRouteWaypoint] = []
+    for index, stop in enumerate(route_data.get("stops") or [], 1):
+        try:
+            x = float(stop["x"])
+            y = float(stop["y"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        target_id = str(stop.get("target_id") or f"POI_{index}")
+        waypoints.append(
+            EditableRouteWaypoint(
+                id=f"POI-{index}",
+                label=f"Photo POI {index}: {target_id}",
+                target_id=target_id,
+                pose=EditableMapPoint(x=x, y=y, source="site_config"),
+            )
+        )
+    if not waypoints:
+        return authoring
+    authoring.routes = [
+        EditableRoute(
+            id="DOGOPS_PHOTO_POI_ROUTE",
+            label="DogOps photo POI route",
+            mission_id=str(state.get("mission_id") or report.get("mission_id") or ""),
+            waypoints=waypoints,
+        )
+    ]
+    authoring.selected_route_id = authoring.routes[0].id
+    return MapAuthoringState.model_validate(authoring.model_dump(mode="json"))
 
 
 def _publish_robot_jog(

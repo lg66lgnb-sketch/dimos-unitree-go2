@@ -96,8 +96,12 @@ export async function mountDogOpsRerunViewer(root) {
   if (!root) return;
   const existing = mounted.get(root);
   if (existing) {
-    existing.stop();
-    mounted.delete(root);
+    const canvasHost = root.querySelector("[data-rerun-canvas]");
+    const fallback = root.querySelector("[data-viewer-offline]");
+    if (canvasHost) canvasHost.hidden = false;
+    if (fallback) fallback.hidden = true;
+    await focusMap(root, { replay: false });
+    return;
   }
 
   const canvasHost = root.querySelector("[data-rerun-canvas]");
@@ -179,6 +183,13 @@ export async function replayDogOpsRerunMap(root) {
 export async function focusDogOpsRerunMap(root) {
   return focusMap(root, { replay: false });
 }
+
+export {
+  mountDogOpsRerunViewer as mount,
+  mountDogOpsRerunViewers as mountAll,
+  replayDogOpsRerunMap as replay,
+  focusDogOpsRerunMap as focusMap,
+};
 
 window.DogOpsRerunWebViewer = {
   mount: mountDogOpsRerunViewer,
