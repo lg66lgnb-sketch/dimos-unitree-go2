@@ -25,6 +25,7 @@ from dimos.experimental.dogops.dashboard_static import (
     build_route_data,
     write_dashboard_html,
 )
+from dimos.experimental.dogops.live_map import DogOpsLiveMapAdapter
 from dimos.experimental.dogops.store import DogOpsStore
 
 try:  # pragma: no cover - exercised only inside a full DimOS checkout.
@@ -74,6 +75,7 @@ DEFAULT_ROBOT_IP = (
 )
 _ROBOT_SESSIONS: dict[str, _RobotMotionSession] = {}
 _ROBOT_SESSIONS_LOCK = threading.Lock()
+_LIVE_MAP_ADAPTER = DogOpsLiveMapAdapter()
 
 
 def make_dashboard_server(run_dir: str | Path, host: str, port: int) -> ThreadingHTTPServer:
@@ -148,7 +150,7 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/map":
             state = self._read_json(self.run_dir / "state.json")
             report = self._read_json(self.run_dir / "report.json")
-            self._send_json(build_map_data(state, report))
+            self._send_json(build_map_data(state, report, live_overlay=_LIVE_MAP_ADAPTER.snapshot()))
         elif path == "/api/robot/pose":
             if self._authorize_local_read():
                 self._send_json(_robot_pose_snapshot(self.robot_ip))

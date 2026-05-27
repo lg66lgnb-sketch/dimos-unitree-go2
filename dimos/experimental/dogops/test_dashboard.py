@@ -61,6 +61,13 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert 'data-map-surface' in content
     assert "map-route" in content
     assert "map-free-cell" in content
+    assert "map-live-cost-cell" in content
+    assert "map-dimos-path" in content
+    assert 'data-map-layer="heatmap"' in content
+    assert 'data-live-heatmap' in content
+    assert 'data-live-path' in content
+    assert 'data-live-target' in content
+    assert "refreshDimOSMap" in content
     assert "map-point" in content
     assert "map-robot-core" in content
     assert "free grid" in content
@@ -187,6 +194,8 @@ def test_dashboard_api_serves_state_report_and_nav(tmp_path) -> None:
     assert any(capture["id"] == "OBS-003" for capture in poi["captures"])  # type: ignore[index]
     assert any(reading["asset_id"] == "TEMP_1" for reading in poi["readings"])  # type: ignore[index]
     assert any(package["id"] == "PKG-104" for package in map_data["packages"])
+    assert map_data["live"]["source"] == "DimOS live LCM topics"  # type: ignore[index]
+    assert "costmap" in map_data["live"]  # type: ignore[operator]
 
 
 def test_dashboard_map_data_projects_site_route_and_observations(tmp_path) -> None:
@@ -206,6 +215,51 @@ def test_dashboard_map_data_projects_site_route_and_observations(tmp_path) -> No
     ]
     assert any(observation["id"] == "OBS-003" for observation in map_data["observations"])
     assert any(incident["id"] == "INC-001" for incident in map_data["incidents"])
+    assert map_data["live"]["status"] == "not_requested"
+
+
+def test_dashboard_map_data_includes_dimos_live_layers(tmp_path, monkeypatch) -> None:
+    class FakeLiveMapAdapter:
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "ok": True,
+                "source": "DimOS live LCM topics",
+                "status": "receiving",
+                "error": "",
+                "topics": {"global_costmap": {"received": True}},
+                "costmap": {
+                    "source": "DimOS live costmap",
+                    "columns": 1,
+                    "rows": 1,
+                    "cells": [{"x": 1.0, "y": 2.0, "width": 0.5, "height": 0.5, "cost": 0.9}],
+                },
+                "path": [{"x": 1.0, "y": 2.0}, {"x": 2.0, "y": 3.0}],
+                "route": [{"target_id": "LIVE-PATH-001", "x": 1.0, "y": 2.0}],
+                "robot_pose": {"x": 1.2, "y": 2.1, "theta_deg": 45.0, "source": "odom"},
+                "target": {"x": 2.0, "y": 3.0, "theta_deg": None, "source": "target"},
+            }
+
+    monkeypatch.setattr(dashboard, "_LIVE_MAP_ADAPTER", FakeLiveMapAdapter())
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        map_data = _get_json(f"{base_url}/api/map")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert map_data["live"]["ok"] is True  # type: ignore[index]
+    assert map_data["live"]["costmap"]["source"] == "DimOS live costmap"  # type: ignore[index]
+    assert map_data["live"]["path"][1]["x"] == 2.0  # type: ignore[index]
+    assert map_data["live"]["target"]["source"] == "target"  # type: ignore[index]
+    assert map_data["layers"]["heatmap"] is True  # type: ignore[index]
+    assert map_data["layers"]["path"] is True  # type: ignore[index]
 
 
 def test_dashboard_route_and_poi_data_project_evidence(tmp_path) -> None:
