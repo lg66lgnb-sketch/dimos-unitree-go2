@@ -4,6 +4,6 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "@rerun-io/web-viewer": "0.32.2"
+    "@rerun-io/web-viewer": "0.32.0-alpha.1"
   }
 }
