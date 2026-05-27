@@ -19,6 +19,22 @@ uv run --no-sync pytest -q -o addopts='' dimos/utils/cli/test_apriltag.py
 uv run --no-sync dimos apriltag --ids '10,20,101-104' --size-mm 100 --family tag36h11 --out /tmp/dogops-tags.pdf
 ```
 
+Fast path when the robot is in front of you:
+
+```bash
+cd $DIMOS_ROOT
+export GO2_IP=<GO2_IP>
+./scripts/dogops_go2_preflight.sh
+RUN_GO2_SMOKE=1 ./scripts/dogops_go2_preflight.sh
+RUN_DOGOPS_SMOKE=1 ./scripts/dogops_go2_preflight.sh
+```
+
+Keep this command visible before starting any hardware smoke:
+
+```bash
+uv run dimos stop --force
+```
+
 After DogOps is implemented:
 
 ```bash
@@ -26,7 +42,7 @@ uv run --no-sync pytest -q -o addopts='' dimos/experimental/dogops
 uv run --no-sync python -m dimos.experimental.dogops.cli simulate --out .dogops/runs/latest
 uv run --no-sync ruff check dimos/experimental/dogops dimos/robot/unitree/go2/blueprints/agentic/unitree_go2_dogops.py || true
 uv run --no-sync dimos list | rg dogops
-uv run --no-sync dimos mcp list-tools | rg 'run_mission|scan_zone|verify_work_order|nav_eval_report'
+uv run --no-sync dimos mcp list-tools | rg 'run_mission|scan_zone|read_gauge|check_clearance|detect_blocked_aisle|scan_receiving_manifest|verify_work_order|nav_eval_report'
 ```
 
 If ruff is unavailable in the full DimOS venv, record that and continue with tests plus `git diff --check`. If replay deploys DogOps modules plus `McpServer` but `dimos status` and `dimos mcp list-tools` do not see a running instance, treat MCP exposure as unvalidated until the hardware run or a corrected DimOS launch mode proves it.
@@ -87,9 +103,13 @@ If this fails, stop DogOps hardware work and record the exact network/WebRTC/log
 uv run --no-sync dimos stop --force || true
 uv run --no-sync dimos run unitree-go2-dogops --robot-ip "$GO2_IP" --viewer none --daemon
 uv run --no-sync dimos status
-uv run --no-sync dimos mcp list-tools | rg 'run_mission|scan_zone|verify_work_order|nav_eval_report'
+uv run --no-sync dimos mcp list-tools | rg 'run_mission|scan_zone|read_gauge|check_clearance|detect_blocked_aisle|scan_receiving_manifest|verify_work_order|nav_eval_report'
 uv run --no-sync dimos mcp call run_mission --json-args '{"mission_id":"receiving_sre_demo"}'
 uv run --no-sync dimos mcp call scan_zone --json-args '{"zone_id":"INBOUND_DOCK"}'
+uv run --no-sync dimos mcp call scan_receiving_manifest --json-args '{"zone_id":"INBOUND_DOCK"}'
+uv run --no-sync dimos mcp call read_gauge --json-args '{"asset_id":"TEMP_1"}'
+uv run --no-sync dimos mcp call check_clearance --json-args '{"asset_id":"COOLING_1"}'
+uv run --no-sync dimos mcp call detect_blocked_aisle --json-args '{"zone_id":"AISLE_1"}'
 uv run --no-sync dimos mcp call nav_eval_report
 uv run --no-sync dimos log -n 200
 uv run --no-sync dimos stop --force

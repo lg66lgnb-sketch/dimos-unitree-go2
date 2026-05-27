@@ -9,7 +9,12 @@ import pytest
 
 from dimos.experimental.dogops import dashboard
 from dimos.experimental.dogops.dashboard import DogOpsDashboardModule, make_dashboard_server
-from dimos.experimental.dogops.dashboard_static import write_dashboard_html
+from dimos.experimental.dogops.dashboard_static import (
+    build_map_data,
+    build_poi_data,
+    build_route_data,
+    write_dashboard_html,
+)
 from dimos.experimental.dogops.mission_engine import run_offline_simulation
 
 
@@ -52,12 +57,37 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     content = html_path.read_text(encoding="utf-8")
 
     assert "DogOps SiteOps Agent" in content
+    assert "Mission Map" in content
+    assert 'data-map-surface' in content
+    assert "map-route" in content
+    assert "map-free-cell" in content
+    assert "map-point" in content
+    assert "map-robot-core" in content
+    assert "free grid" in content
+    assert "tag return" in content
+    assert "no-go cost" in content
+    assert "map-zone no-go" not in content
+    assert "OBS-003" in content
     assert "PKG-104" in content
     assert "INC-001" in content
     assert "Navigation Eval" in content
+    assert "Route / POI Evidence" in content
+    assert "Route Stops" in content
+    assert "POI Evidence" in content
     assert "Robot Control" in content
+    assert "Checkpoint Sign-In" in content
+    assert "Tag Sign-In" in content
+    assert "OBS-005" in content
     assert 'data-command="forward"' in content
     assert 'data-command="hard_stop"' in content
+    assert 'data-key-hint="W / Up"' in content
+    assert 'data-key-hint="Space / Esc"' in content
+    assert 'data-keyboard-map' in content
+    assert '["KeyW", "forward"]' in content
+    assert '["ArrowDown", "backward"]' in content
+    assert '["Space", "hard_stop"]' in content
+    assert '["Escape", "hard_stop"]' in content
+    assert "shouldIgnoreKeyboardEvent" in content
     assert 'data-posture="wake"' in content
     assert 'data-posture="sleep"' in content
     assert 'data-motion="nudge"' in content
@@ -93,6 +123,9 @@ def test_dashboard_api_serves_state_report_and_nav(tmp_path) -> None:
         state = _get_json(f"{base_url}/api/state")
         report = _get_json(f"{base_url}/api/report")
         nav = _get_json(f"{base_url}/api/nav")
+        map_data = _get_json(f"{base_url}/api/map")
+        route = _get_json(f"{base_url}/api/route")
+        poi = _get_json(f"{base_url}/api/poi")
     finally:
         server.shutdown()
         server.server_close()
@@ -101,7 +134,68 @@ def test_dashboard_api_serves_state_report_and_nav(tmp_path) -> None:
     assert "DogOps SiteOps Agent" in html
     assert state["run"]["state"] == "done"  # type: ignore[index]
     assert report["manifest_exceptions"] == 2
+    assert report["checkpoints_verified"] == 4
+    assert report["checkpoint_verifications"][2]["target_id"] == "COOLING_1"  # type: ignore[index]
+    assert report["checkpoint_verifications"][2]["expected_tag_id"] == 41  # type: ignore[index]
     assert nav["waypoints_reached"] == 4
+    assert [stop["target_id"] for stop in map_data["route"]] == [
+        "HOME",
+        "INBOUND_DOCK",
+        "COOLING_1",
+        "QA_HOLD",
+    ]
+    assert [stop["target_id"] for stop in route["stops"]] == [
+        "HOME",
+        "INBOUND_DOCK",
+        "COOLING_1",
+        "QA_HOLD",
+    ]
+    assert route["stops"][2]["tag_verified"] is True  # type: ignore[index]
+    assert any(capture["id"] == "OBS-003" for capture in poi["captures"])  # type: ignore[index]
+    assert any(reading["asset_id"] == "TEMP_1" for reading in poi["readings"])  # type: ignore[index]
+    assert any(package["id"] == "PKG-104" for package in map_data["packages"])
+
+
+def test_dashboard_map_data_projects_site_route_and_observations(tmp_path) -> None:
+    run_dir = tmp_path / "latest"
+    state = run_offline_simulation(out=run_dir)
+    report = json.loads((run_dir / "report.json").read_text(encoding="utf-8"))
+
+    map_data = build_map_data(state.model_dump(mode="json"), report)
+
+    assert map_data["site_id"] == "dogops_demo_site"
+    assert {zone["id"] for zone in map_data["zones"]} >= {"HOME", "INBOUND_DOCK", "QA_HOLD"}
+    assert [stop["target_id"] for stop in map_data["route"]] == [
+        "HOME",
+        "INBOUND_DOCK",
+        "COOLING_1",
+        "QA_HOLD",
+    ]
+    assert any(observation["id"] == "OBS-003" for observation in map_data["observations"])
+    assert any(incident["id"] == "INC-001" for incident in map_data["incidents"])
+
+
+def test_dashboard_route_and_poi_data_project_evidence(tmp_path) -> None:
+    run_dir = tmp_path / "latest"
+    state = run_offline_simulation(out=run_dir)
+    report = json.loads((run_dir / "report.json").read_text(encoding="utf-8"))
+
+    route = build_route_data(state.model_dump(mode="json"), report)
+    poi = build_poi_data(state.model_dump(mode="json"), report)
+
+    assert route["route_coverage"] == 1.0
+    assert route["stops"][2]["target_id"] == "COOLING_1"  # type: ignore[index]
+    assert route["stops"][2]["expected_tag_id"] == 41  # type: ignore[index]
+    assert route["stops"][2]["tag_verified"] is True  # type: ignore[index]
+    assert any(capture["id"] == "OBS-003" for capture in poi["captures"])  # type: ignore[index]
+    assert any(
+        reading["asset_id"] == "COOLING_1" and reading["clearance_clear"] is True
+        for reading in poi["readings"]  # type: ignore[index]
+    )
+    assert any(
+        reading["asset_id"] == "TEMP_1" and reading["within_threshold"] is True
+        for reading in poi["readings"]  # type: ignore[index]
+    )
 
 
 def test_dashboard_robot_jog_sends_low_speed_bounded_pulse(tmp_path, monkeypatch) -> None:

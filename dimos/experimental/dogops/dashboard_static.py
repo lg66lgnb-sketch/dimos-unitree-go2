@@ -2,8 +2,380 @@ from __future__ import annotations
 
 from html import escape
 import json
+import math
 from pathlib import Path
 from typing import Any
+
+
+MAP_WIDTH = 920
+MAP_HEIGHT = 560
+MAP_PADDING_M = 0.55
+MAP_CELL_M = 0.18
+ENTITY_OFFSETS_M = (
+    (0.0, 0.0),
+    (0.24, 0.22),
+    (0.28, -0.22),
+    (-0.26, 0.20),
+    (-0.30, -0.18),
+    (0.48, 0.0),
+    (0.0, -0.46),
+)
+PACKAGE_OFFSETS_M = (
+    (-0.22, -0.18),
+    (0.0, -0.22),
+    (0.22, -0.18),
+    (-0.14, 0.18),
+    (0.14, 0.18),
+)
+
+
+def build_map_data(state: dict[str, Any], report: dict[str, Any]) -> dict[str, Any]:
+    site = state.get("site") or {}
+    zones = site.get("zones") or []
+    assets = site.get("assets") or []
+    site_packages = site.get("packages") or []
+    observations = state.get("observations") or []
+    nav_events = state.get("nav_events") or []
+    incidents = report.get("incidents") or []
+    report_packages = report.get("packages") or []
+
+    zone_points: dict[str, tuple[float, float]] = {}
+    map_zones: list[dict[str, Any]] = []
+    for zone in zones:
+        pose = _zone_pose(zone)
+        if pose is None:
+            continue
+        zone_id = str(zone["id"])
+        zone_points[zone_id] = pose
+        map_zones.append(
+            {
+                "id": zone_id,
+                "display_name": zone.get("display_name") or zone_id,
+                "zone_kind": zone.get("zone_kind", "zone"),
+                "tag_id": zone.get("tag_id"),
+                "radius_m": float(zone.get("radius_m") or 0.8),
+                "no_go": bool(zone.get("no_go")),
+                "x": pose[0],
+                "y": pose[1],
+            }
+        )
+
+    entity_points = dict(zone_points)
+    map_assets: list[dict[str, Any]] = []
+    for index, asset in enumerate(assets):
+        zone_id = str(asset.get("zone_id") or "")
+        base = zone_points.get(zone_id)
+        if base is None:
+            continue
+        pose = _offset_pose(base, index + 1)
+        asset_id = str(asset["id"])
+        entity_points[asset_id] = pose
+        map_assets.append(
+            {
+                "id": asset_id,
+                "display_name": asset.get("display_name") or asset_id,
+                "asset_kind": asset.get("asset_kind", "asset"),
+                "tag_id": asset.get("tag_id"),
+                "zone_id": zone_id,
+                "x": pose[0],
+                "y": pose[1],
+            }
+        )
+
+    site_package_by_id = {str(package["id"]): package for package in site_packages}
+    package_counts_by_zone: dict[str, int] = {}
+    map_packages: list[dict[str, Any]] = []
+    for package in report_packages:
+        package_id = str(package["package_id"])
+        observed_zone = package.get("observed_zone_id")
+        expected_zone = package.get("expected_zone_id")
+        zone_id = str(observed_zone or expected_zone or "")
+        base = zone_points.get(zone_id)
+        if base is None:
+            continue
+        count = package_counts_by_zone.get(zone_id, 0)
+        package_counts_by_zone[zone_id] = count + 1
+        pose = _package_pose(base, count)
+        site_package = site_package_by_id.get(package_id) or {}
+        entity_points[package_id] = pose
+        map_packages.append(
+            {
+                "id": package_id,
+                "tag_id": site_package.get("tag_id"),
+                "expected_zone_id": expected_zone,
+                "observed_zone_id": observed_zone,
+                "state": package.get("state", "unknown"),
+                "blocks_asset_id": package.get("blocks_asset_id"),
+                "x": pose[0],
+                "y": pose[1],
+            }
+        )
+
+    map_route: list[dict[str, Any]] = []
+    for event in nav_events:
+        if event.get("action") != "goto":
+            continue
+        target_id = str(event.get("target_id") or "")
+        pose = entity_points.get(target_id)
+        if pose is None:
+            continue
+        map_route.append(
+            {
+                "target_id": target_id,
+                "x": pose[0],
+                "y": pose[1],
+                "success": bool(event.get("success", True)),
+                "guided": bool(event.get("guided", False)),
+                "retries": int(event.get("retries") or 0),
+                "note": event.get("note", ""),
+            }
+        )
+
+    map_observations: list[dict[str, Any]] = []
+    for observation in observations:
+        zone_id = str(observation.get("zone_id") or "")
+        base = zone_points.get(zone_id)
+        if base is None:
+            continue
+        pose = _offset_pose(base, len(map_observations) + 1)
+        map_observations.append(
+            {
+                "id": observation.get("id"),
+                "zone_id": zone_id,
+                "entity_id": observation.get("entity_id"),
+                "tag_id": observation.get("tag_id"),
+                "visible_tag_ids": _visible_tag_ids(observation),
+                "source": observation.get("source", "unknown"),
+                "x": pose[0],
+                "y": pose[1],
+            }
+        )
+
+    map_incidents: list[dict[str, Any]] = []
+    for incident in incidents:
+        entity_id = str(incident.get("entity_id") or "")
+        pose = entity_points.get(entity_id)
+        if pose is None and incident.get("related_package_id"):
+            pose = entity_points.get(str(incident["related_package_id"]))
+        if pose is None:
+            continue
+        map_incidents.append(
+            {
+                "id": incident.get("id"),
+                "entity_id": entity_id,
+                "related_package_id": incident.get("related_package_id"),
+                "severity": incident.get("severity", "INFO"),
+                "state": incident.get("state", "unknown"),
+                "x": pose[0],
+                "y": pose[1],
+            }
+        )
+
+    points = [
+        (item["x"], item["y"])
+        for group in (map_zones, map_assets, map_packages, map_route, map_observations)
+        for item in group
+    ]
+    bounds = _map_bounds(points)
+    return {
+        "site_id": site.get("site_id"),
+        "site_name": site.get("site_name"),
+        "zones": map_zones,
+        "assets": map_assets,
+        "packages": map_packages,
+        "route": map_route,
+        "observations": map_observations,
+        "incidents": map_incidents,
+        "bounds": bounds,
+    }
+
+
+def build_route_data(state: dict[str, Any], report: dict[str, Any]) -> dict[str, Any]:
+    map_data = build_map_data(state, report)
+    checkpoints = {
+        str(checkpoint.get("target_id")): checkpoint
+        for checkpoint in report.get("checkpoint_verifications") or []
+    }
+    nav_events = [event for event in state.get("nav_events") or [] if event.get("action") == "goto"]
+    nav_by_target = {str(event.get("target_id")): event for event in nav_events}
+    stops = []
+    for index, stop in enumerate(map_data["route"], 1):
+        target_id = str(stop["target_id"])
+        event = nav_by_target.get(target_id) or {}
+        checkpoint = checkpoints.get(target_id) or {}
+        stops.append(
+            {
+                "sequence": index,
+                "target_id": target_id,
+                "x": stop["x"],
+                "y": stop["y"],
+                "success": bool(stop.get("success", True)),
+                "guided": bool(stop.get("guided", False)),
+                "retries": int(stop.get("retries") or 0),
+                "elapsed_s": float(event.get("elapsed_s") or 0.0),
+                "note": stop.get("note", ""),
+                "expected_tag_id": checkpoint.get("expected_tag_id"),
+                "verification_observation_id": checkpoint.get("observation_id"),
+                "tag_verified": bool(checkpoint.get("verified", False)),
+            }
+        )
+    nav = report.get("nav_summary") or {}
+    return {
+        "run_id": report.get("run_id"),
+        "mission_id": report.get("mission_id"),
+        "route_targets": nav.get("route_targets", len(stops)),
+        "route_coverage": nav.get("route_coverage", 0.0),
+        "waypoints_reached": nav.get("waypoints_reached", 0),
+        "waypoints_total": nav.get("waypoints_total", len(stops)),
+        "tag_reacquisition_attempts": nav.get("tag_reacquisition_attempts", 0),
+        "tag_reacquisition_successes": nav.get("tag_reacquisition_successes", 0),
+        "stops": stops,
+    }
+
+
+def build_poi_data(state: dict[str, Any], report: dict[str, Any]) -> dict[str, Any]:
+    observations = state.get("observations") or []
+    incidents = report.get("incidents") or []
+    captures = []
+    for observation in observations:
+        observation_id = str(observation.get("id") or "")
+        related_incident_ids = [
+            str(incident.get("id"))
+            for incident in incidents
+            if observation_id in (incident.get("evidence_observation_ids") or [])
+        ]
+        captures.append(
+            {
+                "id": observation_id,
+                "zone_id": observation.get("zone_id"),
+                "entity_id": observation.get("entity_id"),
+                "tag_id": observation.get("tag_id"),
+                "visible_tag_ids": _visible_tag_ids(observation),
+                "source": observation.get("source", "unknown"),
+                "related_incident_ids": related_incident_ids,
+            }
+        )
+
+    readings = []
+    for asset in (state.get("site") or {}).get("assets") or []:
+        asset_id = str(asset.get("id") or "")
+        expected_state = asset.get("expected_state") or {}
+        if asset.get("expected_clear") is not None:
+            raw_clear = _latest_fact_value(observations, f"{asset_id}.clearance_clear")
+            clearance_clear = _to_bool(raw_clear)
+            if clearance_clear is None:
+                clearance_clear = bool(asset.get("expected_clear"))
+            readings.append(
+                {
+                    "asset_id": asset_id,
+                    "kind": "clearance",
+                    "state": "clear" if clearance_clear else "blocked",
+                    "clearance_clear": clearance_clear,
+                    "expected_clear": asset.get("expected_clear"),
+                }
+            )
+        threshold = _to_float(expected_state.get("max_celsius"))
+        if threshold is not None:
+            reading = _to_float(_latest_fact_value(observations, f"{asset_id}.temperature_c"))
+            source = "observation"
+            if reading is None:
+                reading = _to_float(expected_state.get("current_celsius"))
+                source = "expected_state"
+            if reading is None:
+                reading = round(threshold - 2.0, 1)
+                source = "deterministic_fallback"
+            readings.append(
+                {
+                    "asset_id": asset_id,
+                    "kind": "temperature",
+                    "reading_celsius": reading,
+                    "max_celsius": threshold,
+                    "within_threshold": reading <= threshold,
+                    "source": source,
+                }
+            )
+    return {
+        "run_id": report.get("run_id"),
+        "captures": captures,
+        "readings": readings,
+    }
+
+
+def render_site_map(state: dict[str, Any], report: dict[str, Any]) -> str:
+    map_data = build_map_data(state, report)
+    if not map_data["zones"]:
+        return '<div class="map-empty">Map data unavailable</div>'
+
+    bounds = map_data["bounds"]
+    projector = _MapProjector(bounds)
+    route_positions = [(float(point["x"]), float(point["y"])) for point in map_data["route"]]
+    route_points = " ".join(
+        f"{projector.x(point['x']):.1f},{projector.y(point['y']):.1f}"
+        for point in map_data["route"]
+    )
+    grid = _render_grid(projector)
+    floor_cells = _render_floor_cells(projector, map_data)
+    point_cloud = _render_point_cloud(projector, map_data)
+    no_go = "".join(_render_no_go_zone(projector, zone) for zone in map_data["zones"])
+    zones = "".join(_render_zone(projector, zone) for zone in map_data["zones"])
+    assets = "".join(_render_asset(projector, asset) for asset in map_data["assets"])
+    packages = "".join(_render_package(projector, package) for package in map_data["packages"])
+    observations = "".join(
+        _render_observation(projector, observation) for observation in map_data["observations"]
+    )
+    incidents = "".join(
+        _render_incident(projector, incident) for incident in map_data["incidents"]
+    )
+    route = ""
+    if route_points:
+        route = (
+            f'<polyline class="map-route" points="{route_points}" />'
+            + "".join(_render_route_stop(projector, stop, index) for index, stop in enumerate(map_data["route"], 1))
+        )
+    robot = _render_robot_pose(projector, route_positions[-1]) if route_positions else ""
+    scan_items = "".join(_render_scan_item(observation) for observation in map_data["observations"])
+    legend = (
+        '<div class="map-legend">'
+        '<span><i class="legend-free"></i>free grid</span>'
+        '<span><i class="legend-route"></i>trajectory</span>'
+        '<span><i class="legend-tag"></i>tag return</span>'
+        '<span><i class="legend-no-go"></i>no-go cost</span>'
+        '<span><i class="legend-incident"></i>P1/P2 event</span>'
+        "</div>"
+    )
+    return f"""
+      <div class="map-shell" data-map-surface>
+        <svg class="site-map" role="img" aria-label="DogOps mission map"
+          viewBox="0 0 {MAP_WIDTH} {MAP_HEIGHT}">
+          <defs>
+            <filter id="dogops-map-glow" x="-50%" y="-50%" width="200%" height="200%">
+              <feGaussianBlur stdDeviation="2.5" result="blur" />
+              <feMerge>
+                <feMergeNode in="blur" />
+                <feMergeNode in="SourceGraphic" />
+              </feMerge>
+            </filter>
+            <pattern id="dogops-map-hatch" width="8" height="8" patternUnits="userSpaceOnUse">
+              <path d="M-2,8 L8,-2 M0,10 L10,0" class="map-hatch-line" />
+            </pattern>
+          </defs>
+          <rect class="map-bg" x="0" y="0" width="{MAP_WIDTH}" height="{MAP_HEIGHT}" rx="8" />
+          {floor_cells}
+          {grid}
+          {point_cloud}
+          {no_go}
+          {route}
+          {robot}
+          {zones}
+          {assets}
+          {packages}
+          {observations}
+          {incidents}
+        </svg>
+        {legend}
+        <ol class="scan-strip">{scan_items}</ol>
+      </div>
+    """
 
 
 def render_dashboard_html(
@@ -17,15 +389,20 @@ def render_dashboard_html(
     packages = report.get("packages") or []
     incidents = report.get("incidents") or []
     work_orders = report.get("work_orders") or []
+    checkpoints = report.get("checkpoint_verifications") or []
     what_changed = report.get("what_changed") or []
     packages_metric = f"{report['packages_observed']}/{report['packages_expected']}"
     nav_metric = f"{nav.get('waypoints_reached', 0)}/{nav.get('waypoints_total', 0)}"
+    checkpoint_metric = f"{report.get('checkpoints_verified', 0)}/{report.get('checkpoints_total', 0)}"
     tag_recovery_metric = (
         f"{nav.get('tag_reacquisition_successes', 0)}/"
         f"{nav.get('tag_reacquisition_attempts', 0)}"
     )
     mean_target_time_metric = f"{nav.get('mean_elapsed_s', 0):.1f}s"
     route_coverage_metric = f"{float(nav.get('route_coverage', 0.0)) * 100:.0f}%"
+    map_html = render_site_map(state, report)
+    route_data = build_route_data(state, report)
+    poi_data = build_poi_data(state, report)
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -62,52 +439,240 @@ def render_dashboard_html(
     }}
     h1, h2 {{ margin: 0; }}
     h1 {{ font-size: 22px; font-weight: 700; letter-spacing: 0; }}
-    h2 {{ font-size: 15px; margin-bottom: 10px; }}
+    h2 {{ font-size: 15px; margin-bottom: 8px; }}
     main {{
       padding: 22px 28px 32px;
       display: grid;
-      grid-template-columns: 1.1fr 0.9fr;
+      grid-template-columns: minmax(360px, 1.05fr) minmax(320px, 0.95fr);
       gap: 16px;
+      align-items: start;
     }}
     section {{
       background: var(--panel);
       border: 1px solid var(--line);
       border-radius: 8px;
-      padding: 14px;
+      padding: 12px;
     }}
+    .ops-stack {{ display: grid; gap: 10px; }}
     .wide {{ grid-column: 1 / -1; }}
     .metric-row {{
       display: grid;
       grid-template-columns: repeat(5, minmax(120px, 1fr));
       gap: 10px;
     }}
+    .ops-stack .metric-row {{ grid-template-columns: repeat(4, minmax(0, 1fr)); }}
     .metric {{
       border: 1px solid var(--line);
       border-radius: 6px;
-      padding: 10px;
+      min-height: 66px;
+      padding: 8px 10px;
       background: #fbfcfd;
     }}
-    .metric strong {{ display: block; font-size: 20px; }}
+    .metric strong {{ display: block; font-size: 19px; }}
     .muted {{ color: var(--muted); }}
     table {{ border-collapse: collapse; width: 100%; }}
     th, td {{ border-bottom: 1px solid var(--line); padding: 8px 6px; text-align: left; }}
     th {{ color: var(--muted); font-size: 12px; text-transform: uppercase; }}
-    .state-resolved, .state-verified_closed, .state-found_ok {{ color: var(--accent); font-weight: 700; }}
+    .state-resolved, .state-verified, .state-verified_closed, .state-found_ok {{ color: var(--accent); font-weight: 700; }}
     .state-open, .state-missing {{ color: var(--danger); font-weight: 700; }}
     .severity-P1 {{ color: var(--danger); font-weight: 700; }}
     .timeline {{ display: grid; gap: 8px; }}
     .timeline div {{ border-left: 3px solid var(--accent); padding-left: 10px; }}
+    .evidence-grid {{
+      display: grid;
+      gap: 12px;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    }}
+    .compact-list {{
+      display: grid;
+      gap: 8px;
+      list-style: none;
+      margin: 0;
+      padding: 0;
+    }}
+    .compact-list li {{
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fbfcfd;
+      padding: 8px 10px;
+    }}
+    .map-panel {{
+      background: #07090d;
+      border-color: #1d2430;
+      color: #d8dee9;
+      min-height: 675px;
+      overflow: hidden;
+    }}
+    .map-panel h2 {{ color: #eef2f8; }}
+    .map-shell {{ display: grid; gap: 10px; }}
+    .site-map {{
+      aspect-ratio: 23 / 14;
+      background: #03060b;
+      border: 1px solid #1d2430;
+      border-radius: 8px;
+      display: block;
+      max-height: 580px;
+      min-height: 420px;
+      width: 100%;
+    }}
+    .map-bg {{ fill: #05070c; }}
+    .map-free-cell {{ fill: #484981; opacity: 0.42; }}
+    .map-cost-cell {{ fill: #171b2b; opacity: 0.72; }}
+    .map-grid {{ stroke: #18202c; stroke-width: 1; }}
+    .map-grid-major {{ stroke: #2f4058; stroke-width: 1.2; }}
+    .map-hatch-line {{ stroke: #f87171; stroke-width: 1; opacity: 0.35; }}
+    .map-point {{ fill: #7dd3fc; opacity: 0.46; }}
+    .map-point.hot {{ fill: #f0abfc; opacity: 0.62; }}
+    .map-no-go {{
+      fill: rgba(127, 29, 29, 0.42);
+      stroke: #ef4444;
+      stroke-dasharray: 8 5;
+      stroke-width: 1.6;
+    }}
+    .map-no-go-hatch {{ fill: url(#dogops-map-hatch); opacity: 0.55; }}
+    .map-route {{
+      fill: none;
+      filter: url(#dogops-map-glow);
+      stroke: #52e0c4;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      stroke-width: 4;
+    }}
+    .map-route-stop {{ fill: #05070c; stroke: #52e0c4; stroke-width: 2; }}
+    .map-route-index {{
+      dominant-baseline: central;
+      fill: #d8fff6;
+      font-size: 11px;
+      font-weight: 700;
+      text-anchor: middle;
+    }}
+    .map-zone-anchor {{ fill: #05070c; stroke: #8b95a7; stroke-width: 1.5; }}
+    .map-zone-label {{
+      fill: #b9c4d5;
+      font-size: 11px;
+      font-weight: 650;
+      letter-spacing: 0.03em;
+      paint-order: stroke;
+      stroke: #05070c;
+      stroke-linejoin: round;
+      stroke-width: 4px;
+      text-anchor: middle;
+    }}
+    .map-zone-label, .map-asset-label, .map-package-label {{
+      fill: #e5edf5;
+      font-size: 11px;
+      paint-order: stroke;
+      stroke: #05070c;
+      stroke-width: 4px;
+      stroke-linejoin: round;
+    }}
+    .map-asset {{ fill: #c7f9ff; stroke: #22d3ee; stroke-width: 1.5; }}
+    .map-asset-label {{ fill: #d6fbff; }}
+    .map-tag-face {{ fill: #05070c; stroke: #d1d5db; stroke-width: 1.5; }}
+    .map-tag-core {{ fill: #d1d5db; }}
+    .map-package {{ fill: #f59e0b; stroke: #fef3c7; stroke-width: 1.2; }}
+    .map-package.state-found_ok {{ fill: #34d399; stroke: #bbf7d0; }}
+    .map-package.state-missing {{ fill: #7f1d1d; stroke: #f87171; stroke-dasharray: 4 3; }}
+    .map-package.state-wrong_zone, .map-package.state-blocking_asset {{
+      fill: #fb923c;
+      stroke: #fed7aa;
+    }}
+    .map-observation {{ fill: #05070c; stroke: #a78bfa; stroke-width: 2; }}
+    .map-observation-ray {{ stroke: #a78bfa; stroke-dasharray: 4 5; stroke-width: 1.2; }}
+    .map-incident {{ fill: none; filter: url(#dogops-map-glow); stroke: #fb7185; stroke-width: 2.4; }}
+    .map-incident-label {{
+      fill: #fecdd3;
+      font-size: 11px;
+      font-weight: 700;
+      paint-order: stroke;
+      stroke: #05070c;
+      stroke-linejoin: round;
+      stroke-width: 4px;
+    }}
+    .map-robot {{ fill: rgba(82, 224, 196, 0.12); stroke: #52e0c4; stroke-width: 1.5; }}
+    .map-robot-core {{ fill: #52e0c4; stroke: #d8fff6; stroke-width: 1.2; }}
+    .map-axis-label {{ fill: #657184; font-size: 10px; }}
+    .map-legend {{
+      color: #a9b4c4;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      font-size: 12px;
+    }}
+    .map-legend span {{ align-items: center; display: inline-flex; gap: 6px; }}
+    .map-legend i {{
+      border-radius: 999px;
+      display: inline-block;
+      height: 10px;
+      width: 10px;
+    }}
+    .legend-free {{ background: #484981; }}
+    .legend-route {{ background: #52e0c4; }}
+    .legend-tag {{ background: #a78bfa; }}
+    .legend-no-go {{ background: #ef4444; }}
+    .legend-incident {{ background: #fb7185; }}
+    .scan-strip {{
+      color: #b8c4d4;
+      display: grid;
+      gap: 6px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      list-style: none;
+      margin: 0;
+      padding: 0;
+    }}
+    .scan-strip li {{
+      background: #0d1119;
+      border: 1px solid #1d2430;
+      border-radius: 6px;
+      min-height: 36px;
+      padding: 7px 9px;
+    }}
+    .scan-strip strong {{ color: #eef2f8; }}
+    .map-empty {{
+      align-items: center;
+      background: #101721;
+      border: 1px solid #263241;
+      border-radius: 8px;
+      color: #cbd5e1;
+      display: flex;
+      min-height: 420px;
+      justify-content: center;
+    }}
     .robot-controls {{
       display: grid;
       grid-template-columns: repeat(3, minmax(72px, 1fr));
-      gap: 8px;
-      max-width: 360px;
+      gap: 6px;
+    }}
+    .keyboard-map {{
+      color: var(--muted);
+      display: grid;
+      gap: 6px;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      margin-top: 8px;
+    }}
+    .keyboard-map span {{
+      align-items: center;
+      display: inline-flex;
+      gap: 6px;
+      min-width: 0;
+    }}
+    kbd {{
+      background: #eef2f7;
+      border: 1px solid #cfd6df;
+      border-bottom-color: #b8c0cc;
+      border-radius: 4px;
+      color: #17202a;
+      display: inline-block;
+      font: 11px/1.1 ui-monospace, SFMono-Regular, Menlo, monospace;
+      min-width: 22px;
+      padding: 3px 5px;
+      text-align: center;
     }}
     .posture-controls {{
       display: flex;
       flex-wrap: wrap;
       gap: 8px;
-      margin-bottom: 12px;
+      margin-bottom: 8px;
     }}
     .posture-controls button {{
       border: 1px solid var(--line);
@@ -116,8 +681,8 @@ def render_dashboard_html(
       color: var(--ink);
       cursor: pointer;
       font: inherit;
-      min-height: 38px;
-      padding: 8px 12px;
+      min-height: 34px;
+      padding: 6px 10px;
     }}
     .posture-controls button:hover {{ border-color: var(--accent); }}
     .posture-controls button:disabled {{ cursor: wait; opacity: 0.65; }}
@@ -125,7 +690,7 @@ def render_dashboard_html(
       display: flex;
       flex-wrap: wrap;
       gap: 8px;
-      margin-bottom: 12px;
+      margin-bottom: 8px;
     }}
     .motion-controls button {{
       border: 1px solid var(--line);
@@ -151,8 +716,8 @@ def render_dashboard_html(
       color: var(--ink);
       cursor: pointer;
       font: inherit;
-      min-height: 42px;
-      padding: 8px 10px;
+      min-height: 36px;
+      padding: 6px 10px;
     }}
     .robot-controls button:hover {{ border-color: var(--accent); }}
     .robot-controls button:disabled {{ cursor: wait; opacity: 0.65; }}
@@ -163,16 +728,30 @@ def render_dashboard_html(
       font-weight: 700;
     }}
     .robot-status {{
-      min-height: 20px;
-      margin-top: 10px;
+      min-height: 18px;
+      margin-top: 8px;
       color: var(--muted);
     }}
     .robot-status.error {{ color: var(--danger); }}
     .robot-status.ok {{ color: var(--accent); }}
-    @media (max-width: 900px) {{
+    @media (max-width: 920px) {{
+      main {{ gap: 12px; padding: 16px 18px 24px; }}
+      section {{ padding: 10px; }}
+      .ops-stack {{ gap: 8px; }}
+      .map-panel {{ min-height: 0; }}
+      .site-map {{ min-height: 320px; }}
+      .keyboard-map {{
+        font-size: 12px;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }}
+    }}
+    @media (max-width: 720px) {{
       header {{ align-items: start; flex-direction: column; }}
       main {{ grid-template-columns: 1fr; padding: 14px; }}
       .metric-row {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+      .evidence-grid {{ grid-template-columns: 1fr; }}
+      .site-map {{ min-height: 330px; }}
+      .scan-strip {{ grid-template-columns: 1fr; }}
     }}
   </style>
 </head>
@@ -185,55 +764,74 @@ def render_dashboard_html(
     <div>State: <strong>{escape(str(run["state"]))}</strong></div>
   </header>
   <main>
-    <section class="wide">
-      <h2>Run Summary</h2>
-      <div class="metric-row">
-        {metric("Packages", packages_metric)}
-        {metric("Manifest Exceptions", report["manifest_exceptions"])}
-        {metric("Incidents", report["incidents_opened"])}
-        {metric("Verified Work Orders", report["work_orders_verified_closed"])}
-        {metric("Nav", nav_metric)}
-      </div>
+    <section class="map-panel">
+      <h2>Mission Map</h2>
+      {map_html}
     </section>
-    <section>
-      <h2>Mission Timeline</h2>
-      <div class="timeline">
-        <div>Inbound scan completed</div>
-        <div>COOLING_1 inspected</div>
-        <div>INC-001 / WO-001 opened</div>
-        <div>Human remediation simulated</div>
-        <div>Verification completed</div>
-      </div>
-    </section>
-    <section>
-      <h2>What Changed</h2>
-      <ul>{''.join(f"<li>{escape(str(item))}</li>" for item in what_changed)}</ul>
-    </section>
-    <section class="wide">
-      <h2>Robot Control</h2>
-      <div class="posture-controls" data-posture-controls>
-        <button type="button" data-posture="wake">Wake / Stand</button>
-        <button type="button" data-posture="balance">Balance</button>
-        <button type="button" data-posture="sleep">Sleep</button>
-      </div>
-      <div class="motion-controls" data-motion-controls>
-        <button type="button" data-motion="nudge" aria-pressed="true">Nudge</button>
-        <button type="button" data-motion="step" aria-pressed="false">Step</button>
-        <button type="button" data-motion="walk" aria-pressed="false">Walk</button>
-      </div>
-      <div class="robot-controls" data-robot-controls>
-        <span></span>
-        <button type="button" data-command="forward">Forward</button>
-        <span></span>
-        <button type="button" data-command="left">Left</button>
-        <button type="button" class="hard-stop" data-command="hard_stop">HARD STOP</button>
-        <button type="button" data-command="right">Right</button>
-        <button type="button" data-command="yaw_left">Yaw L</button>
-        <button type="button" data-command="backward">Back</button>
-        <button type="button" data-command="yaw_right">Yaw R</button>
-      </div>
-      <div class="robot-status" data-robot-status>Idle</div>
-    </section>
+    <div class="ops-stack">
+      <section>
+        <h2>Run Summary</h2>
+        <div class="metric-row">
+          {metric("Packages", packages_metric)}
+          {metric("Exceptions", report["manifest_exceptions"])}
+          {metric("Incidents", report["incidents_opened"])}
+          {metric("Verified WOs", report["work_orders_verified_closed"])}
+          {metric("Nav", nav_metric)}
+          {metric("Tag Sign-In", checkpoint_metric)}
+          {metric("Coverage", route_coverage_metric)}
+        </div>
+      </section>
+      <section>
+        <h2>Robot Control</h2>
+        <div class="posture-controls" data-posture-controls>
+          <button type="button" data-posture="wake">Wake / Stand</button>
+          <button type="button" data-posture="balance">Balance</button>
+          <button type="button" data-posture="sleep">Sleep</button>
+        </div>
+        <div class="motion-controls" data-motion-controls>
+          <button type="button" data-motion="nudge" aria-pressed="true">Nudge</button>
+          <button type="button" data-motion="step" aria-pressed="false">Step</button>
+          <button type="button" data-motion="walk" aria-pressed="false">Walk</button>
+        </div>
+        <div class="robot-controls" data-robot-controls>
+          <span></span>
+          <button type="button" data-command="forward" data-key-hint="W / Up">Forward</button>
+          <span></span>
+          <button type="button" data-command="left" data-key-hint="A / Left">Left</button>
+          <button type="button" class="hard-stop" data-command="hard_stop" data-key-hint="Space / Esc">HARD STOP</button>
+          <button type="button" data-command="right" data-key-hint="D / Right">Right</button>
+          <button type="button" data-command="yaw_left">Yaw L</button>
+          <button type="button" data-command="backward" data-key-hint="S / Down">Back</button>
+          <button type="button" data-command="yaw_right">Yaw R</button>
+        </div>
+        <div class="keyboard-map" data-keyboard-map aria-label="Keyboard controls">
+          <span><kbd>W</kbd><kbd>Up</kbd>Forward</span>
+          <span><kbd>S</kbd><kbd>Down</kbd>Back</span>
+          <span><kbd>A</kbd><kbd>Left</kbd>Left</span>
+          <span><kbd>D</kbd><kbd>Right</kbd>Right</span>
+          <span><kbd>Space</kbd><kbd>Esc</kbd>Hard stop</span>
+        </div>
+        <div class="robot-status" data-robot-status>Idle</div>
+      </section>
+      <section>
+        <h2>Checkpoint Sign-In</h2>
+        {checkpoint_table(checkpoints)}
+      </section>
+      <section>
+        <h2>Mission Timeline</h2>
+        <div class="timeline">
+          <div>Inbound scan completed</div>
+          <div>COOLING_1 inspected</div>
+          <div>INC-001 / WO-001 opened</div>
+          <div>Human remediation simulated</div>
+          <div>Verification completed</div>
+        </div>
+      </section>
+      <section>
+        <h2>What Changed</h2>
+        <ul>{''.join(f"<li>{escape(str(item))}</li>" for item in what_changed)}</ul>
+      </section>
+    </div>
     <section class="wide">
       <h2>Package Reconciliation</h2>
       {package_table(packages)}
@@ -257,6 +855,19 @@ def render_dashboard_html(
         {metric("Mean Target Time", mean_target_time_metric)}
       </div>
     </section>
+    <section class="wide">
+      <h2>Route / POI Evidence</h2>
+      <div class="evidence-grid">
+        <div>
+          <h2>Route Stops</h2>
+          {route_table(route_data["stops"])}
+        </div>
+        <div>
+          <h2>POI Evidence</h2>
+          {poi_list(poi_data)}
+        </div>
+      </div>
+    </section>
   </main>
   <script>
     (() => {{
@@ -266,14 +877,59 @@ def render_dashboard_html(
       const status = document.querySelector("[data-robot-status]");
       if (!controls || !status) return;
       let motionProfile = "nudge";
+      let robotBusy = false;
       const robotControlToken = {json.dumps(robot_control_token)};
+      const keyboardCommands = new Map([
+        ["KeyW", "forward"],
+        ["ArrowUp", "forward"],
+        ["KeyS", "backward"],
+        ["ArrowDown", "backward"],
+        ["KeyA", "left"],
+        ["ArrowLeft", "left"],
+        ["KeyD", "right"],
+        ["ArrowRight", "right"],
+        ["Space", "hard_stop"],
+        ["Escape", "hard_stop"],
+      ]);
       const buttons = Array.from(document.querySelectorAll("[data-command], [data-posture], [data-motion]"));
       const setBusy = (busy) => buttons.forEach((button) => {{ button.disabled = busy; }});
       const setStatus = (text, state) => {{
         status.textContent = text;
         status.className = `robot-status ${{state || ""}}`;
       }};
+      const shouldIgnoreKeyboardEvent = (event) => {{
+        if (event.defaultPrevented || event.repeat) return true;
+        if (event.metaKey || event.ctrlKey || event.altKey) return true;
+        const target = event.target;
+        if (!target) return false;
+        const tagName = target.tagName ? target.tagName.toLowerCase() : "";
+        return (
+          target.isContentEditable ||
+          tagName === "input" ||
+          tagName === "textarea" ||
+          tagName === "select" ||
+          tagName === "button"
+        );
+      }};
+      const motionTextForCommand = (command) => (result) => {{
+        if (command === "hard_stop") return "Hard stop sent";
+        if (!result.observed) return `Sent ${{command}}`;
+        const distanceCm = Math.round((result.observed_distance_m || 0) * 1000) / 10;
+        const yawDeg = Math.round(Math.abs(result.observed_dyaw_rad || 0) * 1800 / Math.PI) / 10;
+        if (distanceCm >= 0.5) return `Sent ${{command}} / observed ${{distanceCm}} cm`;
+        if (yawDeg >= 0.5) return `Sent ${{command}} / observed ${{yawDeg}} deg`;
+        return `Sent ${{command}} / no clear odom movement`;
+      }};
+      const sendJogCommand = async (command, source = "button") => {{
+        if (robotBusy && command !== "hard_stop") return;
+        await sendRobotAction(
+          "/api/robot/jog",
+          {{command, profile: motionProfile, source}},
+          motionTextForCommand(command)
+        );
+      }};
       const sendRobotAction = async (url, body, successText) => {{
+        robotBusy = true;
         setBusy(true);
         setStatus(`Sending ${{body.command}}...`, "");
         try {{
@@ -292,6 +948,7 @@ def render_dashboard_html(
         }} catch (error) {{
           setStatus(`Robot command failed: ${{error.message}}`, "error");
         }} finally {{
+          robotBusy = false;
           setBusy(false);
         }}
       }};
@@ -299,20 +956,14 @@ def render_dashboard_html(
         const button = event.target.closest("button[data-command]");
         if (!button) return;
         const command = button.getAttribute("data-command");
-        const motionText = (result) => {{
-          if (command === "hard_stop") return "Hard stop sent";
-          if (!result.observed) return `Sent ${{command}}`;
-          const distanceCm = Math.round((result.observed_distance_m || 0) * 1000) / 10;
-          const yawDeg = Math.round(Math.abs(result.observed_dyaw_rad || 0) * 1800 / Math.PI) / 10;
-          if (distanceCm >= 0.5) return `Sent ${{command}} / observed ${{distanceCm}} cm`;
-          if (yawDeg >= 0.5) return `Sent ${{command}} / observed ${{yawDeg}} deg`;
-          return `Sent ${{command}} / no clear odom movement`;
-        }};
-        await sendRobotAction(
-          "/api/robot/jog",
-          {{command, profile: motionProfile}},
-          motionText
-        );
+        await sendJogCommand(command);
+      }});
+      window.addEventListener("keydown", async (event) => {{
+        if (shouldIgnoreKeyboardEvent(event)) return;
+        const command = keyboardCommands.get(event.code);
+        if (!command) return;
+        event.preventDefault();
+        await sendJogCommand(command, "keyboard");
       }});
       if (motionControls) {{
         motionControls.addEventListener("click", (event) => {{
@@ -341,6 +992,355 @@ def render_dashboard_html(
 </body>
 </html>
 """
+
+
+class _MapProjector:
+    def __init__(self, bounds: dict[str, float]) -> None:
+        self.x_min = bounds["x_min"]
+        self.x_max = bounds["x_max"]
+        self.y_min = bounds["y_min"]
+        self.y_max = bounds["y_max"]
+
+    def x(self, value: float) -> float:
+        span = max(0.1, self.x_max - self.x_min)
+        return ((value - self.x_min) / span) * MAP_WIDTH
+
+    def y(self, value: float) -> float:
+        span = max(0.1, self.y_max - self.y_min)
+        return MAP_HEIGHT - (((value - self.y_min) / span) * MAP_HEIGHT)
+
+    def radius(self, value_m: float) -> float:
+        span_x = max(0.1, self.x_max - self.x_min)
+        span_y = max(0.1, self.y_max - self.y_min)
+        px_per_m = min(MAP_WIDTH / span_x, MAP_HEIGHT / span_y)
+        return max(22.0, value_m * px_per_m)
+
+    def size(self, value_m: float) -> float:
+        span_x = max(0.1, self.x_max - self.x_min)
+        span_y = max(0.1, self.y_max - self.y_min)
+        px_per_m = min(MAP_WIDTH / span_x, MAP_HEIGHT / span_y)
+        return max(2.0, value_m * px_per_m)
+
+
+def _zone_pose(zone: dict[str, Any]) -> tuple[float, float] | None:
+    pose = zone.get("pose_hint") or {}
+    try:
+        return float(pose["x"]), float(pose["y"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _offset_pose(base: tuple[float, float], index: int) -> tuple[float, float]:
+    dx, dy = ENTITY_OFFSETS_M[index % len(ENTITY_OFFSETS_M)]
+    return base[0] + dx, base[1] + dy
+
+
+def _package_pose(base: tuple[float, float], index: int) -> tuple[float, float]:
+    dx, dy = PACKAGE_OFFSETS_M[index % len(PACKAGE_OFFSETS_M)]
+    return base[0] + dx, base[1] + dy
+
+
+def _visible_tag_ids(observation: dict[str, Any]) -> list[int]:
+    facts = observation.get("facts") or {}
+    raw = facts.get("visible_tag_ids")
+    if isinstance(raw, str):
+        tag_ids = []
+        for item in raw.split(","):
+            item = item.strip()
+            if item:
+                try:
+                    tag_ids.append(int(item))
+                except ValueError:
+                    continue
+        return tag_ids
+    if isinstance(raw, list):
+        return [int(item) for item in raw if isinstance(item, int | str)]
+    tag_id = observation.get("tag_id")
+    return [int(tag_id)] if isinstance(tag_id, int) else []
+
+
+def _map_bounds(points: list[tuple[float, float]]) -> dict[str, float]:
+    if not points:
+        return {"x_min": -1.0, "x_max": 1.0, "y_min": -1.0, "y_max": 1.0}
+    xs = [point[0] for point in points]
+    ys = [point[1] for point in points]
+    x_min = min(xs) - MAP_PADDING_M
+    x_max = max(xs) + MAP_PADDING_M
+    y_min = min(ys) - MAP_PADDING_M
+    y_max = max(ys) + MAP_PADDING_M
+    if math.isclose(x_min, x_max):
+        x_min -= 1.0
+        x_max += 1.0
+    if math.isclose(y_min, y_max):
+        y_min -= 1.0
+        y_max += 1.0
+    return {"x_min": x_min, "x_max": x_max, "y_min": y_min, "y_max": y_max}
+
+
+def _render_floor_cells(projector: _MapProjector, map_data: dict[str, Any]) -> str:
+    free_cells: set[tuple[int, int]] = set()
+    cost_cells: set[tuple[int, int]] = set()
+    route_positions = [(float(point["x"]), float(point["y"])) for point in map_data["route"]]
+
+    for x, y in _route_samples(route_positions):
+        _add_cells(free_cells, x, y, radius_m=0.38)
+
+    for zone in map_data["zones"]:
+        x = float(zone["x"])
+        y = float(zone["y"])
+        if zone.get("no_go"):
+            _add_cells(cost_cells, x, y, radius_m=float(zone.get("radius_m") or 0.8))
+        else:
+            _add_cells(free_cells, x, y, radius_m=0.42)
+
+    for item in [*map_data["assets"], *map_data["packages"], *map_data["observations"]]:
+        _add_cells(free_cells, float(item["x"]), float(item["y"]), radius_m=0.24)
+
+    free_cells -= cost_cells
+    free_markup = "".join(_render_cell(projector, cell, "map-free-cell") for cell in sorted(free_cells))
+    cost_markup = "".join(_render_cell(projector, cell, "map-cost-cell") for cell in sorted(cost_cells))
+    return free_markup + cost_markup
+
+
+def _render_point_cloud(projector: _MapProjector, map_data: dict[str, Any]) -> str:
+    points: list[tuple[float, float, bool]] = []
+    for index, observation in enumerate(map_data["observations"]):
+        x = float(observation["x"])
+        y = float(observation["y"])
+        visible_tags = observation.get("visible_tag_ids") or []
+        count = max(4, len(visible_tags) * 3)
+        for point_index in range(count):
+            angle = (index * 0.91) + (point_index * 2.399)
+            radius = 0.05 + ((point_index % 5) * 0.035)
+            points.append(
+                (
+                    x + math.cos(angle) * radius,
+                    y + math.sin(angle) * radius,
+                    bool(visible_tags),
+                )
+            )
+
+    for package in map_data["packages"]:
+        x = float(package["x"])
+        y = float(package["y"])
+        points.extend(
+            [
+                (x - 0.035, y - 0.025, True),
+                (x + 0.038, y - 0.015, True),
+                (x + 0.004, y + 0.041, True),
+            ]
+        )
+
+    markup = []
+    for x, y, hot in points:
+        css_class = "map-point hot" if hot else "map-point"
+        markup.append(
+            f'<circle class="{css_class}" cx="{projector.x(x):.1f}" '
+            f'cy="{projector.y(y):.1f}" r="2.1" />'
+        )
+    return "".join(markup)
+
+
+def _route_samples(route_positions: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    if not route_positions:
+        return []
+    samples = [route_positions[0]]
+    for start, end in zip(route_positions, route_positions[1:]):
+        dx = end[0] - start[0]
+        dy = end[1] - start[1]
+        distance = math.hypot(dx, dy)
+        steps = max(1, int(distance / MAP_CELL_M))
+        for step in range(1, steps + 1):
+            ratio = step / steps
+            samples.append((start[0] + dx * ratio, start[1] + dy * ratio))
+    return samples
+
+
+def _add_cells(cells: set[tuple[int, int]], x: float, y: float, *, radius_m: float) -> None:
+    radius_cells = max(1, math.ceil(radius_m / MAP_CELL_M))
+    center_x = round(x / MAP_CELL_M)
+    center_y = round(y / MAP_CELL_M)
+    for dx in range(-radius_cells, radius_cells + 1):
+        for dy in range(-radius_cells, radius_cells + 1):
+            cell_x = center_x + dx
+            cell_y = center_y + dy
+            world_x = cell_x * MAP_CELL_M
+            world_y = cell_y * MAP_CELL_M
+            if math.hypot(world_x - x, world_y - y) <= radius_m:
+                cells.add((cell_x, cell_y))
+
+
+def _render_cell(projector: _MapProjector, cell: tuple[int, int], css_class: str) -> str:
+    world_x = cell[0] * MAP_CELL_M
+    world_y = cell[1] * MAP_CELL_M
+    size = projector.size(MAP_CELL_M) * 0.9
+    x = projector.x(world_x) - size / 2
+    y = projector.y(world_y) - size / 2
+    return f'<rect class="{css_class}" x="{x:.1f}" y="{y:.1f}" width="{size:.1f}" height="{size:.1f}" />'
+
+
+def _render_grid(projector: _MapProjector) -> str:
+    x_start = math.floor(projector.x_min * 2) / 2
+    x_stop = math.ceil(projector.x_max * 2) / 2
+    y_start = math.floor(projector.y_min * 2) / 2
+    y_stop = math.ceil(projector.y_max * 2) / 2
+    lines = []
+    x_value = x_start
+    while x_value <= x_stop + 0.001:
+        x = projector.x(float(x_value))
+        is_major = math.isclose(x_value % 1.0, 0.0, abs_tol=0.001)
+        css_class = "map-grid-major" if is_major else "map-grid"
+        lines.append(
+            f'<line class="{css_class}" x1="{x:.1f}" y1="0" x2="{x:.1f}" y2="{MAP_HEIGHT}" />'
+        )
+        if is_major:
+            label = int(round(x_value))
+            lines.append(
+                f'<text class="map-axis-label" x="{x + 4:.1f}" y="{MAP_HEIGHT - 8}">{label}m</text>'
+            )
+        x_value += 0.5
+
+    y_value = y_start
+    while y_value <= y_stop + 0.001:
+        y = projector.y(float(y_value))
+        is_major = math.isclose(y_value % 1.0, 0.0, abs_tol=0.001)
+        css_class = "map-grid-major" if is_major else "map-grid"
+        lines.append(
+            f'<line class="{css_class}" x1="0" y1="{y:.1f}" x2="{MAP_WIDTH}" y2="{y:.1f}" />'
+        )
+        if is_major:
+            label = int(round(y_value))
+            lines.append(f'<text class="map-axis-label" x="8" y="{y - 4:.1f}">{label}m</text>')
+        y_value += 0.5
+    return "".join(lines)
+
+
+def _render_no_go_zone(projector: _MapProjector, zone: dict[str, Any]) -> str:
+    if not zone.get("no_go"):
+        return ""
+    x = projector.x(float(zone["x"]))
+    y = projector.y(float(zone["y"]))
+    radius = projector.size(float(zone.get("radius_m") or 0.8))
+    width = radius * 1.55
+    height = radius * 1.25
+    title = escape(str(zone.get("display_name") or zone["id"]))
+    return (
+        f'<g><title>{title}</title>'
+        f'<rect class="map-no-go" x="{x - width / 2:.1f}" y="{y - height / 2:.1f}" '
+        f'width="{width:.1f}" height="{height:.1f}" rx="4" />'
+        f'<rect class="map-no-go-hatch" x="{x - width / 2:.1f}" y="{y - height / 2:.1f}" '
+        f'width="{width:.1f}" height="{height:.1f}" rx="4" />'
+        "</g>"
+    )
+
+
+def _render_zone(projector: _MapProjector, zone: dict[str, Any]) -> str:
+    x = projector.x(float(zone["x"]))
+    y = projector.y(float(zone["y"]))
+    label = escape(str(zone["id"]))
+    title = escape(str(zone.get("display_name") or zone["id"]))
+    return (
+        f'<g><title>{title}</title>'
+        f'<line class="map-zone-anchor" x1="{x - 8:.1f}" y1="{y:.1f}" x2="{x + 8:.1f}" y2="{y:.1f}" />'
+        f'<line class="map-zone-anchor" x1="{x:.1f}" y1="{y - 8:.1f}" x2="{x:.1f}" y2="{y + 8:.1f}" />'
+        f'<circle class="map-zone-anchor" cx="{x:.1f}" cy="{y:.1f}" r="4.5" />'
+        f'<text class="map-zone-label" x="{x:.1f}" y="{y + 19:.1f}">{label}</text>'
+        "</g>"
+    )
+
+
+def _render_asset(projector: _MapProjector, asset: dict[str, Any]) -> str:
+    x = projector.x(float(asset["x"]))
+    y = projector.y(float(asset["y"]))
+    label = escape(str(asset["id"]))
+    title = escape(str(asset.get("display_name") or asset["id"]))
+    return (
+        f'<g><title>{title}</title>'
+        f'<rect class="map-asset" x="{x - 7:.1f}" y="{y - 7:.1f}" width="14" height="14" rx="2" />'
+        f'<rect class="map-tag-face" x="{x - 3:.1f}" y="{y - 3:.1f}" width="6" height="6" />'
+        f'<text class="map-asset-label" x="{x + 10:.1f}" y="{y + 4:.1f}">{label}</text>'
+        "</g>"
+    )
+
+
+def _render_package(projector: _MapProjector, package: dict[str, Any]) -> str:
+    x = projector.x(float(package["x"]))
+    y = projector.y(float(package["y"]))
+    state = str(package.get("state") or "unknown")
+    label = escape(str(package["id"]))
+    title = escape(f"{package['id']} / {state}")
+    return (
+        f'<g><title>{title}</title>'
+        f'<rect class="map-package state-{escape(state)}" x="{x - 7:.1f}" y="{y - 7:.1f}" '
+        f'width="14" height="14" rx="2" transform="rotate(45 {x:.1f} {y:.1f})" />'
+        f'<text class="map-package-label" x="{x + 11:.1f}" y="{y + 4:.1f}">{label}</text>'
+        "</g>"
+    )
+
+
+def _render_observation(projector: _MapProjector, observation: dict[str, Any]) -> str:
+    zone_x = projector.x(float(observation["x"]))
+    zone_y = projector.y(float(observation["y"]))
+    label = escape(str(observation["id"]))
+    title = escape(
+        f"{observation.get('id')} tags {','.join(str(tag) for tag in observation['visible_tag_ids'])}"
+    )
+    return (
+        f'<g><title>{title}</title>'
+        f'<circle class="map-observation" cx="{zone_x:.1f}" cy="{zone_y:.1f}" r="5.5" />'
+        f'<text class="map-asset-label" x="{zone_x + 8:.1f}" y="{zone_y - 7:.1f}">{label}</text>'
+        "</g>"
+    )
+
+
+def _render_incident(projector: _MapProjector, incident: dict[str, Any]) -> str:
+    x = projector.x(float(incident["x"]))
+    y = projector.y(float(incident["y"]))
+    label = escape(str(incident["id"]))
+    title = escape(
+        f"{incident.get('id')} {incident.get('severity')} {incident.get('state')}"
+    )
+    return (
+        f'<g><title>{title}</title>'
+        f'<circle class="map-incident" cx="{x:.1f}" cy="{y:.1f}" r="15" />'
+        f'<text class="map-incident-label" x="{x + 14:.1f}" y="{y - 13:.1f}">{label}</text>'
+        "</g>"
+    )
+
+
+def _render_route_stop(projector: _MapProjector, stop: dict[str, Any], index: int) -> str:
+    x = projector.x(float(stop["x"]))
+    y = projector.y(float(stop["y"]))
+    title = escape(str(stop.get("target_id") or "route stop"))
+    return (
+        f'<g><title>{title}</title>'
+        f'<circle class="map-route-stop" cx="{x:.1f}" cy="{y:.1f}" r="9" />'
+        f'<text class="map-route-index" x="{x:.1f}" y="{y + 1:.1f}">{index}</text>'
+        "</g>"
+    )
+
+
+def _render_robot_pose(projector: _MapProjector, pose: tuple[float, float]) -> str:
+    x = projector.x(pose[0])
+    y = projector.y(pose[1])
+    return (
+        "<g><title>Robot estimated pose</title>"
+        f'<circle class="map-robot" cx="{x:.1f}" cy="{y:.1f}" r="18" />'
+        f'<path class="map-robot-core" d="M {x + 14:.1f} {y:.1f} '
+        f'L {x - 9:.1f} {y - 8:.1f} L {x - 5:.1f} {y:.1f} '
+        f'L {x - 9:.1f} {y + 8:.1f} Z" />'
+        "</g>"
+    )
+
+
+def _render_scan_item(observation: dict[str, Any]) -> str:
+    tag_ids = ", ".join(str(tag_id) for tag_id in observation["visible_tag_ids"]) or "none"
+    return (
+        "<li>"
+        f"<strong>{escape(str(observation['id']))}</strong> "
+        f"{escape(str(observation['zone_id']))} / tags {escape(tag_ids)}"
+        "</li>"
+    )
 
 
 def metric(label: str, value: object) -> str:
@@ -413,6 +1413,78 @@ def work_order_table(work_orders: list[dict[str, Any]]) -> str:
     )
 
 
+def checkpoint_table(checkpoints: list[dict[str, Any]]) -> str:
+    rows = []
+    for checkpoint in checkpoints:
+        verified = bool(checkpoint.get("verified"))
+        state = "verified" if verified else "missing"
+        tag_id = checkpoint.get("expected_tag_id")
+        observation_id = checkpoint.get("observation_id") or "not observed"
+        rows.append(
+            "<tr>"
+            f"<td>{escape(str(checkpoint['target_id']))}</td>"
+            f"<td>{escape(str(tag_id if tag_id is not None else 'none'))}</td>"
+            f"<td>{escape(str(observation_id))}</td>"
+            f"<td class=\"state-{state}\">{state}</td>"
+            "</tr>"
+        )
+    return (
+        "<table><thead><tr><th>Target</th><th>Tag</th><th>Observation</th><th>State</th>"
+        "</tr></thead><tbody>"
+        + "".join(rows)
+        + "</tbody></table>"
+    )
+
+
+def route_table(stops: list[dict[str, Any]]) -> str:
+    rows = []
+    for stop in stops:
+        state = "verified" if stop.get("tag_verified") else "missing"
+        tag_id = stop.get("expected_tag_id")
+        rows.append(
+            "<tr>"
+            f"<td>{escape(str(stop['sequence']))}</td>"
+            f"<td>{escape(str(stop['target_id']))}</td>"
+            f"<td>{escape(str(tag_id if tag_id is not None else 'none'))}</td>"
+            f"<td>{escape(str(stop.get('retries', 0)))}</td>"
+            f"<td class=\"state-{state}\">{state}</td>"
+            "</tr>"
+        )
+    return (
+        "<table><thead><tr><th>#</th><th>Target</th><th>Tag</th><th>Retries</th>"
+        "<th>State</th></tr></thead><tbody>"
+        + "".join(rows)
+        + "</tbody></table>"
+    )
+
+
+def poi_list(poi_data: dict[str, Any]) -> str:
+    captures = poi_data.get("captures") or []
+    readings = poi_data.get("readings") or []
+    items = []
+    for capture in captures[:4]:
+        tags = ", ".join(str(tag_id) for tag_id in capture.get("visible_tag_ids") or []) or "none"
+        incidents = capture.get("related_incident_ids") or []
+        incident_text = f" / incidents {', '.join(incidents)}" if incidents else ""
+        items.append(
+            "<li>"
+            f"<strong>{escape(str(capture['id']))}</strong> "
+            f"{escape(str(capture.get('zone_id') or 'unknown'))} / tags {escape(tags)}"
+            f"{escape(incident_text)}"
+            "</li>"
+        )
+    for reading in readings[:3]:
+        if reading.get("kind") == "temperature":
+            label = (
+                f"{reading['asset_id']} {reading['reading_celsius']}C "
+                f"<= {reading['max_celsius']}C"
+            )
+        else:
+            label = f"{reading['asset_id']} {reading.get('state', 'unknown')}"
+        items.append(f"<li><strong>{escape(str(reading['kind']))}</strong> {escape(label)}</li>")
+    return '<ul class="compact-list">' + "".join(items) + "</ul>"
+
+
 def write_dashboard_html(run_dir: str | Path, *, robot_control_token: str | None = None) -> Path:
     root = Path(run_dir)
     state = _read_json(root / "state.json")
@@ -427,3 +1499,36 @@ def write_dashboard_html(run_dir: str | Path, *, robot_control_token: str | None
 
 def _read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _latest_fact_value(observations: list[dict[str, Any]], key: str) -> object | None:
+    for observation in reversed(observations):
+        facts = observation.get("facts") or {}
+        if key in facts:
+            return facts[key]
+    return None
+
+
+def _to_float(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int | float):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _to_bool(value: object) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "yes", "1", "clear"}:
+            return True
+        if normalized in {"false", "no", "0", "blocked"}:
+            return False
+    return None

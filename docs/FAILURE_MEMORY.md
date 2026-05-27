@@ -62,6 +62,10 @@ Commands:
 Symptom:
 Replay logs show DogOps modules and `McpServer` deploying, but `dimos status` reports no running instance or `dimos mcp list-tools` reports no running MCP server.
 
+Observed on 2026-05-27 in the full DimOS checkout:
+normal replay was blocked by non-interactive sudo for `route add -net 224.0.0.0/4 -interface lo0`.
+Using `PYTEST_VERSION=8.3.5` skipped the configurator and deployed the DogOps modules plus `McpServer`, but daemon discovery still returned no running instance.
+
 Fallback:
 Do not claim MCP validation. Try a different documented DimOS launch mode or real hardware run, check for lingering replay processes, stop with `uv run dimos stop --force`, and ask before killing OS processes directly. Use direct DogOps CLI/skill tests and dashboard/report output as fallback evidence.
 

@@ -15,7 +15,12 @@ import time
 from typing import Any
 from urllib.parse import urlparse
 
-from dimos.experimental.dogops.dashboard_static import write_dashboard_html
+from dimos.experimental.dogops.dashboard_static import (
+    build_map_data,
+    build_poi_data,
+    build_route_data,
+    write_dashboard_html,
+)
 from dimos.experimental.dogops.store import DogOpsStore
 
 try:  # pragma: no cover - exercised only inside a full DimOS checkout.
@@ -134,6 +139,18 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/nav":
             report = self._read_json(self.run_dir / "report.json")
             self._send_json(report.get("nav_summary") or {})
+        elif path == "/api/map":
+            state = self._read_json(self.run_dir / "state.json")
+            report = self._read_json(self.run_dir / "report.json")
+            self._send_json(build_map_data(state, report))
+        elif path == "/api/route":
+            state = self._read_json(self.run_dir / "state.json")
+            report = self._read_json(self.run_dir / "report.json")
+            self._send_json(build_route_data(state, report))
+        elif path == "/api/poi":
+            state = self._read_json(self.run_dir / "state.json")
+            report = self._read_json(self.run_dir / "report.json")
+            self._send_json(build_poi_data(state, report))
         else:
             self._send_json({"error": "not_found", "path": path}, HTTPStatus.NOT_FOUND)
 

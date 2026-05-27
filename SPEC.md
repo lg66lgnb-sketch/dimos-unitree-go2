@@ -680,6 +680,10 @@ load_mission(path: str = "examples/dogops/mission_demo.yaml") -> str
 run_mission(mission_id: str = "receiving_sre_demo") -> str
 scan_zone(zone_id: str) -> str
 inspect_asset(asset_id: str) -> str
+read_gauge(asset_id: str = "TEMP_1") -> str
+check_clearance(asset_id: str) -> str
+detect_blocked_aisle(zone_id: str = "AISLE_1") -> str
+scan_receiving_manifest(zone_id: str = "INBOUND_DOCK") -> str
 reconcile_manifest() -> str
 open_work_order(entity_id: str, issue_type: str) -> str
 mark_ready_to_verify(work_order_id: str) -> str
@@ -1001,7 +1005,7 @@ CI=1 uv run pytest -q -o addopts='' dimos/robot/test_all_blueprints_generation.p
 uv run dimos list | rg dogops
 uv run dimos --replay --viewer none run unitree-go2-dogops --daemon
 uv run dimos status
-uv run dimos mcp list-tools | rg 'run_mission|scan_zone|verify_work_order|nav_eval_report'
+uv run dimos mcp list-tools | rg 'run_mission|scan_zone|read_gauge|check_clearance|detect_blocked_aisle|scan_receiving_manifest|verify_work_order|nav_eval_report'
 uv run dimos mcp call run_mission --json-args '{"mission_id":"receiving_sre_demo"}'
 uv run dimos stop --force
 ```
