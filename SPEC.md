@@ -859,6 +859,8 @@ GET /api/poi           -> point-of-interest captures/readings JSON
 POST /api/map/explore  -> create/refresh simulated open-space map
 POST /api/route/waypoints -> add route waypoint by known target ID
 POST /api/route/pois   -> add point of interest by known target ID
+POST /api/route/inspection_points -> add one operator inspection point as waypoint + POI
+POST /api/route/inspection_points/clear -> clear operator inspection points
 POST /api/route/run    -> simulate route execution and POI capture analysis
 POST /api/work_orders/{id}/ready_to_verify -> mark ready
 POST /api/operator/event -> record manual/guided event
@@ -868,12 +870,12 @@ Map payloads must reuse the existing DimOS Go2 map/navigation stack:
 
 - Do not build a new DogOps SLAM/map system. Use `VoxelGridMapper`, `CostMapper`, `ReplanningAStarPlanner`, `WavefrontFrontierExplorer`, `PatrollingModule`, and `MovementManager` through `unitree_go2_markers` / `unitree_go2_dogops`.
 - “What the dog mapped” is DimOS `global_costmap` / `OccupancyGrid` with values `-1` unknown, `0` free, and `100` occupied.
-- “Where he should go” is DogOps `RoutePlan` waypoints overlaid on that map.
+- “Where he should go” is DogOps `RoutePlan` waypoints overlaid on that map. In the operator UI, a single inspection point creates both the waypoint and the photo/reading POI to keep simulation setup simple.
 - “How he will get there” is DimOS planner `Path`.
 - “Where he is now” is DimOS `odom` / `PoseStamped`.
 - `DogOpsLiveMapModule` subscribes to `global_costmap`, `path`, and `odom`, persists full costmap snapshots into `site_map.dimos_costmap`, persists planner path into `site_map.dimos_path`, persists the latest robot pose, and computes known/free/occupied coverage stats.
 - Keep DogOps semantic overlays separate: zones, no-go areas, assets, package tags, incidents, POIs, and route waypoints. Do not treat policy no-go zones as physical obstacles unless a future planner integration explicitly injects them into costmaps.
-- The dashboard standard map panel embeds the real Rerun WebViewer (`@rerun-io/web-viewer`) against the local DimOS Rerun bridge. DogOps route/POI/report controls are overlaid around that map surface; `map.json` remains only the fallback artifact view for offline reports/tests.
+- The dashboard standard map panel embeds the real Rerun WebViewer (`@rerun-io/web-viewer`) against the local DimOS Rerun bridge. DogOps inspection-point/report controls are overlaid around that map surface; `map.json` remains only the fallback artifact view for offline reports/tests.
 - `dogops rerun-sim` is only a lightweight 2D fallback stream. For real DimOS/MuJoCo-style 3D mapping visuals, run the native Unitree Go2 Air simulator path, for example `uv run dimos --simulation run unitree-go2`, then publish DogOps overlays with `dogops rerun-sim --view-mode native-3d` to the same local Rerun source.
 - Future alternative: make the DimOS/Rerun page the parent shell and embed DogOps as a side panel, or add a deeper Rerun click-coordinate bridge if the WebViewer exposes stable world-coordinate events.
 

@@ -60,13 +60,13 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert "Needs Attention" in content
     assert "Machine Readings" in content
     assert "Floor Changes" in content
-    assert "Route and inspection points" in content
+    assert "Inspection points" in content
     assert "<span>Mode</span><strong>Real dog</strong>" in content
     assert 'data-map-viewer' in content
     assert 'data-rerun-source-url="rerun+http://127.0.0.1:9877/proxy"' in content
     assert 'data-rerun-view-mode="dogops-2d"' in content
     assert 'data-rerun-embed-url=""' in content
-    assert "DogOps fallback Rerun" in content
+    assert "DimOS/Rerun top-down map" in content
     assert 'data-rerun-module-url="/assets/rerun-web-viewer.js"' in content
     assert 'data-rerun-asset-base-url="/assets/vendor/@rerun-io/web-viewer/"' in content
     assert 'data-rerun-canvas' in content
@@ -78,10 +78,14 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert 'data-route-action="explore"' in content
     assert 'data-route-action="stop-explore"' in content
     assert 'data-route-action="replay-map"' in content
-    assert 'data-route-action="add-waypoint"' in content
-    assert 'data-route-action="add-poi"' in content
-    assert 'data-map-click-mode="waypoint"' in content
-    assert 'data-map-click-mode="poi"' in content
+    assert "Inspection points (3/3)" in content
+    assert 'data-route-action="add-inspection"' in content
+    assert 'data-route-action="clear-inspection"' in content
+    assert 'data-route-action="add-waypoint"' not in content
+    assert 'data-route-action="add-poi"' not in content
+    assert 'data-map-click-mode="inspection"' in content
+    assert 'data-map-click-mode="waypoint"' not in content
+    assert 'data-map-click-mode="poi"' not in content
     assert "dogops:map-click-mode" in content
     assert "Rerun WebViewer unavailable; showing offline map artifact." in Path(
         "dimos/experimental/dogops/static/rerun-web-viewer.js"
@@ -207,13 +211,26 @@ def test_dashboard_route_editor_mutates_local_run(tmp_path, monkeypatch) -> None
     try:
         map_status, map_result = _post_json(f"{base_url}/api/map/explore", {})
         replay_status, replay_result = _post_json(f"{base_url}/api/rerun/replay_map", {})
-        waypoint_status, waypoint_result = _post_json(
-            f"{base_url}/api/route/waypoints",
-            {"target_id": "NO_GO_1"},
+        clear_status, clear_result = _post_json(f"{base_url}/api/route/inspection_points/clear", {})
+        first_status, first_result = _post_json(
+            f"{base_url}/api/route/inspection_points",
+            {"target_id": "COOLING_1"},
         )
-        poi_status, poi_result = _post_json(
-            f"{base_url}/api/route/pois",
-            {"target_id": "TEMP_1", "reading_keys": ["TEMP_1.temperature_celsius"]},
+        duplicate_status, duplicate_result = _post_json(
+            f"{base_url}/api/route/inspection_points",
+            {"target_id": "COOLING_1"},
+        )
+        second_status, second_result = _post_json(
+            f"{base_url}/api/route/inspection_points",
+            {"target_id": "TEMP_1"},
+        )
+        third_status, third_result = _post_json(
+            f"{base_url}/api/route/inspection_points",
+            {"target_id": "QA_HOLD"},
+        )
+        limit_status, limit_result = _post_json(
+            f"{base_url}/api/route/inspection_points",
+            {"target_id": "INBOUND_DOCK"},
         )
         run_status, run_result = _post_json(f"{base_url}/api/route/run", {})
         poi = _get_json(f"{base_url}/api/poi")
@@ -228,12 +245,20 @@ def test_dashboard_route_editor_mutates_local_run(tmp_path, monkeypatch) -> None
     assert map_result["rerun"]["action"] == "replay_mapping"  # type: ignore[index]
     assert replay_status == 200
     assert replay_result["rerun"]["action"] == "replay_mapping"  # type: ignore[index]
-    assert waypoint_status == 200
-    assert waypoint_result["waypoints"] >= 6
-    assert poi_status == 200
-    assert poi_result["points_of_interest"] >= 4
+    assert clear_status == 200
+    assert clear_result["inspection_points"] == 0
+    assert first_status == 200
+    assert first_result["inspection_points"] == 1
+    assert duplicate_status == 200
+    assert duplicate_result["inspection_points"] == 1
+    assert second_status == 200
+    assert second_result["inspection_points"] == 2
+    assert third_status == 200
+    assert third_result["inspection_points"] == 3
+    assert limit_status == 400
+    assert limit_result["error"] == "inspection_point_limit"
     assert run_status == 200
-    assert run_result["captures"] >= 4
+    assert run_result["captures"] == 3
     assert run_result["rerun"]["action"] == "replay_route"  # type: ignore[index]
     assert rerun_command["action"] == "replay_route"
     assert len(poi["readings"]) >= 4  # type: ignore[arg-type]

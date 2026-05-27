@@ -17,9 +17,12 @@ from urllib.parse import urlparse
 
 from dimos.experimental.dogops.dashboard_static import write_dashboard_html
 from dimos.experimental.dogops.mapping import (
+    MAX_OPERATOR_INSPECTION_POINTS,
+    add_inspection_point,
     add_point_of_interest,
     add_waypoint,
     build_simulated_site_map,
+    clear_inspection_points,
     simulate_poi_captures,
 )
 from dimos.experimental.dogops.models import NavAction, NavEvent
@@ -201,6 +204,12 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/route/pois":
             if self._authorize_dashboard_mutation():
                 self._add_route_poi()
+        elif path == "/api/route/inspection_points":
+            if self._authorize_dashboard_mutation():
+                self._add_inspection_point()
+        elif path == "/api/route/inspection_points/clear":
+            if self._authorize_dashboard_mutation():
+                self._clear_inspection_points()
         elif path == "/api/route/run":
             if self._authorize_dashboard_mutation():
                 self._run_route_plan()
@@ -419,6 +428,72 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
             {
                 "ok": True,
                 "points_of_interest": len(state.route_plan.points_of_interest),
+                "route_plan": state.route_plan.model_dump(mode="json"),
+            }
+        )
+
+    def _add_inspection_point(self) -> None:
+        payload = self._read_body_json()
+        target_id = str(payload.get("target_id") or "").strip()
+        if not target_id:
+            self._send_json({"ok": False, "error": "missing_target_id"}, HTTPStatus.BAD_REQUEST)
+            return
+        store = DogOpsStore.load_existing(self.run_dir)
+        state = store.state
+        assert state is not None
+        try:
+            add_inspection_point(state.route_plan, state.site, target_id)
+        except KeyError:
+            self._send_json(
+                {"ok": False, "error": "unknown_target", "target_id": target_id},
+                HTTPStatus.BAD_REQUEST,
+            )
+            return
+        except ValueError:
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": "inspection_point_limit",
+                    "max_points": MAX_OPERATOR_INSPECTION_POINTS,
+                },
+                HTTPStatus.BAD_REQUEST,
+            )
+            return
+        store.set_route_plan(state.route_plan)
+        store.write_state(state.run.id)
+        store.write_report(state.run.id)
+        write_dashboard_html(
+            self.run_dir,
+            robot_control_token=self.robot_control_token,
+            runtime_mode=self.runtime_mode,
+        )
+        self._send_json(
+            {
+                "ok": True,
+                "inspection_points": len(state.route_plan.points_of_interest),
+                "max_points": MAX_OPERATOR_INSPECTION_POINTS,
+                "route_plan": state.route_plan.model_dump(mode="json"),
+            }
+        )
+
+    def _clear_inspection_points(self) -> None:
+        store = DogOpsStore.load_existing(self.run_dir)
+        state = store.state
+        assert state is not None
+        clear_inspection_points(state.route_plan)
+        store.set_route_plan(state.route_plan)
+        store.write_state(state.run.id)
+        store.write_report(state.run.id)
+        write_dashboard_html(
+            self.run_dir,
+            robot_control_token=self.robot_control_token,
+            runtime_mode=self.runtime_mode,
+        )
+        self._send_json(
+            {
+                "ok": True,
+                "inspection_points": 0,
+                "max_points": MAX_OPERATOR_INSPECTION_POINTS,
                 "route_plan": state.route_plan.model_dump(mode="json"),
             }
         )

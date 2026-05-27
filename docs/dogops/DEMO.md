@@ -53,7 +53,7 @@ The dashboard standard map panel embeds the real Rerun WebViewer from local npm 
 
 - Rerun WebViewer: primary map viewport for camera, point cloud/global map, TF/base link, nav costmap, planned path, odom, and debug evidence.
 - DimOS Command Center: adjacent link for live nav/costmap controls when the DimOS web visualization module is running.
-- DogOps dashboard: product workflow around the live viewer, including package/asset labels, semantic zones, incidents, operator route, waypoints, POIs, readings, and run report.
+- DogOps dashboard: product workflow around the live viewer, including package/asset labels, semantic zones, incidents, operator route, three simple inspection points, readings, and run report.
 - Bridge: `DogOpsLiveMapModule` consumes shared DimOS streams `global_costmap`, planner `path`, and `odom`, then writes `dimos_costmap`, `dimos_path`, robot pose, and coverage stats for the dashboard.
 - Offline artifact: `map.json` remains available as a fallback snapshot for reports/tests, but it is not the standard operator map view.
 - Simulator bridge: when the real Go2 Air is unavailable, `dogops rerun-sim` publishes incremental 2D lidar-style mapping, odom/path, route/POI overlays, demo cones/boxes, and simulated POI camera frames into the same local Rerun source URL.
@@ -68,7 +68,7 @@ Future alternative: make the DimOS/Rerun page the parent shell and embed DogOps 
 DogOps defaults to real-dog operation:
 
 - `DOGOPS_RUNTIME_MODE=real` is the default. Map and route buttons send DimOS navigation commands; manual controls use the local Go2 WebRTC/Sport control path.
-- `DOGOPS_RUNTIME_MODE=simulation` is for `uv run dimos --simulation ... run unitree-go2`. Map, route, and manual controls send DimOS WebSocketVis events (`start_explore`, `stop_explore`, click goals, and `move_command`) to the simulated dog.
+- `DOGOPS_RUNTIME_MODE=simulation` is for `uv run dimos --simulation ... run unitree-go2`. Map and route controls send DimOS WebSocketVis events (`start_explore`, `stop_explore`, and click goals) to the simulated dog; manual movement is intentionally hidden from the main simulation setup flow.
 - `DOGOPS_RUNTIME_MODE=offline` is only for static artifacts and tests when no DimOS control server is running.
 
 The DimOS control URL defaults to `http://127.0.0.1:7779` and is loopback-only unless `DOGOPS_ALLOW_REMOTE_VIEWER=1` is set deliberately.
@@ -101,7 +101,7 @@ DOGOPS_RERUN_VIEW_MODE=native-3d \
   uv run python -m dimos.experimental.dogops.cli serve --run .dogops/runs/latest --port 8765
 ```
 
-Then use the dashboard buttons directly: `Map Open Space` starts DimOS exploration, `Stop Mapping` stops it, route waypoints/POIs remain DogOps overlays on the live Rerun map, `Run Route` dispatches click-goals to DimOS, and manual motion controls move the simulated dog.
+Then use the dashboard buttons directly: `Map Open Space` starts DimOS exploration, `Stop Mapping` stops it, `Inspection Point Mode` lets the operator click mapped targets on the Rerun surface, `Add Inspection Point` creates both the waypoint and photo/reading POI, and `Run Route` dispatches click-goals to DimOS. Keep the demo to three points, for example COOLING_1, TEMP_1, and QA_HOLD.
 
 API checks:
 

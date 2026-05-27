@@ -403,6 +403,26 @@ def render_dashboard_html(
       background: rgba(180, 83, 9, 0.90);
       box-shadow: 0 0 0 4px rgba(245, 158, 11, 0.18);
     }}
+    .map-target-overlay [data-map-target-id].is-inspection {{
+      background: #0f766e;
+      border-color: #ffffff;
+      box-shadow: 0 0 0 6px rgba(94, 234, 212, 0.24);
+    }}
+    .map-target-overlay [data-map-target-id] em {{
+      position: absolute;
+      inset: -9px auto auto -9px;
+      display: grid;
+      place-items: center;
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      background: #f8fafc;
+      color: #0f766e;
+      font-size: 11px;
+      font-style: normal;
+      font-weight: 800;
+      line-height: 1;
+    }}
     .map-target-overlay [data-map-target-id] span {{
       position: absolute;
       top: -6px;
@@ -508,7 +528,6 @@ def render_dashboard_html(
     .map-route-overlay .route-status.ok {{ color: #5eead4; }}
     .map-click-modes {{
       display: grid;
-      grid-template-columns: 1fr 1fr;
       gap: 6px;
       margin-top: 6px;
     }}
@@ -579,6 +598,13 @@ def render_dashboard_html(
       color: #ffffff;
       font-weight: 700;
       min-width: 92px;
+    }}
+    .sim-motion-note {{
+      border-top: 1px solid rgba(255, 255, 255, 0.16);
+      color: #cbd5e1;
+      font-size: 12px;
+      margin-top: 8px;
+      padding-top: 8px;
     }}
     .offline-snapshot {{
       margin-top: 10px;
@@ -700,7 +726,7 @@ def render_dashboard_html(
       </div>
       <div class="console-grid">
         <div class="map-stage">
-          {map_viewer_panel(site_map, route_plan, target_options, runtime_label=runtime_label)}
+          {map_viewer_panel(site_map, route_plan, target_options, runtime_label=runtime_label, runtime=runtime)}
         </div>
         <aside class="ops-panel" aria-label="Inspection status">
           <div class="panel-block">
@@ -717,8 +743,7 @@ def render_dashboard_html(
           </div>
           <div class="panel-block">
             <h3>Route</h3>
-            {route_stepper(route_plan)}
-            {poi_stepper(route_plan)}
+            {inspection_stepper(route_plan)}
           </div>
         </aside>
       </div>
@@ -776,6 +801,15 @@ def render_dashboard_html(
             statusText.dataset.state = "error";
           }}
         }};
+        if (dogopsRuntimeMode === "offline") {{
+          if (canvasHost) canvasHost.hidden = true;
+          if (frameHost) frameHost.hidden = true;
+          if (offline) offline.hidden = false;
+          if (statusText) {{
+            statusText.textContent = "Offline map artifact.";
+            statusText.dataset.state = "ok";
+          }}
+        }} else
         if (frameHost) {{
           if (offline) offline.hidden = true;
           if (statusText) {{
@@ -903,13 +937,13 @@ def render_dashboard_html(
             );
           }});
           setMapClickStatus(
-            mapClickMode ? `${{mapClickMode}} placement active.` : "Map authoring idle.",
+            mapClickMode ? "Click a mapped target to add an inspection point." : "Map authoring idle.",
             "",
           );
         }};
         try {{
           const storedMapClickMode = window.sessionStorage.getItem(mapClickModeStorageKey) || "";
-          if (["waypoint", "poi"].includes(storedMapClickMode)) {{
+          if (["inspection"].includes(storedMapClickMode)) {{
             setMapClickMode(storedMapClickMode, {{force: true}});
           }}
         }} catch (_) {{
@@ -938,11 +972,8 @@ def render_dashboard_html(
         const routeTargetAction = async (mode, targetId) => {{
           if (!targetId) throw new Error("missing_target_id");
           if (select) select.value = targetId;
-          if (mode === "waypoint") {{
-            return routePost("/api/route/waypoints", {{target_id: targetId}});
-          }}
-          if (mode === "poi") {{
-            return routePost("/api/route/pois", {{target_id: targetId}});
+          if (mode === "inspection") {{
+            return routePost("/api/route/inspection_points", {{target_id: targetId}});
           }}
           throw new Error("unknown_map_mode");
         }};
@@ -961,11 +992,11 @@ def render_dashboard_html(
               return;
             }}
             const targetId = target.getAttribute("data-map-target-id");
-            setRouteStatus(`Adding ${{mapClickMode}} ${{targetId}}...`, "");
+            setRouteStatus(`Adding inspection point ${{targetId}}...`, "");
             try {{
               await routeTargetAction(mapClickMode, targetId);
-              setMapClickStatus(`Added ${{mapClickMode}} at ${{targetId}}.`, "ok");
-              setRouteStatus("Route updated", "ok");
+              setMapClickStatus(`Added inspection point at ${{targetId}}.`, "ok");
+              setRouteStatus("Inspection route updated", "ok");
               window.setTimeout(() => window.location.reload(), 450);
             }} catch (error) {{
               setMapClickStatus(`Map edit failed: ${{error.message}}`, "error");
@@ -1008,9 +1039,11 @@ def render_dashboard_html(
               const result = await routePost("/api/route/run", {{}});
               if (result.mode === "offline") replayRerunMap();
             }}
-            if (action === "add-waypoint") await routeTargetAction("waypoint", targetId);
-            if (action === "add-poi") await routeTargetAction("poi", targetId);
-            setRouteStatus("Route updated", "ok");
+            if (action === "add-inspection") await routeTargetAction("inspection", targetId);
+            if (action === "clear-inspection") {{
+              await routePost("/api/route/inspection_points/clear", {{}});
+            }}
+            setRouteStatus("Inspection route updated", "ok");
             window.setTimeout(() => window.location.reload(), 450);
           }} catch (error) {{
             setRouteStatus(`Route update failed: ${{error.message}}`, "error");
@@ -1119,6 +1152,28 @@ def route_stepper(route_plan: dict[str, Any]) -> str:
     )
 
 
+def inspection_stepper(route_plan: dict[str, Any]) -> str:
+    pois = route_plan.get("points_of_interest") or []
+    if not pois:
+        return route_stepper(route_plan)
+    waypoint_order = {
+        waypoint.get("id"): waypoint.get("order")
+        for waypoint in route_plan.get("waypoints") or []
+    }
+    return (
+        '<div class="route-stepper">'
+        + "".join(
+            '<div class="route-step">'
+            f"<strong>{escape(str(waypoint_order.get(poi.get('waypoint_id'), index + 1)))}. "
+            f"{escape(str(poi.get('target_id')))}</strong>"
+            f"<span>{escape(str(poi.get('display_name') or 'Inspection point'))}</span>"
+            "</div>"
+            for index, poi in enumerate(pois)
+        )
+        + "</div>"
+    )
+
+
 def poi_stepper(route_plan: dict[str, Any]) -> str:
     pois = route_plan.get("points_of_interest") or []
     if not pois:
@@ -1142,6 +1197,7 @@ def map_viewer_panel(
     target_options: list[dict[str, str]],
     *,
     runtime_label: str = "Real dog",
+    runtime: str = "real",
 ) -> str:
     urls = dimos_viewer_urls()
     rerun_source_url = escape(urls["rerun_source"], quote=True)
@@ -1151,7 +1207,41 @@ def map_viewer_panel(
     rerun_view_mode = escape(urls["rerun_view_mode"], quote=True)
     rerun_embed_url = escape(urls["rerun_embed"], quote=True)
     rerun_mode_label = (
-        "DimOS native 3D Rerun" if urls["rerun_view_mode"] == "native-3d" else "DogOps fallback Rerun"
+        "DimOS native 3D Rerun"
+        if urls["rerun_view_mode"] == "native-3d"
+        else "DimOS/Rerun top-down map"
+    )
+    inspection_count = len(route_plan.get("points_of_interest") or [])
+    inspection_limit = 3
+    motion_panel = (
+        '<div class="sim-motion-note">Manual motion is skipped for simulation setup. Use DimOS mapping, target selection, and route run controls here.</div>'
+        if runtime == "simulation"
+        else (
+            '<details>'
+            "<summary>Manual motion</summary>"
+            '<div class="posture-controls" data-posture-controls>'
+            '<button type="button" data-posture="wake">Wake / Stand</button>'
+            '<button type="button" data-posture="balance">Balance</button>'
+            '<button type="button" data-posture="sleep">Sleep</button>'
+            "</div>"
+            '<div class="motion-controls" data-motion-controls>'
+            '<button type="button" data-motion="nudge" aria-pressed="true">Nudge</button>'
+            '<button type="button" data-motion="step" aria-pressed="false">Step</button>'
+            '<button type="button" data-motion="walk" aria-pressed="false">Walk</button>'
+            "</div>"
+            '<div class="robot-controls">'
+            "<span></span>"
+            '<button type="button" data-command="forward">Forward</button>'
+            "<span></span>"
+            '<button type="button" data-command="left">Left</button>'
+            "<span></span>"
+            '<button type="button" data-command="right">Right</button>'
+            '<button type="button" data-command="yaw_left">Yaw L</button>'
+            '<button type="button" data-command="backward">Back</button>'
+            '<button type="button" data-command="yaw_right">Yaw R</button>'
+            "</div>"
+            "</details>"
+        )
     )
     rerun_surface = (
         f'<iframe class="rerun-frame" data-rerun-frame src="{rerun_embed_url}" '
@@ -1174,19 +1264,18 @@ def map_viewer_panel(
         "</div>"
         "</div>"
         '<div class="map-route-overlay">'
-        "<label>Route and inspection points</label>"
+        f"<label>Inspection points ({inspection_count}/{inspection_limit})</label>"
         '<div class="route-controls" data-route-controls>'
         f"<select data-route-target>{target_option_html(target_options)}</select>"
         '<button type="button" data-route-action="explore">Map Open Space</button>'
         '<button type="button" data-route-action="stop-explore">Stop Mapping</button>'
-        '<button type="button" data-route-action="replay-map">Replay Map</button>'
+        '<button type="button" data-route-action="add-inspection">Add Inspection Point</button>'
+        '<button type="button" data-route-action="clear-inspection">Clear Points</button>'
         '<button type="button" data-route-action="run">Run Route</button>'
-        '<button type="button" data-route-action="add-waypoint">Add Waypoint</button>'
-        '<button type="button" data-route-action="add-poi">Add POI</button>'
+        '<button type="button" data-route-action="replay-map">Replay Map</button>'
         "</div>"
         '<div class="map-click-modes" aria-label="Map drawing mode">'
-        '<button type="button" data-map-click-mode="waypoint" aria-pressed="false">Waypoint Mode</button>'
-        '<button type="button" data-map-click-mode="poi" aria-pressed="false">POI Mode</button>'
+        '<button type="button" data-map-click-mode="inspection" aria-pressed="false">Inspection Point Mode</button>'
         "</div>"
         '<div class="map-click-hint" data-map-click-status>Map authoring idle.</div>'
         '<div class="route-status" data-route-status>Route editor ready</div>'
@@ -1197,30 +1286,7 @@ def map_viewer_panel(
         '<span class="robot-status" data-robot-status>Idle</span></div>'
         '<button type="button" class="hard-stop" data-command="hard_stop">HARD STOP</button>'
         "</div>"
-        '<details>'
-        "<summary>Manual motion</summary>"
-        '<div class="posture-controls" data-posture-controls>'
-        '<button type="button" data-posture="wake">Wake / Stand</button>'
-        '<button type="button" data-posture="balance">Balance</button>'
-        '<button type="button" data-posture="sleep">Sleep</button>'
-        "</div>"
-        '<div class="motion-controls" data-motion-controls>'
-        '<button type="button" data-motion="nudge" aria-pressed="true">Nudge</button>'
-        '<button type="button" data-motion="step" aria-pressed="false">Step</button>'
-        '<button type="button" data-motion="walk" aria-pressed="false">Walk</button>'
-        "</div>"
-        '<div class="robot-controls">'
-        "<span></span>"
-        '<button type="button" data-command="forward">Forward</button>'
-        "<span></span>"
-        '<button type="button" data-command="left">Left</button>'
-        "<span></span>"
-        '<button type="button" data-command="right">Right</button>'
-        '<button type="button" data-command="yaw_left">Yaw L</button>'
-        '<button type="button" data-command="backward">Back</button>'
-        '<button type="button" data-command="yaw_right">Yaw R</button>'
-        "</div>"
-        "</details>"
+        + motion_panel +
         "</div>"
         + rerun_surface
         + f'<div class="map-target-overlay" data-route-map>{map_target_overlay(site_map, route_plan)}</div>'
@@ -1245,6 +1311,7 @@ def map_target_overlay(site_map: dict[str, Any], route_plan: dict[str, Any]) -> 
     if not features:
         return ""
     poi_targets = {poi.get("target_id") for poi in route_plan.get("points_of_interest") or []}
+    poi_order = {poi.get("target_id"): index + 1 for index, poi in enumerate(route_plan.get("points_of_interest") or [])}
     route_targets = {waypoint.get("target_id") for waypoint in route_plan.get("waypoints") or []}
     rows = []
     for feature in features:
@@ -1258,16 +1325,19 @@ def map_target_overlay(site_map: dict[str, Any], route_plan: dict[str, Any]) -> 
         if not target_id:
             continue
         display_name = str(feature.get("display_name") or target_id)
-        classes = ["is-poi"] if target_id in poi_targets else []
+        classes = ["is-inspection"] if target_id in poi_targets else []
         if target_id in route_targets:
             classes.append("is-route")
         class_attr = f' class="{" ".join(classes)}"' if classes else ""
+        order = poi_order.get(target_id)
+        order_badge = f"<em>{escape(str(order))}</em>" if order is not None else ""
         rows.append(
             f'<button type="button"{class_attr} '
             f'data-map-target-id="{escape(target_id, quote=True)}" '
             f'data-map-target-name="{escape(display_name, quote=True)}" '
             f'aria-label="Map target {escape(display_name, quote=True)}" '
             f'style="left:{left_pct:.2f}%;top:{top_pct:.2f}%;">'
+            f"{order_badge}"
             f"<span>{escape(target_id)}</span>"
             "</button>"
         )

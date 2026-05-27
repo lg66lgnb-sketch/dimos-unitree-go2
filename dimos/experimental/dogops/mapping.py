@@ -27,6 +27,7 @@ from dimos.experimental.dogops.models import (
 
 
 DEFAULT_MAP_RESOLUTION_M = 0.5
+MAX_OPERATOR_INSPECTION_POINTS = 3
 DIMOS_WEBSOCKET_VIS_MODULE = "dimos.web.websocket_vis.websocket_vis_module"
 DIMOS_OPTIMIZED_COSTMAP = "dimos.web.websocket_vis.optimized_costmap.OptimizedCostmapEncoder"
 
@@ -216,6 +217,40 @@ def add_point_of_interest(
             analysis_prompt=f"Summarize observations at {entity.display_name}.",
         )
     )
+    plan.source = "operator"
+    return plan
+
+
+def add_inspection_point(
+    plan: RoutePlan,
+    site: SiteConfig,
+    target_id: str,
+    *,
+    max_points: int = MAX_OPERATOR_INSPECTION_POINTS,
+) -> RoutePlan:
+    """Add one operator target as both a route waypoint and photo/reading point."""
+    if _entity_for_target(site, target_id) is None:
+        raise KeyError(target_id)
+    if any(poi.target_id == target_id for poi in plan.points_of_interest):
+        plan.source = "operator"
+        return plan
+    if len(plan.points_of_interest) >= max_points:
+        raise ValueError(f"inspection point limit reached: {max_points}")
+    waypoint = _find_or_create_waypoint(plan, site, target_id, None)
+    add_point_of_interest(
+        plan,
+        site,
+        target_id,
+        waypoint_id=waypoint.id,
+        reading_keys=_default_reading_keys(target_id),
+    )
+    plan.source = "operator"
+    return plan
+
+
+def clear_inspection_points(plan: RoutePlan) -> RoutePlan:
+    plan.waypoints = []
+    plan.points_of_interest = []
     plan.source = "operator"
     return plan
 
