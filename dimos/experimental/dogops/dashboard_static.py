@@ -16,6 +16,7 @@ def render_dashboard_html(
     report: dict[str, Any],
     *,
     robot_control_token: str | None = None,
+    runtime_mode: str | None = None,
 ) -> str:
     run = state["run"]
     nav = report.get("nav_summary") or {}
@@ -45,6 +46,12 @@ def render_dashboard_html(
     mean_target_time_metric = f"{nav.get('mean_elapsed_s', 0):.1f}s"
     route_coverage_metric = f"{float(nav.get('route_coverage', 0.0)) * 100:.0f}%"
     coverage_metric = f"{float(site_map.get('coverage_ratio', 0.0)) * 100:.0f}%"
+    runtime = (runtime_mode or os.environ.get("DOGOPS_RUNTIME_MODE") or "real").strip().lower()
+    if runtime in {"sim", "demo"}:
+        runtime = "simulation"
+    runtime_label = "Simulation dog" if runtime == "simulation" else "Real dog"
+    if runtime == "offline":
+        runtime_label = "Offline artifact"
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -542,6 +549,17 @@ def render_dashboard_html(
       display: block;
       font-size: 13px;
     }}
+    .robot-mode {{
+      display: inline-flex;
+      align-items: center;
+      min-height: 22px;
+      border: 1px solid rgba(94, 234, 212, 0.26);
+      border-radius: 999px;
+      color: #5eead4;
+      font-size: 11px;
+      margin: 4px 0;
+      padding: 2px 7px;
+    }}
     .robot-dock summary {{
       cursor: pointer;
       font-weight: 700;
@@ -664,6 +682,7 @@ def render_dashboard_html(
     </div>
     <div class="status-strip">
       {status_pill("Run", humanize(run["state"]))}
+      {status_pill("Mode", runtime_label)}
       {status_pill("Packages", packages_metric)}
       {status_pill("Map", f"{escape(str(site_map.get('status', 'empty')))} / {coverage_metric}")}
       {status_pill("Open Issues", len(open_incidents))}
@@ -681,7 +700,7 @@ def render_dashboard_html(
       </div>
       <div class="console-grid">
         <div class="map-stage">
-          {map_viewer_panel(site_map, route_plan, target_options)}
+          {map_viewer_panel(site_map, route_plan, target_options, runtime_label=runtime_label)}
         </div>
         <aside class="ops-panel" aria-label="Inspection status">
           <div class="panel-block">
@@ -735,6 +754,7 @@ def render_dashboard_html(
   </main>
   <script>
     (() => {{
+      const dogopsRuntimeMode = {json.dumps(runtime)};
       const controls = document.querySelector("[data-robot-controls]");
       const postureControls = document.querySelector("[data-posture-controls]");
       const motionControls = document.querySelector("[data-motion-controls]");
@@ -961,8 +981,21 @@ def render_dashboard_html(
           setRouteStatus(`Running ${{action}}...`, "");
           try {{
             if (action === "explore") {{
-              await routePost("/api/map/explore", {{}});
-              replayRerunMap();
+              setRouteStatus("DimOS exploration command sent", "ok");
+              const result = await routePost("/api/map/explore", {{}});
+              if (result.mode === "offline") replayRerunMap();
+              setRouteStatus(
+                result.mode === "offline" ? "Offline map populated" : "DimOS exploration started",
+                "ok",
+              );
+              if (result.mode !== "offline") return;
+            }}
+            if (action === "stop-explore") {{
+              setRouteStatus("DimOS stop command sent", "ok");
+              await routePost("/api/map/stop_explore", {{}});
+              setRouteStatus("DimOS exploration stopped", "ok");
+              window.setTimeout(() => window.location.reload(), 450);
+              return;
             }}
             if (action === "replay-map") {{
               await routePost("/api/rerun/replay_map", {{}});
@@ -971,8 +1004,9 @@ def render_dashboard_html(
               return;
             }}
             if (action === "run") {{
-              await routePost("/api/route/run", {{}});
-              replayRerunMap();
+              setRouteStatus("Route goals sent to DimOS", "ok");
+              const result = await routePost("/api/route/run", {{}});
+              if (result.mode === "offline") replayRerunMap();
             }}
             if (action === "add-waypoint") await routeTargetAction("waypoint", targetId);
             if (action === "add-poi") await routeTargetAction("poi", targetId);
@@ -1106,6 +1140,8 @@ def map_viewer_panel(
     site_map: dict[str, Any],
     route_plan: dict[str, Any],
     target_options: list[dict[str, str]],
+    *,
+    runtime_label: str = "Real dog",
 ) -> str:
     urls = dimos_viewer_urls()
     rerun_source_url = escape(urls["rerun_source"], quote=True)
@@ -1142,6 +1178,7 @@ def map_viewer_panel(
         '<div class="route-controls" data-route-controls>'
         f"<select data-route-target>{target_option_html(target_options)}</select>"
         '<button type="button" data-route-action="explore">Map Open Space</button>'
+        '<button type="button" data-route-action="stop-explore">Stop Mapping</button>'
         '<button type="button" data-route-action="replay-map">Replay Map</button>'
         '<button type="button" data-route-action="run">Run Route</button>'
         '<button type="button" data-route-action="add-waypoint">Add Waypoint</button>'
@@ -1156,7 +1193,8 @@ def map_viewer_panel(
         "</div>"
         '<div class="robot-dock" data-robot-controls>'
         '<div class="robot-dock-bar">'
-        '<div><strong>Robot Control</strong><span class="robot-status" data-robot-status>Idle</span></div>'
+        f'<div><strong>Robot Control</strong><span class="robot-mode">{escape(runtime_label)}</span>'
+        '<span class="robot-status" data-robot-status>Idle</span></div>'
         '<button type="button" class="hard-stop" data-command="hard_stop">HARD STOP</button>'
         "</div>"
         '<details>'
@@ -1671,13 +1709,23 @@ def work_order_table(work_orders: list[dict[str, Any]]) -> str:
     )
 
 
-def write_dashboard_html(run_dir: str | Path, *, robot_control_token: str | None = None) -> Path:
+def write_dashboard_html(
+    run_dir: str | Path,
+    *,
+    robot_control_token: str | None = None,
+    runtime_mode: str | None = None,
+) -> Path:
     root = Path(run_dir)
     state = _read_json(root / "state.json")
     report = _read_json(root / "report.json")
     html_path = root / "dashboard.html"
     html_path.write_text(
-        render_dashboard_html(state, report, robot_control_token=robot_control_token),
+        render_dashboard_html(
+            state,
+            report,
+            robot_control_token=robot_control_token,
+            runtime_mode=runtime_mode,
+        ),
         encoding="utf-8",
     )
     return html_path

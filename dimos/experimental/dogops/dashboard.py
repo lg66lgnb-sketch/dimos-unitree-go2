@@ -54,6 +54,10 @@ MOTION_PROFILES: dict[str, tuple[float, float, float]] = {
     "walk": (1.20, 1.35, 1.35),
 }
 DEFAULT_MOTION_PROFILE = "nudge"
+DEFAULT_DOGOPS_RUNTIME_MODE = "real"
+SIMULATION_RUNTIME_MODES = {"sim", "simulation", "demo"}
+OFFLINE_RUNTIME_MODES = {"offline", "static", "artifact"}
+DIMOS_CONTROL_TIMEOUT_S = 3.0
 ROBOT_JOG_COMMANDS: dict[str, tuple[float, float, float]] = {
     "forward": (0.15, 0.0, 0.0),
     "backward": (-0.15, 0.0, 0.0),
@@ -80,13 +84,19 @@ _ROBOT_SESSIONS_LOCK = threading.Lock()
 def make_dashboard_server(run_dir: str | Path, host: str, port: int) -> ThreadingHTTPServer:
     root = Path(run_dir)
     robot_control_token = secrets.token_urlsafe(32)
-    write_dashboard_html(root, robot_control_token=robot_control_token)
+    selected_runtime_mode = _dogops_runtime_mode()
+    write_dashboard_html(
+        root,
+        robot_control_token=robot_control_token,
+        runtime_mode=selected_runtime_mode,
+    )
     token = robot_control_token
 
     class Handler(DogOpsDashboardHandler):
         run_dir = root
         robot_control_token = token
         robot_ip = DEFAULT_ROBOT_IP
+        runtime_mode = selected_runtime_mode
 
     return ThreadingHTTPServer((host, port), Handler)
 
@@ -115,7 +125,7 @@ class DogOpsDashboardModule(Module):
         self.port = port
 
     def write_dashboard(self) -> str:
-        return str(write_dashboard_html(self.run_dir))
+        return str(write_dashboard_html(self.run_dir, runtime_mode=_dogops_runtime_mode()))
 
     def serve(self) -> None:
         serve_dashboard(self.run_dir, self.host, self.port)
@@ -134,6 +144,7 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
     run_dir: Path
     robot_control_token: str
     robot_ip: str
+    runtime_mode: str
 
     def do_GET(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
@@ -181,6 +192,9 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/map/explore":
             if self._authorize_dashboard_mutation():
                 self._explore_map()
+        elif path == "/api/map/stop_explore":
+            if self._authorize_dashboard_mutation():
+                self._stop_explore_map()
         elif path == "/api/route/waypoints":
             if self._authorize_dashboard_mutation():
                 self._add_route_waypoint()
@@ -215,7 +229,11 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
                 store.update_work_order(work_order)
                 store.write_state(state.run.id)
                 store.write_report(state.run.id)
-                write_dashboard_html(self.run_dir, robot_control_token=self.robot_control_token)
+                write_dashboard_html(
+                    self.run_dir,
+                    robot_control_token=self.robot_control_token,
+                    runtime_mode=self.runtime_mode,
+                )
                 self._send_json({"ok": True, "work_order_id": work_order_id, "state": "ready_to_verify"})
                 return
         self._send_json(
@@ -234,12 +252,54 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         store = DogOpsStore.load_existing(self.run_dir)
         state = store.state
         assert state is not None
+        if _uses_dimos_navigation_runtime(self.runtime_mode):
+            try:
+                control = _dimos_start_explore()
+            except Exception as exc:
+                self._send_json(
+                    {"ok": False, "error": "dimos_explore_failed", "message": str(exc)},
+                    HTTPStatus.BAD_GATEWAY,
+                )
+                return
+            site_map = state.site_map.model_copy(deep=True)
+            site_map.status = "mapping"
+            site_map.source = (
+                "dimos_simulation" if _is_simulation_runtime(self.runtime_mode) else "dimos_real"
+            )
+            note = f"DimOS {self.runtime_mode} exploration command sent."
+            if note not in site_map.notes:
+                site_map.notes.append(note)
+            store.set_site_map(site_map)
+            store.write_state(state.run.id)
+            store.write_report(state.run.id)
+            write_dashboard_html(
+                self.run_dir,
+                robot_control_token=self.robot_control_token,
+                runtime_mode=self.runtime_mode,
+            )
+            self._send_json(
+                {
+                    "ok": True,
+                    "mode": self.runtime_mode,
+                    "dimos": control,
+                    "map": {
+                        "status": site_map.status,
+                        "coverage_ratio": site_map.coverage_ratio,
+                        "features": len(site_map.features),
+                    },
+                }
+            )
+            return
         site_map = build_simulated_site_map(state.site, state.nav_events)
         store.set_site_map(site_map)
         store.write_state(state.run.id)
         store.write_report(state.run.id)
         command = _write_rerun_command(self.run_dir, "replay_mapping")
-        write_dashboard_html(self.run_dir, robot_control_token=self.robot_control_token)
+        write_dashboard_html(
+            self.run_dir,
+            robot_control_token=self.robot_control_token,
+            runtime_mode=self.runtime_mode,
+        )
         self._send_json(
             {
                 "ok": True,
@@ -251,6 +311,41 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
                 },
             }
         )
+
+    def _stop_explore_map(self) -> None:
+        if not _uses_dimos_navigation_runtime(self.runtime_mode):
+            self._send_json(
+                {"ok": False, "error": "stop_explore_requires_dimos_runtime"},
+                HTTPStatus.BAD_REQUEST,
+            )
+            return
+        try:
+            control = _dimos_stop_explore()
+        except Exception as exc:
+            self._send_json(
+                {"ok": False, "error": "dimos_stop_explore_failed", "message": str(exc)},
+                HTTPStatus.BAD_GATEWAY,
+            )
+            return
+
+        store = DogOpsStore.load_existing(self.run_dir)
+        state = store.state
+        assert state is not None
+        site_map = state.site_map.model_copy(deep=True)
+        if site_map.status == "mapping":
+            site_map.status = "mapped" if site_map.coverage_ratio > 0 else "empty"
+        note = f"DimOS {self.runtime_mode} exploration stop command sent."
+        if note not in site_map.notes:
+            site_map.notes.append(note)
+        store.set_site_map(site_map)
+        store.write_state(state.run.id)
+        store.write_report(state.run.id)
+        write_dashboard_html(
+            self.run_dir,
+            robot_control_token=self.robot_control_token,
+            runtime_mode=self.runtime_mode,
+        )
+        self._send_json({"ok": True, "mode": self.runtime_mode, "dimos": control})
 
     def _add_route_waypoint(self) -> None:
         payload = self._read_body_json()
@@ -272,7 +367,11 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         store.set_route_plan(state.route_plan)
         store.write_state(state.run.id)
         store.write_report(state.run.id)
-        write_dashboard_html(self.run_dir, robot_control_token=self.robot_control_token)
+        write_dashboard_html(
+            self.run_dir,
+            robot_control_token=self.robot_control_token,
+            runtime_mode=self.runtime_mode,
+        )
         self._send_json(
             {
                 "ok": True,
@@ -311,7 +410,11 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         store.set_route_plan(state.route_plan)
         store.write_state(state.run.id)
         store.write_report(state.run.id)
-        write_dashboard_html(self.run_dir, robot_control_token=self.robot_control_token)
+        write_dashboard_html(
+            self.run_dir,
+            robot_control_token=self.robot_control_token,
+            runtime_mode=self.runtime_mode,
+        )
         self._send_json(
             {
                 "ok": True,
@@ -324,6 +427,19 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         store = DogOpsStore.load_existing(self.run_dir)
         state = store.state
         assert state is not None
+        dimos_goals: list[dict[str, Any]] = []
+        if _uses_dimos_navigation_runtime(self.runtime_mode):
+            try:
+                dimos_goals = [
+                    _dimos_click_goal(waypoint.pose.x or 0.0, waypoint.pose.y or 0.0)
+                    for waypoint in state.route_plan.waypoints
+                ]
+            except Exception as exc:
+                self._send_json(
+                    {"ok": False, "error": "dimos_route_goal_failed", "message": str(exc)},
+                    HTTPStatus.BAD_GATEWAY,
+                )
+                return
         next_nav_index = len(state.nav_events) + 1
         for offset, waypoint in enumerate(state.route_plan.waypoints):
             store.append_nav_event(
@@ -337,11 +453,26 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
                     elapsed_s=3.0 + (offset * 0.5),
                     retries=0,
                     guided=False,
-                    note="operator route simulation",
+                    note=(
+                        f"DimOS {self.runtime_mode} goal dispatched"
+                        if _uses_dimos_navigation_runtime(self.runtime_mode)
+                        else "operator route simulation"
+                    ),
                 )
             )
         state.nav_summary = summarize_nav_events(state.run.id, state.nav_events)
-        site_map = build_simulated_site_map(state.site, state.nav_events)
+        if _uses_dimos_navigation_runtime(self.runtime_mode):
+            site_map = state.site_map.model_copy(deep=True)
+            if site_map.status == "empty":
+                site_map.status = "mapping"
+            site_map.source = (
+                "dimos_simulation" if _is_simulation_runtime(self.runtime_mode) else "dimos_real"
+            )
+            note = f"DimOS {self.runtime_mode} route goals dispatched."
+            if note not in site_map.notes:
+                site_map.notes.append(note)
+        else:
+            site_map = build_simulated_site_map(state.site, state.nav_events)
         store.set_site_map(site_map)
         captures, readings = simulate_poi_captures(
             run_id=state.run.id,
@@ -352,11 +483,17 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         store.write_state(state.run.id)
         store.write_report(state.run.id)
         command = _write_rerun_command(self.run_dir, "replay_route")
-        write_dashboard_html(self.run_dir, robot_control_token=self.robot_control_token)
+        write_dashboard_html(
+            self.run_dir,
+            robot_control_token=self.robot_control_token,
+            runtime_mode=self.runtime_mode,
+        )
         self._send_json(
             {
                 "ok": True,
+                "mode": self.runtime_mode,
                 "rerun": command,
+                "dimos_goals": dimos_goals,
                 "waypoints_run": len(state.route_plan.waypoints),
                 "captures": len(captures),
                 "readings": len(readings),
@@ -383,7 +520,14 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
             linear_x, linear_y, angular_z, duration_s, profile = _resolve_motion_request(
                 command, payload
             )
-            if command in HARD_STOP_COMMANDS:
+            if _is_simulation_runtime(self.runtime_mode):
+                motion_result = _publish_simulation_jog(
+                    linear_x,
+                    linear_y,
+                    angular_z,
+                    0.0 if command in HARD_STOP_COMMANDS else duration_s,
+                )
+            elif command in HARD_STOP_COMMANDS:
                 motion_result = _run_robot_call(lambda: _publish_robot_hard_stop(robot_ip))
             else:
                 motion_result = _run_robot_call(
@@ -415,6 +559,7 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         self._send_json(
             {
                 "ok": True,
+                "mode": self.runtime_mode,
                 "command": command,
                 "duration_s": 0.0 if command in HARD_STOP_COMMANDS else duration_s,
                 "linear_x": linear_x,
@@ -437,7 +582,10 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
 
         robot_ip = self.robot_ip
         try:
-            ok = _run_robot_call(lambda: _run_robot_posture(command, robot_ip))
+            if _is_simulation_runtime(self.runtime_mode):
+                ok = _run_simulation_posture(command)
+            else:
+                ok = _run_robot_call(lambda: _run_robot_posture(command, robot_ip))
         except ModuleNotFoundError as exc:
             self._send_json(
                 {
@@ -461,7 +609,7 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
             )
             return
 
-        self._send_json({"ok": bool(ok), "command": command})
+        self._send_json({"ok": bool(ok), "mode": self.runtime_mode, "command": command})
 
     def _authorize_robot_control(self) -> bool:
         host = self.headers.get("Host", "")
@@ -542,6 +690,115 @@ def _run_robot_call(fn: Any) -> Any:
     if "error" in result:
         raise result["error"]
     return result.get("value")
+
+
+def _dogops_runtime_mode() -> str:
+    mode = (os.environ.get("DOGOPS_RUNTIME_MODE") or DEFAULT_DOGOPS_RUNTIME_MODE).strip().lower()
+    if mode in SIMULATION_RUNTIME_MODES:
+        return "simulation"
+    if mode in OFFLINE_RUNTIME_MODES:
+        return "offline"
+    return "real"
+
+
+def _is_simulation_runtime(mode: str) -> bool:
+    return mode.strip().lower() in SIMULATION_RUNTIME_MODES
+
+
+def _uses_dimos_navigation_runtime(mode: str) -> bool:
+    return mode.strip().lower() not in OFFLINE_RUNTIME_MODES
+
+
+def _dimos_control_url() -> str:
+    raw_url = (
+        os.environ.get("DOGOPS_DIMOS_CONTROL_URL")
+        or os.environ.get("DOGOPS_DIMOS_WS_URL")
+        or "http://127.0.0.1:7779"
+    ).strip()
+    parsed = urlparse(raw_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("DOGOPS_DIMOS_CONTROL_URL must be an http(s) URL")
+    if not _is_loopback_host(parsed.hostname) and os.environ.get("DOGOPS_ALLOW_REMOTE_VIEWER") != "1":
+        raise ValueError("DimOS control URL must be loopback unless DOGOPS_ALLOW_REMOTE_VIEWER=1")
+    return raw_url.rstrip("/")
+
+
+def _emit_dimos_socket_event(event: str, data: Any | None = None) -> dict[str, Any]:
+    try:
+        import socketio
+        import requests
+    except ModuleNotFoundError as exc:  # pragma: no cover - dependency failure path.
+        raise ModuleNotFoundError(
+            "python-socketio and requests are required for DogOps DimOS simulation/real navigation controls"
+        ) from exc
+
+    url = _dimos_control_url()
+    session = requests.Session()
+    session.trust_env = False
+    client = socketio.Client(
+        reconnection=False,
+        logger=False,
+        engineio_logger=False,
+        request_timeout=DIMOS_CONTROL_TIMEOUT_S,
+        http_session=session,
+    )
+    try:
+        client.connect(url, wait_timeout=DIMOS_CONTROL_TIMEOUT_S)
+        if data is None:
+            client.emit(event)
+        else:
+            client.emit(event, data)
+    finally:
+        if client.connected:
+            client.disconnect()
+    return {"event": event, "url": url, "sent": True}
+
+
+def _dimos_start_explore() -> dict[str, Any]:
+    return _emit_dimos_socket_event("start_explore")
+
+
+def _dimos_stop_explore() -> dict[str, Any]:
+    return _emit_dimos_socket_event("stop_explore")
+
+
+def _dimos_click_goal(x: float, y: float) -> dict[str, Any]:
+    return _emit_dimos_socket_event("click", [float(x), float(y)])
+
+
+def _dimos_move_command(linear_x: float, linear_y: float, angular_z: float) -> dict[str, Any]:
+    return _emit_dimos_socket_event(
+        "move_command",
+        {
+            "linear": {"x": float(linear_x), "y": float(linear_y), "z": 0.0},
+            "angular": {"x": 0.0, "y": 0.0, "z": float(angular_z)},
+        },
+    )
+
+
+def _publish_simulation_jog(
+    linear_x: float,
+    linear_y: float,
+    angular_z: float,
+    duration_s: float,
+) -> dict[str, Any]:
+    control = _dimos_move_command(linear_x, linear_y, angular_z)
+    stop_sent = False
+    if duration_s > 0 and any((linear_x, linear_y, angular_z)):
+        time.sleep(duration_s)
+        _dimos_move_command(0.0, 0.0, 0.0)
+        stop_sent = True
+    return {
+        "observed": False,
+        "dimos": control,
+        "simulation_stop_sent": stop_sent,
+    }
+
+
+def _run_simulation_posture(command: str) -> bool:
+    if command == "sleep":
+        _dimos_move_command(0.0, 0.0, 0.0)
+    return True
 
 
 def _write_rerun_command(run_dir: Path, action: str) -> dict[str, object]:

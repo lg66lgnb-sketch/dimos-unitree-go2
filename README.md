@@ -26,6 +26,8 @@ manifest + site policy
 
 The map layer uses the existing DimOS Go2 map/navigation stack. DogOps does not implement SLAM: `DogOpsLiveMapModule` consumes DimOS `global_costmap`, planner `path`, and `odom`, then the dashboard overlays semantic labels, incidents, route waypoints, POIs, and run reporting on the embedded Rerun WebViewer. `map.json` is still written for reports/tests and offline fallback, but the normal operator map is Rerun. The base demo requires no cloud API keys and no LLM. POI photo/readings analysis is deterministic in simulation; optional Gemini/OpenAI/VLM analysis is stretch only and must stay server-side.
 
+Dashboard runtime modes are explicit. The default is `DOGOPS_RUNTIME_MODE=real`: route/map buttons send DimOS navigation commands and manual motion controls command the real Go2 through the local WebRTC/Sport API. Use `DOGOPS_RUNTIME_MODE=simulation` when DimOS is running with `--simulation`; the same dashboard buttons send DimOS `start_explore`, `stop_explore`, click-goal, and `move_command` events to the simulator. Use `DOGOPS_RUNTIME_MODE=offline` only for static artifact checks where no DimOS control server is running.
+
 ## Where To Build
 
 Primary target:
@@ -77,6 +79,21 @@ uv run python -m dimos.experimental.dogops.cli serve --run .dogops/runs/latest -
 ```
 
 `rerun-sim` needs `rerun-sdk`; use the full DimOS environment or install this repo with the optional `rerun` extra. For the real 3D mapping look, run the native Go2 Air simulator (`uv run dimos --simulation --viewer rerun --rerun-open none run unitree-go2`) and publish DogOps overlays with `rerun-sim --view-mode native-3d` to the same local Rerun source. Native 3D mode refuses to start if no DimOS Rerun source is already listening, so it cannot silently fall back to the simple DogOps map. The dashboard’s primary path is option 2: the pinned `@rerun-io/web-viewer` component mounted directly inside DogOps. `DOGOPS_RERUN_EMBED_URL=http://127.0.0.1:9878` remains available only as an option-1 diagnostic fallback when testing DimOS’ own served viewer page.
+
+For the full no-robot simulation flow, start DimOS simulation first, then serve DogOps in simulation mode:
+
+```bash
+cd /path/to/dimos
+NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
+  uv run dimos --simulation --viewer rerun --rerun-open none run unitree-go2
+
+cd /path/to/dimos-unitree-go2
+DOGOPS_RUNTIME_MODE=simulation \
+DOGOPS_DIMOS_CONTROL_URL=http://127.0.0.1:7779 \
+DOGOPS_RERUN_SOURCE_URL=rerun+http://127.0.0.1:9877/proxy \
+DOGOPS_RERUN_VIEW_MODE=native-3d \
+  uv run python -m dimos.experimental.dogops.cli serve --run .dogops/runs/latest --port 8765
+```
 
 ## Starter Files
 

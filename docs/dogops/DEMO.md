@@ -63,6 +63,16 @@ Live Go2 Air mapping should swap in real `global_costmap`/`Path`/`PoseStamped` s
 
 Future alternative: make the DimOS/Rerun page the parent shell and embed DogOps as a side panel.
 
+## Runtime Modes
+
+DogOps defaults to real-dog operation:
+
+- `DOGOPS_RUNTIME_MODE=real` is the default. Map and route buttons send DimOS navigation commands; manual controls use the local Go2 WebRTC/Sport control path.
+- `DOGOPS_RUNTIME_MODE=simulation` is for `uv run dimos --simulation ... run unitree-go2`. Map, route, and manual controls send DimOS WebSocketVis events (`start_explore`, `stop_explore`, click goals, and `move_command`) to the simulated dog.
+- `DOGOPS_RUNTIME_MODE=offline` is only for static artifacts and tests when no DimOS control server is running.
+
+The DimOS control URL defaults to `http://127.0.0.1:7779` and is loopback-only unless `DOGOPS_ALLOW_REMOTE_VIEWER=1` is set deliberately.
+
 ## Part B Dashboard Demo
 
 Serve the latest run. Keep `rerun-sim` running in one terminal, then start the dashboard in another:
@@ -80,6 +90,18 @@ Open <http://127.0.0.1:8765/> to view the dashboard.
 `rerun-sim` needs `rerun-sdk`; use the full DimOS environment or install the optional DogOps `rerun` extra.
 
 For the native 3D mapping view, start `uv run dimos --simulation --viewer rerun --rerun-open none run unitree-go2` first and run Terminal A with `--view-mode native-3d` so DogOps attaches overlays to the DimOS 3D Rerun stream instead of replacing the native simulator view. The standard DogOps dashboard uses the option-2 `@rerun-io/web-viewer` component mounted directly inside DogOps. `DOGOPS_RERUN_EMBED_URL=http://127.0.0.1:9878` is only a diagnostic fallback for comparing against DimOS' own served Rerun viewer page.
+
+For an end-to-end simulation UI pass, serve DogOps with:
+
+```bash
+DOGOPS_RUNTIME_MODE=simulation \
+DOGOPS_DIMOS_CONTROL_URL=http://127.0.0.1:7779 \
+DOGOPS_RERUN_SOURCE_URL=rerun+http://127.0.0.1:9877/proxy \
+DOGOPS_RERUN_VIEW_MODE=native-3d \
+  uv run python -m dimos.experimental.dogops.cli serve --run .dogops/runs/latest --port 8765
+```
+
+Then use the dashboard buttons directly: `Map Open Space` starts DimOS exploration, `Stop Mapping` stops it, route waypoints/POIs remain DogOps overlays on the live Rerun map, `Run Route` dispatches click-goals to DimOS, and manual motion controls move the simulated dog.
 
 API checks:
 

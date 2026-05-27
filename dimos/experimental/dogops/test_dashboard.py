@@ -61,6 +61,7 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert "Machine Readings" in content
     assert "Floor Changes" in content
     assert "Route and inspection points" in content
+    assert "<span>Mode</span><strong>Real dog</strong>" in content
     assert 'data-map-viewer' in content
     assert 'data-rerun-source-url="rerun+http://127.0.0.1:9877/proxy"' in content
     assert 'data-rerun-view-mode="dogops-2d"' in content
@@ -75,6 +76,7 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert "Offline map artifact" in content
     assert "Inspection Evidence" in content
     assert 'data-route-action="explore"' in content
+    assert 'data-route-action="stop-explore"' in content
     assert 'data-route-action="replay-map"' in content
     assert 'data-route-action="add-waypoint"' in content
     assert 'data-route-action="add-poi"' in content
@@ -88,6 +90,7 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert "/evidence/" in content
     assert "Navigation Eval" in content
     assert "Robot Control" in content
+    assert "Real dog" in content
     assert 'data-command="forward"' in content
     assert 'data-command="hard_stop"' in content
     assert 'data-posture="wake"' in content
@@ -192,7 +195,8 @@ def test_dashboard_api_serves_state_report_and_nav(tmp_path) -> None:
     assert len(poi["captures"]) == 3  # type: ignore[arg-type]
 
 
-def test_dashboard_route_editor_mutates_local_run(tmp_path) -> None:
+def test_dashboard_route_editor_mutates_local_run(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("DOGOPS_RUNTIME_MODE", "offline")
     run_dir = tmp_path / "latest"
     run_offline_simulation(out=run_dir)
     server = make_dashboard_server(run_dir, "127.0.0.1", 0)
@@ -233,6 +237,69 @@ def test_dashboard_route_editor_mutates_local_run(tmp_path) -> None:
     assert run_result["rerun"]["action"] == "replay_route"  # type: ignore[index]
     assert rerun_command["action"] == "replay_route"
     assert len(poi["readings"]) >= 4  # type: ignore[arg-type]
+
+
+def test_dashboard_simulation_runtime_dispatches_dimos_controls(tmp_path, monkeypatch) -> None:
+    events: list[tuple[str, dict[str, Any] | None]] = []
+
+    def fake_emit(event: str, data: dict[str, Any] | None = None) -> dict[str, object]:
+        events.append((event, data))
+        return {"event": event, "data": data, "sent": True}
+
+    monkeypatch.setenv("DOGOPS_RUNTIME_MODE", "simulation")
+    monkeypatch.setattr(dashboard, "_emit_dimos_socket_event", fake_emit)
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        explore_status, explore_result = _post_json(f"{base_url}/api/map/explore", {})
+        stop_status, stop_result = _post_json(f"{base_url}/api/map/stop_explore", {})
+        jog_status, jog_result = _post_json(
+            f"{base_url}/api/robot/jog",
+            {"command": "hard_stop"},
+            headers=_robot_headers(server),
+        )
+        posture_status, posture_result = _post_json(
+            f"{base_url}/api/robot/posture",
+            {"command": "sleep"},
+            headers=_robot_headers(server),
+        )
+        run_status, run_result = _post_json(f"{base_url}/api/route/run", {})
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert explore_status == 200
+    assert explore_result["mode"] == "simulation"
+    assert explore_result["map"]["status"] == "mapping"  # type: ignore[index]
+    assert stop_status == 200
+    assert stop_result["mode"] == "simulation"
+    assert jog_status == 200
+    assert jog_result["mode"] == "simulation"
+    assert posture_status == 200
+    assert posture_result["mode"] == "simulation"
+    assert run_status == 200
+    assert run_result["mode"] == "simulation"
+    assert [event for event, _ in events].count("start_explore") == 1
+    assert [event for event, _ in events].count("stop_explore") == 1
+    assert [event for event, _ in events].count("move_command") >= 2
+    assert [event for event, _ in events].count("click") >= 1
+
+
+def test_dimos_control_url_rejects_remote_by_default(monkeypatch) -> None:
+    monkeypatch.setenv("DOGOPS_DIMOS_CONTROL_URL", "http://10.0.0.5:7779")
+    monkeypatch.delenv("DOGOPS_ALLOW_REMOTE_VIEWER", raising=False)
+
+    with pytest.raises(ValueError, match="loopback"):
+        dashboard._dimos_control_url()
+
+    monkeypatch.setenv("DOGOPS_ALLOW_REMOTE_VIEWER", "1")
+    assert dashboard._dimos_control_url() == "http://10.0.0.5:7779"
 
 
 def test_dashboard_robot_jog_sends_low_speed_bounded_pulse(tmp_path, monkeypatch) -> None:
