@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import threading
 from typing import Any
 import urllib.request
@@ -11,6 +12,7 @@ from dimos.experimental.dogops import dashboard
 from dimos.experimental.dogops.dashboard import DogOpsDashboardModule, make_dashboard_server
 from dimos.experimental.dogops.dashboard_static import dimos_viewer_urls, write_dashboard_html
 from dimos.experimental.dogops.mission_engine import run_offline_simulation
+from dimos.experimental.dogops.store import DogOpsStore
 
 
 def _get_json(url: str) -> dict[str, object]:
@@ -75,6 +77,10 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert 'data-route-action="add-poi"' in content
     assert 'data-map-click-mode="waypoint"' in content
     assert 'data-map-click-mode="poi"' in content
+    assert "dogops:map-click-mode" in content
+    assert "Rerun WebViewer unavailable; showing offline map artifact." in Path(
+        "dimos/experimental/dogops/static/rerun-web-viewer.js"
+    ).read_text(encoding="utf-8")
     assert 'data-map-target-id="COOLING_1"' in content
     assert "/evidence/" in content
     assert "Navigation Eval" in content
@@ -87,6 +93,24 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert 'data-motion="step"' in content
     assert 'data-motion="walk"' in content
     assert "X-DogOps-Control-Token" in content
+
+
+def test_dashboard_static_html_surfaces_planned_route_before_run(tmp_path) -> None:
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    store = DogOpsStore.load_existing(run_dir)
+    state = store.state
+    assert state is not None
+    state.nav_events = []
+    state.nav_summary.waypoints_total = 0
+    state.nav_summary.waypoints_reached = 0
+    store.write_state(state.run.id)
+    store.write_report(state.run.id)
+    write_dashboard_html(run_dir)
+
+    content = (run_dir / "dashboard.html").read_text(encoding="utf-8")
+
+    assert "<span>Route</span><strong>6 planned</strong>" in content
 
 
 def test_dashboard_viewer_urls_default_local_and_remote_gated(monkeypatch) -> None:

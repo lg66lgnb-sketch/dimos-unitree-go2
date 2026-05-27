@@ -36,6 +36,8 @@ def render_dashboard_html(
     target_options = _target_options(state)
     packages_metric = f"{report['packages_observed']}/{report['packages_expected']}"
     nav_metric = f"{nav.get('waypoints_reached', 0)}/{nav.get('waypoints_total', 0)}"
+    planned_waypoints = len(route_plan.get("waypoints") or [])
+    route_status_metric = nav_metric if nav.get("waypoints_total", 0) else f"{planned_waypoints} planned"
     tag_recovery_metric = (
         f"{nav.get('tag_reacquisition_successes', 0)}/"
         f"{nav.get('tag_reacquisition_attempts', 0)}"
@@ -463,20 +465,21 @@ def render_dashboard_html(
       border-radius: 6px;
       background: rgba(7, 11, 18, 0.78);
       padding: 6px 8px;
+      max-width: min(520px, 100%);
     }}
     .viewer-hint [data-state="ok"] {{ color: #5eead4; }}
     .viewer-hint [data-state="error"] {{ color: #fecaca; }}
     .map-route-overlay {{
       position: absolute;
       z-index: 3;
-      top: 52px;
+      top: 50px;
       left: 10px;
-      width: min(390px, calc(100% - 20px));
+      width: min(320px, calc(100% - 20px));
       border: 1px solid rgba(255, 255, 255, 0.18);
       border-radius: 8px;
       background: rgba(7, 11, 18, 0.78);
       color: #f8fafc;
-      padding: 10px;
+      padding: 8px;
       backdrop-filter: blur(10px);
     }}
     .map-route-overlay label {{
@@ -487,15 +490,16 @@ def render_dashboard_html(
     }}
     .map-route-overlay .route-status {{
       color: #cbd5e1;
-      margin-top: 6px;
+      margin-top: 4px;
+      font-size: 12px;
     }}
     .map-route-overlay .route-status.error {{ color: #fecaca; }}
     .map-route-overlay .route-status.ok {{ color: #5eead4; }}
     .map-click-modes {{
       display: grid;
       grid-template-columns: 1fr 1fr;
-      gap: 8px;
-      margin-top: 8px;
+      gap: 6px;
+      margin-top: 6px;
     }}
     .map-click-modes button[aria-pressed="true"] {{
       background: #dff6f1;
@@ -505,7 +509,7 @@ def render_dashboard_html(
     }}
     .map-click-hint {{
       margin-top: 6px;
-      min-height: 18px;
+      min-height: 16px;
       color: #cbd5e1;
       font-size: 12px;
     }}
@@ -592,6 +596,11 @@ def render_dashboard_html(
       padding: 8px 10px;
     }}
     .map-route-overlay .route-controls select,
+    .map-route-overlay .route-controls button {{
+      min-height: 30px;
+      padding: 5px 8px;
+      font-size: 13px;
+    }}
     .map-route-overlay .route-controls button,
     .robot-dock button {{
       background: rgba(255, 255, 255, 0.94);
@@ -655,7 +664,7 @@ def render_dashboard_html(
       {status_pill("Map", f"{escape(str(site_map.get('status', 'empty')))} / {coverage_metric}")}
       {status_pill("Open Issues", len(open_incidents))}
       {status_pill("Readings", f"{len(sensor_readings) - len(reading_alerts)}/{len(sensor_readings) or 1} normal")}
-      {status_pill("Route", nav_metric)}
+      {status_pill("Route", route_status_metric)}
     </div>
   </header>
   <main>
@@ -750,7 +759,8 @@ def render_dashboard_html(
             window.DogOpsRerunModule = module;
             return module.mountDogOpsRerunViewer(mapViewer);
           }}).catch((error) => {{
-            showFallback(`Rerun WebViewer unavailable: ${{error.message}}`);
+            console.warn("DogOps Rerun WebViewer unavailable", error);
+            showFallback("Rerun WebViewer unavailable; showing offline map artifact.");
           }});
         }} else {{
           showFallback("Rerun WebViewer module is not configured.");
@@ -830,6 +840,7 @@ def render_dashboard_html(
       }}
       if (routeControls && routeStatus) {{
         let mapClickMode = "";
+        const mapClickModeStorageKey = "dogops:map-click-mode";
         const select = routeControls.querySelector("[data-route-target]");
         const clickModeButtons = Array.from(routeControls.parentElement.querySelectorAll("[data-map-click-mode]"));
         const mapClickStatus = document.querySelector("[data-map-click-status]");
@@ -842,8 +853,15 @@ def render_dashboard_html(
           mapClickStatus.textContent = text;
           mapClickStatus.className = `map-click-hint ${{state || ""}}`;
         }};
-        const setMapClickMode = (mode) => {{
-          mapClickMode = mapClickMode === mode ? "" : mode;
+        const setMapClickMode = (mode, options) => {{
+          const force = Boolean(options && options.force);
+          mapClickMode = force ? mode : (mapClickMode === mode ? "" : mode);
+          try {{
+            if (mapClickMode) window.sessionStorage.setItem(mapClickModeStorageKey, mapClickMode);
+            else window.sessionStorage.removeItem(mapClickModeStorageKey);
+          }} catch (_) {{
+            // sessionStorage can be unavailable in stricter browser contexts.
+          }}
           clickModeButtons.forEach((button) => {{
             button.setAttribute(
               "aria-pressed",
@@ -855,6 +873,14 @@ def render_dashboard_html(
             "",
           );
         }};
+        try {{
+          const storedMapClickMode = window.sessionStorage.getItem(mapClickModeStorageKey) || "";
+          if (["waypoint", "poi"].includes(storedMapClickMode)) {{
+            setMapClickMode(storedMapClickMode, {{force: true}});
+          }}
+        }} catch (_) {{
+          // sessionStorage can be unavailable in stricter browser contexts.
+        }}
         const routePost = async (url, body) => {{
           const response = await fetch(url, {{
             method: "POST",

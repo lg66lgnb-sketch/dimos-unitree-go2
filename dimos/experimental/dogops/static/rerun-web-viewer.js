@@ -145,7 +145,8 @@ export async function mountDogOpsRerunViewer(root) {
     );
   } catch (error) {
     mounted.delete(root);
-    showFallback(root, `Rerun WebViewer failed: ${error.message || error}`);
+    console.warn("DogOps Rerun WebViewer failed; showing offline map artifact.", error);
+    showFallback(root, "Rerun WebViewer unavailable; showing offline map artifact.");
   }
 }
 
