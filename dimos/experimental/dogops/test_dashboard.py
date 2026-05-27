@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from html import unescape
 import json
 import math
 from pathlib import Path
@@ -25,6 +26,14 @@ from dimos.experimental.dogops.live_map import (
     LIVE_TOPIC_MAX_AGE_S,
     _extend_dimos_package_path,
     _grid_to_costmap,
+)
+from dimos.experimental.dogops.map_authoring import (
+    EditableMapEntity,
+    EditableMapPoint,
+    EditableRoute,
+    EditableRouteWaypoint,
+    MapAuthoringState,
+    save_map_authoring,
 )
 from dimos.experimental.dogops.mission_engine import run_offline_simulation
 
@@ -142,6 +151,8 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert "/api/map/no_go_shapes/publish" in content
     assert "/api/map/tag_bindings" in content
     assert "/from_observation" in content
+    assert "routes.find((item) => item.id === current.selected_route_id) || routes[0]" in content
+    assert "selected_route_id: route.id" in content
     assert 'data-go-to-marker' in content
     assert "/api/robot/go_to" in content
     assert "worldFromSvgEvent" in content
@@ -177,6 +188,48 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert 'data-motion="step"' in content
     assert 'data-motion="walk"' in content
     assert "X-DogOps-Control-Token" in content
+
+
+def test_dashboard_static_embeds_full_authoring_state(tmp_path) -> None:
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    save_map_authoring(
+        run_dir,
+        MapAuthoringState(
+            site_id="dogops_demo_site",
+            entities=[
+                EditableMapEntity(
+                    id="CHECKPOINT_X",
+                    kind="checkpoint",
+                    label="Checkpoint X",
+                    pose=EditableMapPoint(x=1.0, y=2.0),
+                )
+            ],
+            routes=[
+                EditableRoute(
+                    id="ROUTE_X",
+                    label="Route X",
+                    waypoints=[
+                        EditableRouteWaypoint(
+                            id="WP_X",
+                            label="Waypoint X",
+                            pose=EditableMapPoint(x=3.0, y=4.0),
+                        )
+                    ],
+                )
+            ],
+        ),
+    )
+
+    content = write_dashboard_html(run_dir).read_text(encoding="utf-8")
+    match = re.search(r'data-map-authoring="([^"]+)"', content)
+    assert match is not None
+    authoring = json.loads(unescape(match.group(1)))
+
+    assert authoring["entities"][0]["id"] == "CHECKPOINT_X"
+    assert authoring["routes"][0]["waypoints"][0]["id"] == "WP_X"
+    assert not isinstance(authoring["entities"], int)
+    assert not isinstance(authoring["routes"], int)
 
 
 def test_dashboard_map_layer_controls_match_svg_layers(tmp_path) -> None:
@@ -474,6 +527,8 @@ def test_dashboard_map_authoring_delete_and_export(tmp_path) -> None:
             {},
             headers=_robot_headers(server),
         )
+        authoring = _get_json(f"{base_url}/api/map/authoring")
+        map_data = _get_json(f"{base_url}/api/map")
     finally:
         server.shutdown()
         server.server_close()
@@ -483,7 +538,14 @@ def test_dashboard_map_authoring_delete_and_export(tmp_path) -> None:
     assert delete_result["ok"] is True
     assert export_status == 200
     assert export_result["ok"] is True
-    assert (run_dir / "exports" / "site_authoring.yaml").exists()
+    assert not any(
+        entity["id"] == "CHECKPOINT_DELETE"
+        for entity in authoring["entities"]  # type: ignore[index]
+    )
+    assert not any(zone["id"] == "CHECKPOINT_DELETE" for zone in map_data["zones"])
+    site_yaml = (run_dir / "exports" / "site_authoring.yaml")
+    assert site_yaml.exists()
+    assert "CHECKPOINT_DELETE" not in site_yaml.read_text(encoding="utf-8")
 
 
 def test_dashboard_map_authoring_observation_placement_and_route_select(tmp_path) -> None:
@@ -573,6 +635,49 @@ def test_dashboard_no_go_publish_keeps_unsupported_without_publisher(tmp_path) -
     assert status == 200
     assert result["ok"] is True
     assert result["authoring"]["no_go_shapes"][0]["dimos_constraint_status"] == "not_supported"  # type: ignore[index]
+
+
+def test_dashboard_no_go_publish_persists_published_status(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("DOGOPS_NO_GO_PUBLISH_COMMAND", "true")
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        _post_json(
+            f"{base_url}/api/map/no_go_shapes",
+            {
+                "id": "NO_GO_PUBLISH",
+                "label": "Publish No-Go",
+                "shape": "rectangle",
+                "points": [
+                    {"x": 1.0, "y": 1.0, "source": "dashboard_edit"},
+                    {"x": 2.0, "y": 2.0, "source": "dashboard_edit"},
+                ],
+                "enabled": True,
+            },
+            headers=_robot_headers(server),
+        )
+        status, result = _post_json(
+            f"{base_url}/api/map/no_go_shapes/publish",
+            {},
+            headers=_robot_headers(server),
+        )
+        authoring = _get_json(f"{base_url}/api/map/authoring")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 200
+    assert result["authoring"]["no_go_shapes"][0]["dimos_constraint_status"] == "published"  # type: ignore[index]
+    assert authoring["no_go_shapes"][0]["dimos_constraint_status"] == "published"  # type: ignore[index]
 
 
 def test_dashboard_map_data_projects_site_route_and_observations(tmp_path) -> None:

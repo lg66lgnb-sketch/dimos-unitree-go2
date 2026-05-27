@@ -15,6 +15,7 @@ from dimos.experimental.dogops.map_authoring import (
     MapAuthoringState,
     export_authoring_yaml,
     load_map_authoring,
+    publish_no_go_constraints,
     replace_entity,
     save_map_authoring,
 )
@@ -195,3 +196,59 @@ def test_authoring_export_includes_selected_route_mission_steps(tmp_path) -> Non
     assert exports["mission"].endswith("mission_authoring.yaml")
     assert "selected_route_id: ROUTE_A" in mission_yaml
     assert "target_id: CHECKPOINT_A" in mission_yaml
+
+
+def test_no_go_publish_marks_enabled_shapes_published_and_excludes_disabled(
+    monkeypatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_run(*_: object, **kwargs: object) -> object:
+        calls.append(json.loads(str(kwargs["input"])))
+
+        class Result:
+            returncode = 0
+
+        return Result()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    authoring = MapAuthoringState(
+        site_id="dogops_demo_site",
+        no_go_shapes=[
+            EditableNoGoShape(
+                id="NO_GO_ENABLED",
+                label="Enabled",
+                points=[EditableMapPoint(x=0.0, y=0.0), EditableMapPoint(x=1.0, y=1.0)],
+                enabled=True,
+            ),
+            EditableNoGoShape(
+                id="NO_GO_DISABLED",
+                label="Disabled",
+                points=[EditableMapPoint(x=2.0, y=2.0), EditableMapPoint(x=3.0, y=3.0)],
+                enabled=False,
+            ),
+        ],
+    )
+
+    published = publish_no_go_constraints(authoring, command="dogops-publisher")
+
+    assert calls[0]["site_id"] == "dogops_demo_site"
+    assert [shape["id"] for shape in calls[0]["no_go_shapes"]] == ["NO_GO_ENABLED"]  # type: ignore[index]
+    assert published.no_go_shapes[0].dimos_constraint_status == "published"
+    assert published.no_go_shapes[1].dimos_constraint_status == "not_supported"
+
+
+def test_no_go_publish_marks_enabled_shapes_failed_on_command_failure() -> None:
+    authoring = MapAuthoringState(
+        no_go_shapes=[
+            EditableNoGoShape(
+                id="NO_GO_FAIL",
+                label="Fail",
+                points=[EditableMapPoint(x=0.0, y=0.0), EditableMapPoint(x=1.0, y=1.0)],
+            )
+        ]
+    )
+
+    failed = publish_no_go_constraints(authoring, command="false")
+
+    assert failed.no_go_shapes[0].dimos_constraint_status == "failed"

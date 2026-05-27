@@ -576,10 +576,7 @@ def render_site_map(
 
     bounds = map_data["bounds"]
     bounds_attr = escape(json.dumps(bounds, separators=(",", ":")), quote=True)
-    authoring_attr = escape(
-        json.dumps(map_data["authoring"], separators=(",", ":")),
-        quote=True,
-    )
+    authoring_attr = escape(json.dumps(authoring or {}, separators=(",", ":")), quote=True)
     projector = _MapProjector(bounds)
     route_points = " ".join(
         f"{projector.x(point['x']):.1f},{projector.y(point['y']):.1f}"
@@ -1716,7 +1713,8 @@ def render_dashboard_html(
         }} else if (mapEditMode === "route") {{
           const current = mapAuthoring || {{}};
           const routes = Array.isArray(current.routes) ? [...current.routes] : [];
-          const route = routes[0] || {{id: "AUTHORED_ROUTE", label: "Authored Route", waypoints: [], mission_id: null}};
+          const route = routes.find((item) => item.id === current.selected_route_id) || routes[0] || {{id: "AUTHORED_ROUTE", label: "Authored Route", waypoints: [], mission_id: null}};
+          const routeIndex = routes.indexOf(route);
           route.waypoints = [...(route.waypoints || []), {{
             id: mapEditId("WP"),
             label: `Waypoint ${{(route.waypoints || []).length + 1}}`,
@@ -1724,8 +1722,8 @@ def render_dashboard_html(
             target_id: null,
             required: true,
           }}];
-          routes[0] = route;
-          await postAuthoring("/api/map/authoring", {{...current, routes}}, "PUT");
+          routes[routeIndex >= 0 ? routeIndex : 0] = route;
+          await postAuthoring("/api/map/authoring", {{...current, routes, selected_route_id: route.id}}, "PUT");
         }} else if (mapEditMode === "incident") {{
           const incidentId = window.prompt("Incident id", "INC-001");
           if (!incidentId) return;
