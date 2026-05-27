@@ -120,7 +120,7 @@ Generate static `dashboard.html`, `state.json`, and `report.json`; skip live ser
 ### Real Go2 base smoke fails
 
 Command:
-`uv run dimos run unitree-go2 --robot-ip <GO2_IP> --viewer none --daemon`
+`uv run dimos --viewer none run unitree-go2 -o go2connection.ip=<GO2_IP> --daemon`
 
 Fallback:
 Stop with `uv run dimos stop --force`, save `dimos log -n 200`, ask DimOS/event staff for network/WebRTC help, and continue offline/MCP work. Do not run `unitree-go2-dogops` until base `unitree-go2` is healthy.

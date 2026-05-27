@@ -878,6 +878,11 @@ def render_dashboard_html(
       if (!controls || !status) return;
       let motionProfile = "nudge";
       let robotBusy = false;
+      const motionLabels = {{
+        nudge: "Nudge",
+        step: "Step",
+        walk: "Walk",
+      }};
       const robotControlToken = {json.dumps(robot_control_token)};
       const keyboardCommands = new Map([
         ["KeyW", "forward"],
@@ -892,7 +897,9 @@ def render_dashboard_html(
         ["Escape", "hard_stop"],
       ]);
       const buttons = Array.from(document.querySelectorAll("[data-command], [data-posture], [data-motion]"));
-      const setBusy = (busy) => buttons.forEach((button) => {{ button.disabled = busy; }});
+      const setBusy = (busy) => buttons.forEach((button) => {{
+        button.disabled = busy && button.getAttribute("data-command") !== "hard_stop";
+      }});
       const setStatus = (text, state) => {{
         status.textContent = text;
         status.className = `robot-status ${{state || ""}}`;
@@ -913,12 +920,13 @@ def render_dashboard_html(
       }};
       const motionTextForCommand = (command) => (result) => {{
         if (command === "hard_stop") return "Hard stop sent";
-        if (!result.observed) return `Sent ${{command}}`;
+        const profile = motionLabels[result.profile] || motionLabels[motionProfile] || motionProfile;
+        if (!result.observed) return `Sent ${{profile}} ${{command}}`;
         const distanceCm = Math.round((result.observed_distance_m || 0) * 1000) / 10;
         const yawDeg = Math.round(Math.abs(result.observed_dyaw_rad || 0) * 1800 / Math.PI) / 10;
-        if (distanceCm >= 0.5) return `Sent ${{command}} / observed ${{distanceCm}} cm`;
-        if (yawDeg >= 0.5) return `Sent ${{command}} / observed ${{yawDeg}} deg`;
-        return `Sent ${{command}} / no clear odom movement`;
+        if (distanceCm >= 0.5) return `Sent ${{profile}} ${{command}} / observed ${{distanceCm}} cm`;
+        if (yawDeg >= 0.5) return `Sent ${{profile}} ${{command}} / observed ${{yawDeg}} deg`;
+        return `Sent ${{profile}} ${{command}} / no clear odom movement`;
       }};
       const sendJogCommand = async (command, source = "button") => {{
         if (robotBusy && command !== "hard_stop") return;
@@ -956,6 +964,7 @@ def render_dashboard_html(
         const button = event.target.closest("button[data-command]");
         if (!button) return;
         const command = button.getAttribute("data-command");
+        button.blur();
         await sendJogCommand(command);
       }});
       window.addEventListener("keydown", async (event) => {{
@@ -973,6 +982,8 @@ def render_dashboard_html(
           motionControls.querySelectorAll("[data-motion]").forEach((item) => {{
             item.setAttribute("aria-pressed", item === button ? "true" : "false");
           }});
+          setStatus(`Motion: ${{motionLabels[motionProfile] || motionProfile}}`, "ok");
+          button.blur();
         }});
       }}
       if (postureControls) {{
@@ -980,6 +991,7 @@ def render_dashboard_html(
           const button = event.target.closest("button[data-posture]");
           if (!button) return;
           const command = button.getAttribute("data-posture");
+          button.blur();
           await sendRobotAction(
             "/api/robot/posture",
             {{command}},

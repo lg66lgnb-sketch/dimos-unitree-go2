@@ -34,17 +34,17 @@ except ModuleNotFoundError:
 
 
 DEFAULT_JOG_DURATION_S = 0.35
-MAX_JOG_DURATION_S = 1.20
-MAX_LINEAR_SPEED = 0.22
-MAX_ANGULAR_SPEED = 0.45
+MAX_JOG_DURATION_S = 2.00
+MAX_LINEAR_SPEED = 0.65
+MAX_ANGULAR_SPEED = 1.10
 ROBOT_CALL_TIMEOUT_S = 8.0
 WEBRTC_COMMAND_TIMEOUT_S = 2.0
 HARD_STOP_REPEATS = 6
 HARD_STOP_INTERVAL_S = 0.05
 MOTION_PROFILES: dict[str, tuple[float, float, float]] = {
     "nudge": (0.35, 1.0, 1.0),
-    "step": (0.80, 1.2, 1.15),
-    "walk": (1.20, 1.35, 1.35),
+    "step": (1.00, 2.3, 2.0),
+    "walk": (2.00, 4.0, 3.0),
 }
 DEFAULT_MOTION_PROFILE = "nudge"
 ROBOT_JOG_COMMANDS: dict[str, tuple[float, float, float]] = {
@@ -52,8 +52,8 @@ ROBOT_JOG_COMMANDS: dict[str, tuple[float, float, float]] = {
     "backward": (-0.15, 0.0, 0.0),
     "left": (0.0, 0.15, 0.0),
     "right": (0.0, -0.15, 0.0),
-    "yaw_left": (0.0, 0.0, 0.30),
-    "yaw_right": (0.0, 0.0, -0.30),
+    "yaw_left": (0.0, 0.0, 0.35),
+    "yaw_right": (0.0, 0.0, -0.35),
     "hard_stop": (0.0, 0.0, 0.0),
     "stop": (0.0, 0.0, 0.0),
 }

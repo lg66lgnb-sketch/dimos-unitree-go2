@@ -20,7 +20,7 @@ Optional when `GO2_IP` is known:
 
 ```bash
 uv run dimos stop --force || true
-uv run dimos run unitree-go2 --robot-ip "$GO2_IP" --viewer none --daemon
+uv run dimos --viewer none run unitree-go2 -o "go2connection.ip=${GO2_IP}" --daemon
 uv run dimos status
 uv run dimos log -n 100
 uv run dimos stop --force
@@ -111,7 +111,7 @@ Only run after the route is physically clear and the stop command is known.
 
 ```bash
 uv run dimos stop --force || true
-uv run dimos run unitree-go2-dogops --robot-ip "$GO2_IP" --viewer none --daemon
+uv run dimos --viewer none run unitree-go2-dogops -o "go2connection.ip=${GO2_IP}" --daemon
 uv run dimos status
 uv run dimos mcp list-tools | rg 'run_mission|scan_zone|read_gauge|check_clearance|detect_blocked_aisle|scan_receiving_manifest|verify_work_order|nav_eval_report'
 uv run dimos mcp call run_mission --json-args '{"mission_id":"receiving_sre_demo"}'

@@ -163,7 +163,7 @@ Smoke-test the base Go2 path before a DogOps run:
 
 ```bash
 uv run dimos stop --force
-uv run dimos run unitree-go2 --robot-ip <GO2_IP> --viewer none --daemon
+uv run dimos --viewer none run unitree-go2 -o go2connection.ip=<GO2_IP> --daemon
 uv run dimos status
 uv run dimos stop --force
 ```

@@ -271,9 +271,9 @@ def test_dashboard_robot_jog_applies_motion_profile(tmp_path, monkeypatch) -> No
     assert status == 200
     assert result["ok"] is True
     assert result["profile"] == "walk"
-    assert result["linear_x"] == pytest.approx(0.2025)
-    assert result["duration_s"] == 1.2
-    assert calls == [(0.2025, 0.0, 0.0, 1.2, "192.168.12.1")]
+    assert result["linear_x"] == pytest.approx(0.6)
+    assert result["duration_s"] == 2.0
+    assert calls == [(0.6, 0.0, 0.0, 2.0, "192.168.12.1")]
 
 
 def test_dashboard_robot_jog_ignores_payload_robot_ip(tmp_path, monkeypatch) -> None:
@@ -551,8 +551,8 @@ def test_dashboard_robot_posture_rejects_unknown_command(tmp_path, monkeypatch) 
         ("backward", -0.15, 0.0, 0.0),
         ("left", 0.0, 0.15, 0.0),
         ("right", 0.0, -0.15, 0.0),
-        ("yaw_left", 0.0, 0.0, 0.30),
-        ("yaw_right", 0.0, 0.0, -0.30),
+        ("yaw_left", 0.0, 0.0, 0.35),
+        ("yaw_right", 0.0, 0.0, -0.35),
         ("hard_stop", 0.0, 0.0, 0.0),
         ("stop", 0.0, 0.0, 0.0),
     ],

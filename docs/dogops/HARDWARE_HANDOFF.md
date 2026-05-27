@@ -89,7 +89,7 @@ cd $DIMOS_ROOT
 export GO2_IP=<GO2_IP>
 ping -c 3 "$GO2_IP"
 uv run --no-sync dimos stop --force || true
-uv run --no-sync dimos run unitree-go2 --robot-ip "$GO2_IP" --viewer none --daemon
+uv run --no-sync dimos --viewer none run unitree-go2 -o "go2connection.ip=${GO2_IP}" --daemon
 uv run --no-sync dimos status
 uv run --no-sync dimos log -n 100
 uv run --no-sync dimos stop --force
@@ -101,7 +101,7 @@ If this fails, stop DogOps hardware work and record the exact network/WebRTC/log
 
 ```bash
 uv run --no-sync dimos stop --force || true
-uv run --no-sync dimos run unitree-go2-dogops --robot-ip "$GO2_IP" --viewer none --daemon
+uv run --no-sync dimos --viewer none run unitree-go2-dogops -o "go2connection.ip=${GO2_IP}" --daemon
 uv run --no-sync dimos status
 uv run --no-sync dimos mcp list-tools | rg 'run_mission|scan_zone|read_gauge|check_clearance|detect_blocked_aisle|scan_receiving_manifest|verify_work_order|nav_eval_report'
 uv run --no-sync dimos mcp call run_mission --json-args '{"mission_id":"receiving_sre_demo"}'

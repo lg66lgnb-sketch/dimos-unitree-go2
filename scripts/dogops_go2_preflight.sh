@@ -102,7 +102,7 @@ if [[ "${RUN_GO2_SMOKE:-0}" == "1" ]]; then
     exit 1
   fi
   run_optional uv_run dimos stop --force
-  run uv_run dimos run unitree-go2 --robot-ip "${GO2_IP}" --viewer none --daemon
+  run uv_run dimos --viewer none run unitree-go2 -o "go2connection.ip=${GO2_IP}" --daemon
   ROBOT_STARTED=1
   run uv_run dimos status
   run uv_run dimos log -n 100
@@ -118,7 +118,7 @@ if [[ "${RUN_DOGOPS_SMOKE:-0}" == "1" ]]; then
     exit 1
   fi
   run_optional uv_run dimos stop --force
-  run uv_run dimos run unitree-go2-dogops --robot-ip "${GO2_IP}" --viewer none --daemon
+  run uv_run dimos --viewer none run unitree-go2-dogops -o "go2connection.ip=${GO2_IP}" --daemon
   ROBOT_STARTED=1
   run uv_run dimos status
   run uv_run dimos mcp call run_mission --json-args '{"mission_id":"receiving_sre_demo"}'

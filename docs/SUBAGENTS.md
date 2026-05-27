@@ -135,7 +135,7 @@ Success:
 
 ```bash
 uv run dimos list | rg 'unitree-go2'
-uv run dimos run unitree-go2 --robot-ip "$GO2_IP" --viewer none --daemon
+uv run dimos --viewer none run unitree-go2 -o "go2connection.ip=${GO2_IP}" --daemon
 uv run dimos status
 uv run dimos stop --force
 ```
