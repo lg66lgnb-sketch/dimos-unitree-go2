@@ -28,6 +28,7 @@ class DogOpsLiveMapAdapter:
         self._started = False
         self._error = ""
         self._unsubscribers: list[Any] = []
+        self._transports: list[Any] = []
         self._latest: dict[str, tuple[float, Any]] = {}
 
     def snapshot(self) -> dict[str, Any]:
@@ -91,9 +92,29 @@ class DogOpsLiveMapAdapter:
                 transport = LCMTransport(topic, msg_type)
                 unsubscribe = transport.subscribe(lambda msg, item=name: self._record(item, msg))
                 self._unsubscribers.append(unsubscribe)
+                self._transports.append(transport)
             except Exception as exc:
                 with self._lock:
                     self._error = f"Failed subscribing to {topic}: {exc}"
+
+    def stop(self) -> None:
+        with self._lock:
+            unsubscribers = list(self._unsubscribers)
+            transports = list(self._transports)
+            self._unsubscribers.clear()
+            self._transports.clear()
+            self._latest.clear()
+            self._started = False
+        for unsubscribe in unsubscribers:
+            try:
+                unsubscribe()
+            except Exception:
+                pass
+        for transport in transports:
+            try:
+                transport.stop()
+            except Exception:
+                pass
 
     def _record(self, name: str, msg: Any) -> None:
         with self._lock:

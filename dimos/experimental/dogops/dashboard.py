@@ -78,6 +78,24 @@ _ROBOT_SESSIONS_LOCK = threading.Lock()
 _LIVE_MAP_ADAPTER = DogOpsLiveMapAdapter()
 
 
+class DogOpsDashboardServer(ThreadingHTTPServer):
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        handler_class: type[BaseHTTPRequestHandler],
+        *,
+        live_map_adapter: DogOpsLiveMapAdapter,
+    ) -> None:
+        super().__init__(server_address, handler_class)
+        self.live_map_adapter = live_map_adapter
+
+    def server_close(self) -> None:
+        stop = getattr(self.live_map_adapter, "stop", None)
+        if stop is not None:
+            stop()
+        super().server_close()
+
+
 def make_dashboard_server(run_dir: str | Path, host: str, port: int) -> ThreadingHTTPServer:
     root = Path(run_dir)
     robot_control_token = secrets.token_urlsafe(32)
@@ -89,7 +107,7 @@ def make_dashboard_server(run_dir: str | Path, host: str, port: int) -> Threadin
         robot_control_token = token
         robot_ip = DEFAULT_ROBOT_IP
 
-    return ThreadingHTTPServer((host, port), Handler)
+    return DogOpsDashboardServer((host, port), Handler, live_map_adapter=_LIVE_MAP_ADAPTER)
 
 
 def serve_dashboard(run_dir: str | Path, host: str = "127.0.0.1", port: int = 8765) -> None:
