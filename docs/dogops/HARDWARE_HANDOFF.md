@@ -2,6 +2,8 @@
 
 This is the Mac/Go2 handoff checklist. The real Go2 is available, so final validation should happen from the full DimOS checkout at `$DIMOS_ROOT`.
 
+For PR review and final test evidence, use [REAL_GO2_PR_TEST_PLAN.md](REAL_GO2_PR_TEST_PLAN.md) as the concise checklist and PR-body source.
+
 Do not use UTM unless the active thread is explicitly a VM-only development thread.
 
 ## 1. Full DimOS Sanity Check
