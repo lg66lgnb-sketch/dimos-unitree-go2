@@ -129,3 +129,16 @@ Stop with `uv run dimos stop --force`, save `dimos log -n 200`, ask DimOS/event 
 
 Fallback:
 Keep direct generated-image detector tests. Add guided `simulated_tag_ids` argument to `scan_zone`. Continue with product demo and return to real stream later.
+
+### Full DimOS venv has empty dist-info packages
+
+Commands:
+`uv sync`
+`uv pip install click==8.3.1`
+`uv run --no-sync dimos list`
+
+Symptom:
+The full checkout `.venv` can contain empty `*.dist-info` directories after a failed or partial install. `dimos list` then fails on missing imports such as `click` or `pydantic`, even though `uv tree` resolves them.
+
+Fallback:
+Do not keep patching one dependency at a time. Create a clean temporary run environment, for example with `UV_PROJECT_ENVIRONMENT=/private/tmp/dimos-go2-venv`, and run hardware commands through that venv. Rebuild the full checkout `.venv` later when the robot run is not time-sensitive.

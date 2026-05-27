@@ -10,6 +10,7 @@ LOG_DIR="${LOG_DIR:-.dogops/preflight/$(date +%Y%m%d-%H%M%S)}"
 ROBOT_STARTED=0
 DOGOPS_REQUIRED_TOOLS=(
   run_mission
+  go_to
   scan_zone
   read_gauge
   check_clearance

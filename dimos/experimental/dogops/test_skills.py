@@ -1,12 +1,21 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 from dimos.experimental.dogops.skills import DogOpsSkillContainer
 
 
 def _payload(raw: str) -> dict[str, object]:
     return json.loads(raw)
+
+
+class _FakePointPublisher:
+    def __init__(self) -> None:
+        self.points: list[Any] = []
+
+    def publish(self, point: Any) -> None:
+        self.points.append(point)
 
 
 def test_skill_container_runs_closed_loop_and_reports_state(tmp_path) -> None:
@@ -53,6 +62,48 @@ def test_skill_container_runs_closed_loop_and_reports_state(tmp_path) -> None:
 
     nav = _payload(skills.nav_eval_report())
     assert nav["nav_summary"]["waypoints_reached"] == 4  # type: ignore[index]
+
+
+def test_skill_container_go_to_publishes_clicked_point(tmp_path) -> None:
+    publisher = _FakePointPublisher()
+    skills = DogOpsSkillContainer(run_dir=tmp_path / "latest")
+    skills.clicked_point = publisher  # type: ignore[attr-defined]
+
+    result = _payload(skills.go_to(1.25, -0.5))
+
+    assert result["ok"] is True
+    assert result["skill"] == "go_to"
+    assert result["transport"] == "clicked_point"
+    assert result["x"] == 1.25
+    assert result["y"] == -0.5
+    assert result["z"] == 0.0
+    assert result["frame_id"] == "map"
+    assert len(publisher.points) == 1
+    point = publisher.points[0]
+    assert point.x == 1.25
+    assert point.y == -0.5
+    assert point.z == 0.0
+    assert point.frame_id == "map"
+
+
+def test_skill_container_go_to_rejects_invalid_target(tmp_path) -> None:
+    skills = DogOpsSkillContainer(run_dir=tmp_path / "latest")
+
+    result = _payload(skills.go_to(float("nan"), 0.0))
+
+    assert result["ok"] is False
+    assert result["skill"] == "go_to"
+    assert result["error"] == "invalid_go_to_target"
+
+
+def test_skill_container_go_to_reports_missing_navigation_stream(tmp_path) -> None:
+    skills = DogOpsSkillContainer(run_dir=tmp_path / "latest")
+
+    result = _payload(skills.go_to(1.0, 2.0))
+
+    assert result["ok"] is False
+    assert result["skill"] == "go_to"
+    assert result["error"] == "navigation_stream_unavailable"
 
 
 def test_skill_container_work_order_methods_are_idempotent(tmp_path) -> None:

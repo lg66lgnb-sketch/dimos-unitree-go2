@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 import json
-import time
+import math
 from pathlib import Path
-from typing import Any, Callable, TypeVar
+import time
+from typing import Any, TypeVar
 
 from dimos.experimental.dogops.config_loader import (
     DEFAULT_MANIFEST,
@@ -37,8 +39,8 @@ except ModuleNotFoundError:  # pragma: no cover - fallback behavior is tested th
 
     def skill(func: F | None = None, **metadata: object) -> F | Callable[[F], F]:
         def decorate(inner: F) -> F:
-            setattr(inner, "__dogops_skill__", True)
-            setattr(inner, "__dogops_skill_metadata__", metadata)
+            inner.__dogops_skill__ = True  # type: ignore[attr-defined]
+            inner.__dogops_skill_metadata__ = metadata  # type: ignore[attr-defined]
             return inner
 
         if func is None:
@@ -56,8 +58,36 @@ except ModuleNotFoundError:
             return {"module": cls.__name__, "kwargs": kwargs}
 
 
+try:  # pragma: no cover - exercised only inside a full DimOS checkout.
+    from dimos.core.stream import Out
+    from dimos.msgs.geometry_msgs.PointStamped import PointStamped
+except ModuleNotFoundError:  # pragma: no cover - local project-pack fallback.
+
+    class Out:
+        def __class_getitem__(cls, _: object) -> type[Out]:
+            return cls
+
+    class PointStamped:
+        def __init__(
+            self,
+            *,
+            ts: float,
+            frame_id: str,
+            x: float,
+            y: float,
+            z: float,
+        ) -> None:
+            self.ts = ts
+            self.frame_id = frame_id
+            self.x = x
+            self.y = y
+            self.z = z
+
+
 class DogOpsSkillContainer(Module):
     """Deterministic SiteOps skills exposed through DimOS MCP or direct tests."""
+
+    clicked_point: Out[PointStamped]
 
     def __init__(
         self,
@@ -67,6 +97,7 @@ class DogOpsSkillContainer(Module):
         mission_path: str | Path = DEFAULT_MISSION,
         policy_path: str | Path = DEFAULT_POLICY,
         run_dir: str | Path = ".dogops/runs/latest",
+        go_to_handler: Callable[[float, float, float, str], object] | None = None,
         **_: object,
     ) -> None:
         self.site_path = Path(site_path)
@@ -74,6 +105,7 @@ class DogOpsSkillContainer(Module):
         self.mission_path = Path(mission_path)
         self.policy_path = Path(policy_path)
         self.run_dir = Path(run_dir)
+        self._go_to_handler = go_to_handler
 
     @skill
     def load_site_config(self, path: str = str(DEFAULT_SITE)) -> str:
@@ -136,6 +168,56 @@ class DogOpsSkillContainer(Module):
             state=state.run.state,
             report=str(self.run_dir / "report.md"),
             summary=state.run.summary,
+        )
+
+    @skill
+    def go_to(self, x: float, y: float, z: float = 0.0, frame_id: str = "map") -> str:
+        try:
+            x_f, y_f, z_f = _finite_point(x, y, z)
+        except ValueError as exc:
+            return _json(
+                ok=False,
+                skill="go_to",
+                error="invalid_go_to_target",
+                message=str(exc),
+            )
+        frame = frame_id.strip() or "map"
+        if self._go_to_handler is not None:
+            result = self._go_to_handler(x_f, y_f, z_f, frame)
+            return _json(
+                ok=True,
+                skill="go_to",
+                transport="handler",
+                x=x_f,
+                y=y_f,
+                z=z_f,
+                frame_id=frame,
+                result=result,
+            )
+
+        publisher = getattr(self, "clicked_point", None)
+        if publisher is None or not hasattr(publisher, "publish"):
+            return _json(
+                ok=False,
+                skill="go_to",
+                error="navigation_stream_unavailable",
+                message="DogOps go_to needs the DimOS clicked_point stream.",
+                x=x_f,
+                y=y_f,
+                z=z_f,
+                frame_id=frame,
+            )
+
+        point = PointStamped(ts=time.time(), frame_id=frame, x=x_f, y=y_f, z=z_f)
+        publisher.publish(point)
+        return _json(
+            ok=True,
+            skill="go_to",
+            transport="clicked_point",
+            x=x_f,
+            y=y_f,
+            z=z_f,
+            frame_id=frame,
         )
 
     @skill
@@ -574,6 +656,16 @@ def _find_work_order(work_orders: list[WorkOrder], work_order_id: str) -> WorkOr
     return None
 
 
+def _finite_point(x: float, y: float, z: float) -> tuple[float, float, float]:
+    try:
+        point = (float(x), float(y), float(z))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("go_to requires numeric x, y, and z") from exc
+    if not all(math.isfinite(value) for value in point):
+        raise ValueError("go_to target must be finite")
+    return point
+
+
 def _work_order_for_incident(work_orders: list[WorkOrder], incident_id: str) -> WorkOrder | None:
     for work_order in work_orders:
         if work_order.incident_id == incident_id:
@@ -651,7 +743,7 @@ def _observed_packages_for_zone(
                 package_ids.update(_package_ids_from_observation(obs, zone_id))
         return sorted(package_ids)
 
-    observations = getattr(mission, "simulation_observations").values()
+    observations = mission.simulation_observations.values()
     for obs in observations:
         if obs.zone_id == zone_id:
             package_ids.update(_package_ids_from_facts(obs.facts, zone_id))
@@ -668,7 +760,7 @@ def _visible_tags_for_zone(
                 tag_ids.update(_observation_tag_ids(obs))
         return sorted(tag_ids)
 
-    observations = getattr(mission, "simulation_observations").values()
+    observations = mission.simulation_observations.values()
     for obs in observations:
         if obs.zone_id == zone_id:
             tag_ids.update(obs.visible_tag_ids)

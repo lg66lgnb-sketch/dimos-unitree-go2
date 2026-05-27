@@ -1,21 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
+from concurrent.futures import TimeoutError as FutureTimeoutError
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import ipaddress
 import json
 import math
 import os
+from pathlib import Path
 import secrets
 import shlex
 import shutil
 import subprocess
 import threading
 import time
-from collections import deque
-from concurrent.futures import TimeoutError as FutureTimeoutError
-from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -134,7 +134,7 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
     robot_control_token: str
     robot_ip: str
 
-    def do_GET(self) -> None:  # noqa: N802
+    def do_GET(self) -> None:
         path = urlparse(self.path).path
         if path in {"/", "/dashboard.html"}:
             self._send_file(self.run_dir / "dashboard.html", "text/html; charset=utf-8")
@@ -163,7 +163,7 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         else:
             self._send_json({"error": "not_found", "path": path}, HTTPStatus.NOT_FOUND)
 
-    def do_POST(self) -> None:  # noqa: N802
+    def do_POST(self) -> None:
         path = urlparse(self.path).path
         if path.startswith("/api/work_orders/") and path.endswith("/ready_to_verify"):
             work_order_id = path.split("/")[3]
@@ -470,7 +470,7 @@ def _run_robot_call(fn: Any) -> Any:
     def target() -> None:
         try:
             result["value"] = fn()
-        except BaseException as exc:  # noqa: BLE001 - re-raised on the request thread.
+        except BaseException as exc:
             result["error"] = exc
 
     thread = threading.Thread(target=target, daemon=True)

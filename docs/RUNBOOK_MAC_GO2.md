@@ -120,7 +120,7 @@ uv run pytest dimos/robot/test_all_blueprints_generation.py || true
 git diff -- dimos/robot/all_blueprints.py
 uv run pytest dimos/robot/test_all_blueprints_generation.py
 uv run dimos list | rg dogops
-uv run dimos mcp list-tools | rg 'run_mission|scan_zone|read_gauge|check_clearance|detect_blocked_aisle|scan_receiving_manifest|verify_work_order|nav_eval_report'
+uv run dimos mcp list-tools | rg 'run_mission|go_to|scan_zone|read_gauge|check_clearance|detect_blocked_aisle|scan_receiving_manifest|verify_work_order|nav_eval_report'
 ```
 
 Do not mark DimOS integration complete until `unitree-go2-dogops` appears in `dimos list`.
@@ -131,7 +131,7 @@ Do not mark DimOS integration complete until `unitree-go2-dogops` appears in `di
 uv run dimos stop --force || true
 uv run dimos --viewer none run unitree-go2-dogops -o "go2connection.ip=${GO2_IP}" --daemon
 uv run dimos status
-uv run dimos mcp list-tools | rg 'run_mission|scan_zone|read_gauge|check_clearance|detect_blocked_aisle|scan_receiving_manifest|verify_work_order|nav_eval_report'
+uv run dimos mcp list-tools | rg 'run_mission|go_to|scan_zone|read_gauge|check_clearance|detect_blocked_aisle|scan_receiving_manifest|verify_work_order|nav_eval_report'
 uv run dimos mcp call run_mission --json-args '{"mission_id":"receiving_sre_demo"}'
 uv run dimos mcp call scan_zone --json-args '{"zone_id":"INBOUND_DOCK"}'
 uv run dimos mcp call scan_receiving_manifest --json-args '{"zone_id":"INBOUND_DOCK"}'

@@ -42,7 +42,7 @@ uv run --no-sync pytest -q -o addopts='' dimos/experimental/dogops
 uv run --no-sync python -m dimos.experimental.dogops.cli simulate --out .dogops/runs/latest
 uv run --no-sync ruff check dimos/experimental/dogops dimos/robot/unitree/go2/blueprints/agentic/unitree_go2_dogops.py || true
 uv run --no-sync dimos list | rg dogops
-uv run --no-sync dimos mcp list-tools | rg 'run_mission|scan_zone|read_gauge|check_clearance|detect_blocked_aisle|scan_receiving_manifest|verify_work_order|nav_eval_report'
+uv run --no-sync dimos mcp list-tools | rg 'run_mission|go_to|scan_zone|read_gauge|check_clearance|detect_blocked_aisle|scan_receiving_manifest|verify_work_order|nav_eval_report'
 ```
 
 If ruff is unavailable in the full DimOS venv, record that and continue with tests plus `git diff --check`. If replay deploys DogOps modules plus `McpServer` but `dimos status` and `dimos mcp list-tools` do not see a running instance, treat MCP exposure as unvalidated until the hardware run or a corrected DimOS launch mode proves it.
@@ -103,7 +103,7 @@ If this fails, stop DogOps hardware work and record the exact network/WebRTC/log
 uv run --no-sync dimos stop --force || true
 uv run --no-sync dimos --viewer none run unitree-go2-dogops -o "go2connection.ip=${GO2_IP}" --daemon
 uv run --no-sync dimos status
-uv run --no-sync dimos mcp list-tools | rg 'run_mission|scan_zone|read_gauge|check_clearance|detect_blocked_aisle|scan_receiving_manifest|verify_work_order|nav_eval_report'
+uv run --no-sync dimos mcp list-tools | rg 'run_mission|go_to|scan_zone|read_gauge|check_clearance|detect_blocked_aisle|scan_receiving_manifest|verify_work_order|nav_eval_report'
 uv run --no-sync dimos mcp call run_mission --json-args '{"mission_id":"receiving_sre_demo"}'
 uv run --no-sync dimos mcp call scan_zone --json-args '{"zone_id":"INBOUND_DOCK"}'
 uv run --no-sync dimos mcp call scan_receiving_manifest --json-args '{"zone_id":"INBOUND_DOCK"}'

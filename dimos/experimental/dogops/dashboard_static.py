@@ -1,13 +1,13 @@
 from __future__ import annotations
 
+from html import escape
+from itertools import pairwise
 import json
 import math
 import os
-from html import escape
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
-
 
 MAP_WIDTH = 920
 MAP_HEIGHT = 560
@@ -1535,7 +1535,7 @@ def _route_samples(route_positions: list[tuple[float, float]]) -> list[tuple[flo
     if not route_positions:
         return []
     samples = [route_positions[0]]
-    for start, end in zip(route_positions, route_positions[1:]):
+    for start, end in pairwise(route_positions):
         dx = end[0] - start[0]
         dy = end[1] - start[1]
         distance = math.hypot(dx, dy)
@@ -1584,7 +1584,7 @@ def _render_grid(projector: _MapProjector) -> str:
             f'<line class="{css_class}" x1="{x:.1f}" y1="0" x2="{x:.1f}" y2="{MAP_HEIGHT}" />'
         )
         if is_major:
-            label = int(round(x_value))
+            label = round(x_value)
             lines.append(
                 f'<text class="map-axis-label" x="{x + 4:.1f}" y="{MAP_HEIGHT - 8}">{label}m</text>'
             )
@@ -1599,7 +1599,7 @@ def _render_grid(projector: _MapProjector) -> str:
             f'<line class="{css_class}" x1="0" y1="{y:.1f}" x2="{MAP_WIDTH}" y2="{y:.1f}" />'
         )
         if is_major:
-            label = int(round(y_value))
+            label = round(y_value)
             lines.append(f'<text class="map-axis-label" x="8" y="{y - 4:.1f}">{label}m</text>')
         y_value += 0.5
     return "".join(lines)
