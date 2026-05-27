@@ -11,6 +11,9 @@ ROBOT_STARTED=0
 DOGOPS_REQUIRED_TOOLS=(
   run_mission
   go_to
+  follow_route
+  stop_route
+  route_status
   scan_zone
   read_gauge
   check_clearance
@@ -128,6 +131,7 @@ if [[ "${RUN_DOGOPS_SMOKE:-0}" == "1" ]]; then
   run uv_run dimos mcp call read_gauge --json-args '{"asset_id":"TEMP_1"}'
   run uv_run dimos mcp call check_clearance --json-args '{"asset_id":"COOLING_1"}'
   run uv_run dimos mcp call detect_blocked_aisle --json-args '{"zone_id":"AISLE_1"}'
+  run uv_run dimos mcp call route_status
   run uv_run dimos mcp call nav_eval_report
   run uv_run dimos log -n 200
   run uv_run dimos stop --force

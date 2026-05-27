@@ -641,6 +641,8 @@ def render_site_map(
         '<button type="button" data-map-edit-action="use_observation">Use Observation</button>'
         '<button type="button" data-map-edit-action="delete_selected">Delete</button>'
         '<button type="button" data-map-edit-action="route_select">Select Route</button>'
+        '<button type="button" data-map-edit-action="run_route">Run Route</button>'
+        '<button type="button" data-map-edit-action="stop_route">Stop Route</button>'
         '<button type="button" data-map-edit-action="route_up">Route Up</button>'
         '<button type="button" data-map-edit-action="route_down">Route Down</button>'
         '<button type="button" data-map-edit-action="publish_no_go">Publish No-Go</button>'
@@ -696,6 +698,7 @@ def render_site_map(
           <span class="map-command-status" data-map-command-status>Map command idle</span>
         </div>
         <div class="map-authoring-status" data-map-authoring-status>Map authoring idle</div>
+        <div class="map-route-execution-status" data-route-execution-status>Execution: idle</div>
         <div class="map-live-status" data-live-map-status>Live odom: waiting for Go2</div>
         <ol class="scan-strip">{scan_items}</ol>
       </div>
@@ -1086,6 +1089,13 @@ def render_dashboard_html(
     }}
     .map-authoring-status.ok {{ color: #86efac; }}
     .map-authoring-status.error {{ color: #fca5a5; }}
+    .map-route-execution-status {{
+      color: #bfdbfe;
+      font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace;
+      min-height: 18px;
+    }}
+    .map-route-execution-status.ok {{ color: #86efac; }}
+    .map-route-execution-status.error {{ color: #fca5a5; }}
     .scan-strip {{
       color: #b8c4d4;
       display: grid;
@@ -1392,6 +1402,7 @@ def render_dashboard_html(
       const liveMapStatus = document.querySelector("[data-live-map-status]");
       const mapCommandStatus = document.querySelector("[data-map-command-status]");
       const mapAuthoringStatus = document.querySelector("[data-map-authoring-status]");
+      const routeExecutionStatus = document.querySelector("[data-route-execution-status]");
       const liveHeatmap = liveMapSvg ? liveMapSvg.querySelector("[data-live-heatmap]") : null;
       const livePath = liveMapSvg ? liveMapSvg.querySelector("[data-live-path]") : null;
       const liveTrace = liveMapSvg ? liveMapSvg.querySelector("[data-live-trace]") : null;
@@ -1404,6 +1415,7 @@ def render_dashboard_html(
       let robotBusy = false;
       let liveMapPolling = false;
       let dimosMapPolling = false;
+      let routeExecutionPolling = false;
       let dimosRobotPoseActive = false;
       let goToArmed = false;
       let mapEditMode = "select";
@@ -1461,6 +1473,11 @@ def render_dashboard_html(
         if (!mapAuthoringStatus) return;
         mapAuthoringStatus.textContent = text;
         mapAuthoringStatus.className = `map-authoring-status ${{state || ""}}`;
+      }};
+      const setRouteExecutionStatus = (text, state) => {{
+        if (!routeExecutionStatus) return;
+        routeExecutionStatus.textContent = text;
+        routeExecutionStatus.className = `map-route-execution-status ${{state || ""}}`;
       }};
       const setRerunStatus = (text) => {{
         if (rerunStatus) rerunStatus.textContent = text;
@@ -1616,6 +1633,85 @@ def render_dashboard_html(
         const routes = Array.isArray(current.routes) ? current.routes : [];
         if (!routes.length) return null;
         return routes.find((route) => route.id === current.selected_route_id) || routes[0];
+      }};
+      const routeExecutionText = (state) => {{
+        if (!state || !state.state) return "Execution: idle";
+        const total = Number(state.waypoints_total || 0);
+        const reached = Number(state.waypoints_reached || 0);
+        const active = state.active_waypoint_id ? ` active=${{state.active_waypoint_id}}` : "";
+        const transport = state.transport ? ` transport=${{state.transport}}` : "";
+        const error = state.last_error ? ` error=${{state.last_error}}` : "";
+        return `Execution: ${{state.state}} ${{reached}}/${{total}}${{active}}${{transport}}${{error}}`;
+      }};
+      const refreshRouteExecution = async () => {{
+        if (routeExecutionPolling) return;
+        routeExecutionPolling = true;
+        try {{
+          const response = await fetch("/api/map/routes/status", {{
+            cache: "no-store",
+            headers: {{"X-DogOps-Control-Token": robotControlToken}},
+          }});
+          const result = await response.json();
+          if (!response.ok || result.ok === false) {{
+            throw new Error(result.message || result.error || "route_status_failed");
+          }}
+          const state = result.route_execution || {{}};
+          setRouteExecutionStatus(routeExecutionText(state), state.state === "failed" ? "error" : "ok");
+        }} catch (error) {{
+          setRouteExecutionStatus(`Execution: status unavailable (${{error.message}})`, "error");
+        }} finally {{
+          routeExecutionPolling = false;
+        }}
+      }};
+      const runSelectedRoute = async () => {{
+        const route = selectedRoute();
+        if (!route) {{
+          setRouteExecutionStatus("Execution: select or author a route first", "error");
+          return;
+        }}
+        setRouteExecutionStatus(`Execution: starting ${{route.id}}...`, "");
+        try {{
+          const response = await fetch("/api/map/routes/follow", {{
+            method: "POST",
+            headers: {{
+              "Content-Type": "application/json",
+              "X-DogOps-Control-Token": robotControlToken,
+            }},
+            body: JSON.stringify({{route_id: route.id, dry_run: false}}),
+          }});
+          const result = await response.json();
+          const state = (result.mcp_result && result.mcp_result.route_execution) || result.route_execution || {{}};
+          if (!response.ok || result.ok === false) {{
+            throw new Error(result.message || result.error || "follow_route_failed");
+          }}
+          setRouteExecutionStatus(routeExecutionText(state), "ok");
+        }} catch (error) {{
+          setRouteExecutionStatus(`Execution failed: ${{error.message}}`, "error");
+        }} finally {{
+          await refreshRouteExecution();
+        }}
+      }};
+      const stopRouteExecution = async () => {{
+        setRouteExecutionStatus("Execution: stopping route...", "");
+        try {{
+          const response = await fetch("/api/map/routes/stop", {{
+            method: "POST",
+            headers: {{
+              "Content-Type": "application/json",
+              "X-DogOps-Control-Token": robotControlToken,
+            }},
+            body: JSON.stringify({{}}),
+          }});
+          const result = await response.json();
+          if (!response.ok || result.ok === false) {{
+            throw new Error(result.message || result.error || "stop_route_failed");
+          }}
+          setRouteExecutionStatus(routeExecutionText(result.route_execution || {{}}), "ok");
+        }} catch (error) {{
+          setRouteExecutionStatus(`Stop route failed: ${{error.message}}`, "error");
+        }} finally {{
+          await refreshRouteExecution();
+        }}
       }};
       const routeIndexForTarget = (route, targetId) => {{
         if (!route || !Array.isArray(route.waypoints)) return -1;
@@ -2118,6 +2214,10 @@ def render_dashboard_html(
             await placeSelectedFromObservation();
           }} else if (action === "route_select") {{
             await selectRouteByPrompt();
+          }} else if (action === "run_route") {{
+            await runSelectedRoute();
+          }} else if (action === "stop_route") {{
+            await stopRouteExecution();
           }} else if (action === "route_up") {{
             await moveSelectedRouteWaypoint(-1);
           }} else if (action === "route_down") {{
@@ -2141,8 +2241,10 @@ def render_dashboard_html(
       }}
       refreshLiveMap();
       refreshDimOSMap();
+      refreshRouteExecution();
       window.setInterval(refreshLiveMap, 1000);
       window.setInterval(refreshDimOSMap, 1500);
+      window.setInterval(refreshRouteExecution, 1500);
     }})();
   </script>
 </body>

@@ -58,7 +58,7 @@ The real Unitree Go2 Air is available. Offline simulation remains the first safe
 |---|---|---|
 | Part 0 — full DimOS preflight | Partial | full checkout lists `unitree-go2` and `unitree-go2-dogops`; Go2 network smoke still requires `GO2_IP` and the real robot |
 | Part A — offline core | Done | simulated mission opens/verifies incidents and writes report |
-| Part B — dashboard | Done | first screen shows rerun-style mission map plus DogOps run metrics; manual Go2 controls use Sport `Move`/`StopMove` and report odometry |
+| Part B — dashboard | Done | first screen shows rerun-style mission map plus DogOps run metrics; manual Go2 controls use Sport `Move`/`StopMove`, map `go_to`, authored route run/stop/status controls, and report odometry |
 | Part C — DimOS registry/MCP | Partial | full checkout registry passes; replay deploys DogOps modules plus `McpServer`, but MCP discovery still reports no running server |
 | Part D — AprilTag observation | Not started | detector reads generated tags and supports simulated/real image observations |
 | Part E — real-Go2 dry run | Not started | base `unitree-go2` smoke passes; DogOps blueprint starts or documented blocker exists |
@@ -85,7 +85,8 @@ The real Unitree Go2 Air is available. Offline simulation remains the first safe
 - GitHub issue #7 checkpoint sign-in is partially implemented in the offline path: the report/dashboard now verifies route checkpoints by expected AprilTag observation (`HOME` 10, `INBOUND_DOCK` 20, `COOLING_1` 41, `QA_HOLD` 30).
 - GitHub issue #2 / PR #11 SiteOps skill surface is implemented in the deterministic path: `read_gauge`, `check_clearance`, `detect_blocked_aisle`, and `scan_receiving_manifest` now run without cloud keys or the real dog, and `scripts/dogops_go2_preflight.sh` checks each required MCP tool individually.
 - GitHub issue #19 editable map authoring is implemented in the offline dashboard path: `map_authoring.json` persists home/entity/no-go/route/incident/tag edits, `/api/map` composes authored semantic state with live DimOS overlays, the dashboard supports select/delete/drag, observation-based placement, route selection/reorder/delete, no-go publish fallback, and run-local YAML export writes `exports/site_authoring.yaml` plus selected-route `exports/mission_authoring.yaml`. Full `dimos list | rg dogops` still requires the full DimOS checkout because this project-pack worktree has no `dimos` console script.
-- Live authored-route following is planned but not implemented. `docs/dogops/ISSUE_19_LIVE_ROUTE_FOLLOWING_IMPLEMENTATION_PLAN.md` defines the proposed `follow_route`/`stop_route` path using existing DimOS `go_to`/`clicked_point` messaging first, with full DimOS validation required before claiming the Go2 can autonomously follow authored route waypoints.
+- Live authored-route following is implemented in the offline/MCP surface: `route_execution.json` records `follow_route` progress, `follow_route`/`stop_route`/`route_status` are exposed by `DogOpsSkillContainer`, dashboard endpoints and controls are present, and completed live/fake runs append NavEvent evidence into `state.json`, `report.json`, and `report.md`. Full DimOS MCP visibility and real Go2 two-waypoint route following still require runtime validation before claiming autonomous hardware success.
+- Local project-pack verification on 2026-05-27 for live authored-route following: focused executor/skills/dashboard tests passed (`71 passed`), full DogOps tests passed (`92 passed, 2 skipped`), ruff passed, simulation wrote `.dogops/runs/latest/report.md`, and `git diff --check` passed. The project pack still lacks a `dimos` console script. `/Users/chris/Documents/Workspace/dimos` currently lists `unitree-go2` and `unitree-go2-dogops`, but `uv run dimos mcp list-tools` reports `no running MCP server`; do not claim `follow_route` MCP visibility until a DogOps runtime is started from the full checkout with these branch changes synced.
 
 ## Required Acceptance Checklist
 
@@ -93,7 +94,7 @@ The real Unitree Go2 Air is available. Offline simulation remains the first safe
 - `uv run python -m dimos.experimental.dogops.cli simulate --out .dogops/runs/latest` produces a coherent report.
 - Dashboard opens and shows report/state/nav metrics.
 - `uv run dimos list | rg dogops` shows `unitree-go2-dogops`.
-- `uv run dimos mcp list-tools` exposes `run_mission`, `go_to`, `scan_zone`, `read_gauge`, `check_clearance`, `detect_blocked_aisle`, `scan_receiving_manifest`, `verify_work_order`, and `nav_eval_report`, or an exact blocker plus direct fallback is documented.
+- `uv run dimos mcp list-tools` exposes `run_mission`, `go_to`, `follow_route`, `stop_route`, `route_status`, `scan_zone`, `read_gauge`, `check_clearance`, `detect_blocked_aisle`, `scan_receiving_manifest`, `verify_work_order`, and `nav_eval_report`, or an exact blocker plus direct fallback is documented.
 - Base `unitree-go2` hardware smoke is attempted against the real robot.
 - DogOps hardware/guided run is attempted, or a specific DimOS/robot blocker is documented.
 - 90-second demo video shows the closed loop.

@@ -3,6 +3,13 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from dimos.experimental.dogops.map_authoring import (
+    EditableMapPoint,
+    EditableRoute,
+    EditableRouteWaypoint,
+    MapAuthoringState,
+    save_map_authoring,
+)
 from dimos.experimental.dogops.skills import DogOpsSkillContainer
 
 
@@ -104,6 +111,98 @@ def test_skill_container_go_to_reports_missing_navigation_stream(tmp_path) -> No
     assert result["ok"] is False
     assert result["skill"] == "go_to"
     assert result["error"] == "navigation_stream_unavailable"
+
+
+def test_skill_container_route_skills_validate_and_report_dry_run(tmp_path) -> None:
+    save_map_authoring(
+        tmp_path / "latest",
+        MapAuthoringState(
+            selected_route_id="ROUTE_A",
+            routes=[
+                EditableRoute(
+                    id="ROUTE_A",
+                    label="Route A",
+                    waypoints=[
+                        EditableRouteWaypoint(
+                            id="WP-1",
+                            label="One",
+                            target_id="CHECKPOINT_1",
+                            pose=EditableMapPoint(x=1.0, y=2.0),
+                        ),
+                    ],
+                )
+            ],
+        ),
+    )
+    skills = DogOpsSkillContainer(run_dir=tmp_path / "latest")
+
+    result = _payload(skills.follow_route(dry_run=True))
+    status = _payload(skills.route_status())
+
+    assert result["ok"] is True
+    assert result["skill"] == "follow_route"
+    assert result["route_id"] == "ROUTE_A"
+    assert result["state"] == "completed"
+    assert result["transport"] == "dry_run"
+    assert status["state"] == "completed"
+
+
+def test_skill_container_follow_route_requires_navigation_stream_for_live_run(tmp_path) -> None:
+    save_map_authoring(
+        tmp_path / "latest",
+        MapAuthoringState(
+            selected_route_id="ROUTE_A",
+            routes=[
+                EditableRoute(
+                    id="ROUTE_A",
+                    label="Route A",
+                    waypoints=[
+                        EditableRouteWaypoint(
+                            id="WP-1",
+                            label="One",
+                            pose=EditableMapPoint(x=1.0, y=2.0),
+                        ),
+                    ],
+                )
+            ],
+        ),
+    )
+    skills = DogOpsSkillContainer(run_dir=tmp_path / "latest")
+
+    result = _payload(skills.follow_route(dry_run=False))
+
+    assert result["ok"] is False
+    assert result["skill"] == "follow_route"
+    assert result["error"] == "navigation_stream_unavailable"
+
+
+def test_skill_container_stop_route_marks_execution_stopped(tmp_path) -> None:
+    save_map_authoring(
+        tmp_path / "latest",
+        MapAuthoringState(
+            selected_route_id="ROUTE_A",
+            routes=[
+                EditableRoute(
+                    id="ROUTE_A",
+                    label="Route A",
+                    waypoints=[
+                        EditableRouteWaypoint(
+                            id="WP-1",
+                            label="One",
+                            pose=EditableMapPoint(x=1.0, y=2.0),
+                        ),
+                    ],
+                )
+            ],
+        ),
+    )
+    skills = DogOpsSkillContainer(run_dir=tmp_path / "latest")
+    _payload(skills.follow_route(dry_run=True))
+
+    result = _payload(skills.stop_route())
+
+    assert result["ok"] is True
+    assert result["state"] == "completed"
 
 
 def test_skill_container_work_order_methods_are_idempotent(tmp_path) -> None:
