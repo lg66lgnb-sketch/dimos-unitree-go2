@@ -70,15 +70,24 @@ class CallableGoalPublisher:
 class ClickedPointGoalPublisher:
     transport_name = "clicked_point"
 
-    def __init__(self, publisher: Any, point_type: type[Any]) -> None:
+    def __init__(
+        self,
+        publisher: Any,
+        point_type: type[Any],
+        *,
+        on_publish: Callable[[Any], None] | None = None,
+    ) -> None:
         self._publisher = publisher
         self._point_type = point_type
+        self._on_publish = on_publish
 
     def publish_goal(self, *, x: float, y: float, z: float, frame_id: str) -> dict[str, Any]:
         if self._publisher is None or not hasattr(self._publisher, "publish"):
             raise RouteExecutionError("DogOps follow_route needs the DimOS clicked_point stream.")
         point = self._point_type(ts=time.time(), frame_id=frame_id, x=x, y=y, z=z)
         self._publisher.publish(point)
+        if self._on_publish is not None:
+            self._on_publish(point)
         return {"transport": self.transport_name}
 
 

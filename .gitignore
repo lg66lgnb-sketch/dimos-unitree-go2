@@ -19,6 +19,9 @@ __pycache__/
 .mypy_cache/
 .venv/
 
+# JavaScript tooling
+node_modules/
+
 # Logs and OS noise
 *.log
 .DS_Store

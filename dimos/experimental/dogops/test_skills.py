@@ -26,6 +26,22 @@ class _FakePointPublisher:
         self.points.append(point)
 
 
+class _FakePosition:
+    def __init__(self, x: float, y: float) -> None:
+        self.x = x
+        self.y = y
+
+
+class _FakePose:
+    def __init__(self, x: float, y: float) -> None:
+        self.position = _FakePosition(x, y)
+
+
+class _FakePoseStamped:
+    def __init__(self, x: float, y: float) -> None:
+        self.pose = _FakePose(x, y)
+
+
 def test_skill_container_runs_closed_loop_and_reports_state(tmp_path) -> None:
     skills = DogOpsSkillContainer(run_dir=tmp_path / "latest")
 
@@ -175,6 +191,40 @@ def test_skill_container_follow_route_requires_navigation_stream_for_live_run(tm
     assert result["ok"] is False
     assert result["skill"] == "follow_route"
     assert result["error"] == "navigation_stream_unavailable"
+
+
+def test_skill_container_follow_route_uses_direct_odom_feedback(tmp_path) -> None:
+    save_map_authoring(
+        tmp_path / "latest",
+        MapAuthoringState(
+            selected_route_id="ROUTE_A",
+            routes=[
+                EditableRoute(
+                    id="ROUTE_A",
+                    label="Route A",
+                    waypoints=[
+                        EditableRouteWaypoint(
+                            id="WP-1",
+                            label="One",
+                            pose=EditableMapPoint(x=0.2, y=0.0),
+                        ),
+                    ],
+                )
+            ],
+        ),
+    )
+    publisher = _FakePointPublisher()
+    skills = DogOpsSkillContainer(run_dir=tmp_path / "latest")
+    skills.clicked_point = publisher  # type: ignore[attr-defined]
+    skills._record_odom(_FakePoseStamped(0.2, 0.0))
+
+    result = _payload(skills.follow_route(dry_run=False))
+
+    assert result["ok"] is True
+    assert result["state"] == "completed"
+    assert result["transport"] == "clicked_point"
+    assert result["waypoints_reached"] == 1
+    assert len(publisher.points) == 1
 
 
 def test_skill_container_stop_route_marks_execution_stopped(tmp_path) -> None:

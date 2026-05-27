@@ -66,9 +66,14 @@ except ModuleNotFoundError:
 
 
 try:  # pragma: no cover - exercised only inside a full DimOS checkout.
-    from dimos.core.stream import Out
+    from dimos.core.stream import In, Out
     from dimos.msgs.geometry_msgs.PointStamped import PointStamped
+    from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
 except ModuleNotFoundError:  # pragma: no cover - local project-pack fallback.
+
+    class In:
+        def __class_getitem__(cls, _: object) -> type[In]:
+            return cls
 
     class Out:
         def __class_getitem__(cls, _: object) -> type[Out]:
@@ -90,11 +95,15 @@ except ModuleNotFoundError:  # pragma: no cover - local project-pack fallback.
             self.y = y
             self.z = z
 
+    class PoseStamped:
+        pass
+
 
 class DogOpsSkillContainer(Module):
     """Deterministic SiteOps skills exposed through DimOS MCP or direct tests."""
 
     clicked_point: Out[PointStamped]
+    odom: In[PoseStamped]
 
     def __init__(
         self,
@@ -119,6 +128,27 @@ class DogOpsSkillContainer(Module):
         self._go_to_handler = go_to_handler
         self._route_stop_handler = route_stop_handler
         self._live_map_adapter = live_map_adapter
+        self._latest_odom: tuple[float, Any] | None = None
+        self._latest_clicked_point: tuple[float, Any] | None = None
+        self._fallback_unsubscribers: list[Callable[[], object]] = []
+
+    def start(self) -> None:  # pragma: no cover - exercised inside full DimOS.
+        odom = getattr(self, "odom", None)
+        if odom is not None and hasattr(odom, "subscribe"):
+            unsubscribe = odom.subscribe(self._record_odom)
+            self._register_unsubscribe(unsubscribe)
+
+    def stop(self) -> None:  # pragma: no cover - exercised inside full DimOS.
+        unsubscribers = list(self._fallback_unsubscribers)
+        self._fallback_unsubscribers.clear()
+        for unsubscribe in unsubscribers:
+            try:
+                unsubscribe()
+            except Exception:
+                pass
+        stop = getattr(super(), "stop", None)
+        if stop is not None:
+            stop()
 
     @skill
     def load_site_config(self, path: str = str(DEFAULT_SITE)) -> str:
@@ -249,12 +279,11 @@ class DogOpsSkillContainer(Module):
                 error="navigation_stream_unavailable",
                 message="DogOps follow_route needs the DimOS clicked_point stream or a handler.",
             )
-        live_adapter = self._live_map_adapter or DogOpsLiveMapAdapter()
         executor = DogOpsRouteExecutor(
             self.run_dir,
             goal_publisher=publisher,
             stop_handler=self._route_stop_handler,
-            live_snapshot_reader=live_adapter.snapshot if not dry_run else None,
+            live_snapshot_reader=self._route_live_snapshot if not dry_run else None,
         )
         try:
             state = executor.follow_route(route_id, dry_run=dry_run)
@@ -762,7 +791,62 @@ class DogOpsSkillContainer(Module):
         publisher = getattr(self, "clicked_point", None)
         if publisher is None or not hasattr(publisher, "publish"):
             return None
-        return ClickedPointGoalPublisher(publisher, PointStamped)
+        return ClickedPointGoalPublisher(
+            publisher,
+            PointStamped,
+            on_publish=self._record_clicked_point,
+        )
+
+    def _register_unsubscribe(self, unsubscribe: object) -> None:
+        if not callable(unsubscribe):
+            return
+        try:
+            from reactivex.disposable import Disposable
+        except ModuleNotFoundError:
+            self._fallback_unsubscribers.append(unsubscribe)
+            return
+        register = getattr(self, "register_disposable", None)
+        if register is None:
+            self._fallback_unsubscribers.append(unsubscribe)
+            return
+        register(Disposable(unsubscribe))
+
+    def _record_odom(self, msg: Any) -> None:
+        self._latest_odom = (time.time(), msg)
+
+    def _record_clicked_point(self, msg: Any) -> None:
+        self._latest_clicked_point = (time.time(), msg)
+
+    def _route_live_snapshot(self) -> dict[str, Any]:
+        if self._live_map_adapter is not None:
+            snapshot = self._live_map_adapter.snapshot()
+        else:
+            snapshot = {
+                "ok": False,
+                "source": "DogOpsSkillContainer direct streams",
+                "status": "waiting_for_topics",
+                "topics": {},
+            }
+        now = time.time()
+        odom_pose = _pose_msg_to_map_pose(self._latest_odom, now=now, source="odom")
+        clicked_point = _point_msg_to_map_pose(
+            self._latest_clicked_point,
+            now=now,
+            source="clicked_point",
+        )
+        topics = dict(snapshot.get("topics") or {})
+        if odom_pose is not None:
+            snapshot["robot_pose"] = odom_pose
+            topics["odom"] = _topic_status("/odom", self._latest_odom, now)
+        if clicked_point is not None:
+            snapshot["clicked_point"] = clicked_point
+            topics["clicked_point"] = _topic_status("/clicked_point", self._latest_clicked_point, now)
+        if odom_pose is not None or clicked_point is not None:
+            snapshot["ok"] = True
+            snapshot["status"] = "receiving"
+            snapshot["source"] = "DogOpsSkillContainer direct streams"
+        snapshot["topics"] = topics
+        return snapshot
 
 
 def _find_incident(incidents: list[Incident], incident_id: str) -> Incident | None:
@@ -770,6 +854,70 @@ def _find_incident(incidents: list[Incident], incident_id: str) -> Incident | No
         if incident.id == incident_id:
             return incident
     return None
+
+
+def _topic_status(topic: str, latest: tuple[float, Any] | None, now: float) -> dict[str, Any]:
+    age_s = round(now - latest[0], 3) if latest is not None else None
+    return {
+        "topic": topic,
+        "received": latest is not None,
+        "age_s": age_s,
+        "stale": False,
+    }
+
+
+def _pose_msg_to_map_pose(
+    latest: tuple[float, Any] | None,
+    *,
+    now: float,
+    source: str,
+) -> dict[str, Any] | None:
+    if latest is None:
+        return None
+    msg = latest[1]
+    pose = getattr(msg, "pose", msg)
+    position = getattr(pose, "position", pose)
+    x = _finite_float(getattr(position, "x", None))
+    y = _finite_float(getattr(position, "y", None))
+    if x is None or y is None:
+        return None
+    return {
+        "x": x,
+        "y": y,
+        "source": source,
+        "age_s": round(now - latest[0], 3),
+    }
+
+
+def _point_msg_to_map_pose(
+    latest: tuple[float, Any] | None,
+    *,
+    now: float,
+    source: str,
+) -> dict[str, Any] | None:
+    if latest is None:
+        return None
+    msg = latest[1]
+    x = _finite_float(getattr(msg, "x", None))
+    y = _finite_float(getattr(msg, "y", None))
+    if x is None or y is None:
+        return None
+    return {
+        "x": x,
+        "y": y,
+        "source": source,
+        "age_s": round(now - latest[0], 3),
+    }
+
+
+def _finite_float(value: object) -> float | None:
+    try:
+        result = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(result):
+        return None
+    return result
 
 
 def _find_work_order(work_orders: list[WorkOrder], work_order_id: str) -> WorkOrder | None:

@@ -114,11 +114,11 @@ class DogOpsDashboardServer(ThreadingHTTPServer):
         *,
         live_map_adapter: DogOpsLiveMapAdapter,
     ) -> None:
-        super().__init__(server_address, handler_class)
         self.live_map_adapter = live_map_adapter
+        super().__init__(server_address, handler_class)
 
     def server_close(self) -> None:
-        stop = getattr(self.live_map_adapter, "stop", None)
+        stop = getattr(getattr(self, "live_map_adapter", None), "stop", None)
         if stop is not None:
             stop()
         with _ROBOT_SESSIONS_LOCK:
@@ -1209,6 +1209,10 @@ def _call_dimos_mcp_skill(
     *,
     timeout_s: float = DIMOS_MCP_CALL_TIMEOUT_S,
 ) -> dict[str, Any]:
+    direct_result = _call_dimos_mcp_skill_direct(skill_name, args, timeout_s=timeout_s)
+    if direct_result is not None:
+        return direct_result
+
     command = _dimos_mcp_call_command(skill_name, args)
     try:
         result = subprocess.run(
@@ -1251,6 +1255,46 @@ def _call_dimos_mcp_skill(
                 payload["mcp_result"] = decoded
             else:
                 payload["mcp_result"] = {"value": decoded}
+    return payload
+
+
+def _call_dimos_mcp_skill_direct(
+    skill_name: str,
+    args: dict[str, Any],
+    *,
+    timeout_s: float,
+) -> dict[str, Any] | None:
+    try:
+        from dimos.agents.mcp.mcp_adapter import McpAdapter
+    except ModuleNotFoundError:
+        return None
+    adapter = McpAdapter(timeout=timeout_s)
+    result = adapter.call_tool(skill_name, args)
+    payload: dict[str, Any] = {
+        "transport": "dimos_mcp",
+        "skill": skill_name,
+    }
+    content = result.get("content", []) if isinstance(result, dict) else []
+    text = "\n".join(
+        str(item.get("text", ""))
+        for item in content
+        if isinstance(item, dict) and item.get("text") is not None
+    ).strip()
+    if not text:
+        payload["mcp_result"] = result
+        return payload
+    try:
+        decoded = json.loads(text)
+    except json.JSONDecodeError:
+        payload["stdout"] = text
+    else:
+        if isinstance(decoded, dict):
+            if decoded.get("ok") is False:
+                detail = decoded.get("error") or decoded.get("message") or decoded
+                raise RuntimeError(f"dimos mcp call {skill_name} returned error: {detail}")
+            payload["mcp_result"] = decoded
+        else:
+            payload["mcp_result"] = {"value": decoded}
     return payload
 
 

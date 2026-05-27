@@ -694,7 +694,7 @@ def render_site_map(
         </svg>
         {legend}
         <div class="map-workflow">
-          <a href="{rerun_web_url_attr}" target="_blank" rel="noreferrer" data-rerun-web-link>Open Rerun Web</a>
+          <a href="{rerun_web_url_attr}" target="_blank" rel="noreferrer" data-rerun-web-link>Open 3D View</a>
           <span class="map-command-status" data-map-command-status>Map command idle</span>
         </div>
         <div class="map-authoring-status" data-map-authoring-status>Map authoring idle</div>
@@ -1490,7 +1490,7 @@ def render_dashboard_html(
           rerunFrame.setAttribute("src", url);
         }}
         if (rerunStandby) rerunStandby.hidden = true;
-        setRerunStatus("Rerun visualization connected");
+        setRerunStatus("3D View connected");
       }};
       const projectPoseWithBounds = (pose, bounds) => {{
         if (!bounds || !pose) return null;
@@ -2338,12 +2338,12 @@ def _render_rerun_surface(rerun_web_url: str) -> str:
     rerun_web_url_attr = escape(rerun_web_url, quote=True)
     return (
         f'<div class="rerun-surface" data-rerun-surface data-rerun-url="{rerun_web_url_attr}">'
-        '<iframe data-rerun-frame title="Rerun Web visualization" loading="lazy"></iframe>'
+        '<iframe data-rerun-frame title="3D View" loading="lazy"></iframe>'
         '<div class="rerun-standby" data-rerun-standby>'
-        '<span class="rerun-chip">Rerun Web Visualization</span>'
-        '<div class="rerun-status" data-rerun-status>Rerun visualization standby</div>'
+        '<span class="rerun-chip">3D View</span>'
+        '<div class="rerun-status" data-rerun-status>3D View standby</div>'
         '<div class="rerun-controls">'
-        '<button type="button" data-rerun-connect>Connect Rerun</button>'
+        '<button type="button" data-rerun-connect>Connect 3D View</button>'
         f'<a href="{rerun_web_url_attr}" target="_blank" rel="noreferrer">Open</a>'
         "</div>"
         "</div>"

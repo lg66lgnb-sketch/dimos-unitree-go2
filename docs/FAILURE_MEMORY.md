@@ -36,6 +36,33 @@ Status impact:
 
 ## Known likely failures and default fallbacks
 
+### Go2 simulation starts but route execution has no odom feedback
+
+Command:
+`PYTEST_VERSION=codex PYTHONPATH=<full-dimos-validation-checkout> <full-dimos-venv>/bin/dimos --simulation --viewer rerun --rerun-open none --rerun-web run unitree-go2-dogops`
+
+Follow-up command:
+`POST /api/map/routes/follow {"route_id":"SIM_POI_ROUTE_2","dry_run":false}`
+
+Observed on 2026-05-27:
+The blueprint deployed `GO2Connection`, `ReplanningAStarPlanner`, `DogOpsSkillContainer`, `RerunBridgeModule`, `VoxelGridMapper`, and Rerun Web. The route API published goals through `clicked_point`, but live route execution failed after retry with `last_error: "no odom received"`. DimOS logs also reported `Cannot handle goal request: missing odometry.`
+
+Tried:
+1. Running the dashboard from the project-pack venv, which could not import full DimOS topic dependencies.
+2. Running the dashboard from a disposable full-DimOS worktree and venv.
+3. Wiring `DogOpsSkillContainer` to subscribe to the blueprint `odom` stream directly.
+
+Learned:
+- The route authoring, route selection, dry-run, `clicked_point` publish path, Rerun Web, camera, LiDAR, and pointcloud topic wiring are present.
+- The current local Go2 MuJoCo simulation did not produce odometry to the planner or DogOps route feedback path during this run.
+
+Decision / fallback:
+- Do not claim live route completion in this simulator state.
+- Use real-Go2 or a known-good sim odom source to validate full autonomous POI routing; keep dry-run and command-publish tests as the local fallback.
+
+Status impact:
+- Real-dog readiness still needs one odom-backed route test from lower-map POI selection to return-home completion.
+
 ### DogOps tests pass but full DimOS registry is missing
 
 Command:

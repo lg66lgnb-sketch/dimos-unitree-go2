@@ -150,7 +150,8 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert 'data-rerun-frame' in content
     assert 'data-rerun-url=' in content
     assert 'data-rerun-web-link' in content
-    assert "Rerun Web Visualization" in content
+    assert "3D View" in content
+    assert "Rerun Web Visualization" not in content
     assert "connectRerunSurface" in content
     assert 'data-map-command-status' in content
     assert 'data-map-action="arm_go_to"' in content
