@@ -79,9 +79,6 @@ What the comparison showed:
 
 DogOps decision: track this PR as a likely Mac reliability improvement, but do not make the base demo depend on it while it is unmerged. Adopt after merge, or cherry-pick only if DogOps replay/visual streams drop on macOS and a focused DogOps smoke test proves the PR fixes it.
 
-Local DogOps status: the current full DimOS integration branch carries a scoped #2245-style subset that forwards Go2 camera, lidar, map, and costmap SHM streams into the Rerun bridge without taking unrelated coordinator changes.
-Other contributors should either use that DimOS branch or confirm upstream DimOS has equivalent SHM/Rerun support before validating the native 3D map dashboard.
-
 Still required on macOS: local `.venv`, `git-lfs`, `portaudio`, the MuJoCo `libpython3.12.dylib` venv symlink workaround, and cautious handling of DimOS host configurators for real robot runs.
 
 ### 1. PR #2236 — Clean Go2 Static Transform frames

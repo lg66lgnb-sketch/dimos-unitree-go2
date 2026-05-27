@@ -1,12 +1,21 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 from dimos.experimental.dogops.skills import DogOpsSkillContainer
 
 
 def _payload(raw: str) -> dict[str, object]:
     return json.loads(raw)
+
+
+class _FakePointPublisher:
+    def __init__(self) -> None:
+        self.points: list[Any] = []
+
+    def publish(self, point: Any) -> None:
+        self.points.append(point)
 
 
 def test_skill_container_runs_closed_loop_and_reports_state(tmp_path) -> None:
@@ -23,9 +32,27 @@ def test_skill_container_runs_closed_loop_and_reports_state(tmp_path) -> None:
     scan = _payload(skills.scan_zone("INBOUND_DOCK"))
     assert scan["visible_tag_ids"] == [20, 101, 102]
 
+    manifest_scan = _payload(skills.scan_receiving_manifest("INBOUND_DOCK"))
+    assert manifest_scan["expected_package_ids"] == ["PKG-101", "PKG-102", "PKG-103"]
+    assert manifest_scan["observed_package_ids"] == ["PKG-101", "PKG-102"]
+    assert manifest_scan["missing_package_ids"] == ["PKG-103"]
+    assert manifest_scan["manifest_exceptions"] == 1
+
     asset = _payload(skills.inspect_asset("COOLING_1"))
     assert asset["ok"] is True
     assert asset["expected_clear"] is True
+
+    clearance = _payload(skills.check_clearance("COOLING_1"))
+    assert clearance["clearance_clear"] is True
+    assert clearance["evidence_observation_id"] == "OBS-004"
+
+    gauge = _payload(skills.read_gauge("TEMP_1"))
+    assert gauge["within_threshold"] is True
+    assert gauge["reading_celsius"] == 28.0
+
+    aisle = _payload(skills.detect_blocked_aisle("AISLE_1"))
+    assert aisle["blocked"] is False
+    assert aisle["clearance_clear"] is True
 
     reconciliation = _payload(skills.reconcile_manifest())
     assert reconciliation["manifest_exceptions"] == 2
@@ -36,20 +63,47 @@ def test_skill_container_runs_closed_loop_and_reports_state(tmp_path) -> None:
     nav = _payload(skills.nav_eval_report())
     assert nav["nav_summary"]["waypoints_reached"] == 4  # type: ignore[index]
 
-    site_map = _payload(skills.map_open_space())
-    assert site_map["map"]["status"] == "mapped"  # type: ignore[index]
 
-    route = _payload(skills.add_route_waypoint("NO_GO_1"))
-    assert route["waypoints"] >= 6
+def test_skill_container_go_to_publishes_clicked_point(tmp_path) -> None:
+    publisher = _FakePointPublisher()
+    skills = DogOpsSkillContainer(run_dir=tmp_path / "latest")
+    skills.clicked_point = publisher  # type: ignore[attr-defined]
 
-    poi = _payload(skills.add_point_of_interest("TEMP_1", '["TEMP_1.temperature_celsius"]'))
-    assert poi["points_of_interest"] >= 4
+    result = _payload(skills.go_to(1.25, -0.5))
 
-    route_run = _payload(skills.run_route_plan())
-    assert route_run["captures"] >= 4
+    assert result["ok"] is True
+    assert result["skill"] == "go_to"
+    assert result["transport"] == "clicked_point"
+    assert result["x"] == 1.25
+    assert result["y"] == -0.5
+    assert result["z"] == 0.0
+    assert result["frame_id"] == "map"
+    assert len(publisher.points) == 1
+    point = publisher.points[0]
+    assert point.x == 1.25
+    assert point.y == -0.5
+    assert point.z == 0.0
+    assert point.frame_id == "map"
 
-    poi_report = _payload(skills.poi_report())
-    assert "temperature" in str(poi_report["readings"])
+
+def test_skill_container_go_to_rejects_invalid_target(tmp_path) -> None:
+    skills = DogOpsSkillContainer(run_dir=tmp_path / "latest")
+
+    result = _payload(skills.go_to(float("nan"), 0.0))
+
+    assert result["ok"] is False
+    assert result["skill"] == "go_to"
+    assert result["error"] == "invalid_go_to_target"
+
+
+def test_skill_container_go_to_reports_missing_navigation_stream(tmp_path) -> None:
+    skills = DogOpsSkillContainer(run_dir=tmp_path / "latest")
+
+    result = _payload(skills.go_to(1.0, 2.0))
+
+    assert result["ok"] is False
+    assert result["skill"] == "go_to"
+    assert result["error"] == "navigation_stream_unavailable"
 
 
 def test_skill_container_work_order_methods_are_idempotent(tmp_path) -> None:

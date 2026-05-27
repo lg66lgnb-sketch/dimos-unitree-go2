@@ -6,17 +6,12 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "pydantic>=2.12,<3",
-    "python-socketio>=5.13,<6",
     "PyYAML>=6.0,<7",
-    "requests>=2.32,<3",
 ]
 
 [project.optional-dependencies]
 vision = [
     "opencv-contrib-python-headless>=4.10,<5",
-]
-rerun = [
-    "rerun-sdk==0.32.0a1",
 ]
 
 [dependency-groups]

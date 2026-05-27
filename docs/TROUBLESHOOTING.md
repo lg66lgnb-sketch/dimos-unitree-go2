@@ -30,26 +30,6 @@ uv run dimos --viewer none run <blueprint>
 
 Keep DogOps dashboard separate.
 
-## Native Go2 Air simulation asks for sudo
-
-`uv run dimos --simulation --viewer rerun --rerun-open none run unitree-go2` may stop during LCM setup on macOS with:
-
-```text
-sudo route add -net 224.0.0.0/4 -interface lo0
-```
-
-Run the printed DimOS system-configuration commands once from an interactive terminal, then rerun the simulator. Do not enter sudo passwords through Codex.
-
-Prefer the repo-local reversible helper:
-
-```bash
-./scripts/macos_dimos_lcm_network.sh status
-./scripts/macos_dimos_lcm_network.sh dry-run-apply
-./scripts/macos_dimos_lcm_network.sh apply
-```
-
-See [macos_dimos_lcm_network.md](macos_dimos_lcm_network.md) for snapshot and restore.
-
 ## `dimos mcp list-tools` has no DogOps tools
 
 Check:
@@ -82,7 +62,7 @@ Do not accept a standalone-pack pass as final. The command must be run in the fu
 First test base blueprint:
 
 ```bash
-uv run dimos run unitree-go2 --robot-ip <GO2_IP> --viewer none --daemon
+uv run dimos --viewer none run unitree-go2 -o go2connection.ip=<GO2_IP> --daemon
 uv run dimos status
 uv run dimos log -n 200
 uv run dimos stop --force

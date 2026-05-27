@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from html import escape
+from itertools import pairwise
 import json
 import math
 import os
@@ -8,7 +9,502 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from dimos.experimental.dogops.mapping import decode_dimos_costmap_full
+MAP_WIDTH = 920
+MAP_HEIGHT = 560
+MAP_PADDING_M = 0.55
+MAP_CELL_M = 0.18
+DEFAULT_RERUN_SOURCE_URL = "rerun+http://127.0.0.1:9877/proxy"
+ENTITY_OFFSETS_M = (
+    (0.0, 0.0),
+    (0.24, 0.22),
+    (0.28, -0.22),
+    (-0.26, 0.20),
+    (-0.30, -0.18),
+    (0.48, 0.0),
+    (0.0, -0.46),
+)
+PACKAGE_OFFSETS_M = (
+    (-0.22, -0.18),
+    (0.0, -0.22),
+    (0.22, -0.18),
+    (-0.14, 0.18),
+    (0.14, 0.18),
+)
+
+
+def build_map_data(
+    state: dict[str, Any],
+    report: dict[str, Any],
+    *,
+    live_overlay: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    site = state.get("site") or {}
+    zones = site.get("zones") or []
+    assets = site.get("assets") or []
+    site_packages = site.get("packages") or []
+    observations = state.get("observations") or []
+    nav_events = state.get("nav_events") or []
+    incidents = report.get("incidents") or []
+    report_packages = report.get("packages") or []
+
+    zone_points: dict[str, tuple[float, float]] = {}
+    map_zones: list[dict[str, Any]] = []
+    for zone in zones:
+        pose = _zone_pose(zone)
+        if pose is None:
+            continue
+        zone_id = str(zone["id"])
+        zone_points[zone_id] = pose
+        map_zones.append(
+            {
+                "id": zone_id,
+                "display_name": zone.get("display_name") or zone_id,
+                "zone_kind": zone.get("zone_kind", "zone"),
+                "tag_id": zone.get("tag_id"),
+                "radius_m": float(zone.get("radius_m") or 0.8),
+                "no_go": bool(zone.get("no_go")),
+                "x": pose[0],
+                "y": pose[1],
+            }
+        )
+
+    entity_points = dict(zone_points)
+    map_assets: list[dict[str, Any]] = []
+    for index, asset in enumerate(assets):
+        zone_id = str(asset.get("zone_id") or "")
+        base = zone_points.get(zone_id)
+        if base is None:
+            continue
+        pose = _offset_pose(base, index + 1)
+        asset_id = str(asset["id"])
+        entity_points[asset_id] = pose
+        map_assets.append(
+            {
+                "id": asset_id,
+                "display_name": asset.get("display_name") or asset_id,
+                "asset_kind": asset.get("asset_kind", "asset"),
+                "tag_id": asset.get("tag_id"),
+                "zone_id": zone_id,
+                "x": pose[0],
+                "y": pose[1],
+            }
+        )
+
+    site_package_by_id = {str(package["id"]): package for package in site_packages}
+    package_counts_by_zone: dict[str, int] = {}
+    map_packages: list[dict[str, Any]] = []
+    for package in report_packages:
+        package_id = str(package["package_id"])
+        observed_zone = package.get("observed_zone_id")
+        expected_zone = package.get("expected_zone_id")
+        zone_id = str(observed_zone or expected_zone or "")
+        base = zone_points.get(zone_id)
+        if base is None:
+            continue
+        count = package_counts_by_zone.get(zone_id, 0)
+        package_counts_by_zone[zone_id] = count + 1
+        pose = _package_pose(base, count)
+        site_package = site_package_by_id.get(package_id) or {}
+        entity_points[package_id] = pose
+        map_packages.append(
+            {
+                "id": package_id,
+                "tag_id": site_package.get("tag_id"),
+                "expected_zone_id": expected_zone,
+                "observed_zone_id": observed_zone,
+                "state": package.get("state", "unknown"),
+                "blocks_asset_id": package.get("blocks_asset_id"),
+                "x": pose[0],
+                "y": pose[1],
+            }
+        )
+
+    map_route: list[dict[str, Any]] = []
+    for event in nav_events:
+        if event.get("action") != "goto":
+            continue
+        target_id = str(event.get("target_id") or "")
+        pose = entity_points.get(target_id)
+        if pose is None:
+            continue
+        map_route.append(
+            {
+                "target_id": target_id,
+                "x": pose[0],
+                "y": pose[1],
+                "success": bool(event.get("success", True)),
+                "guided": bool(event.get("guided", False)),
+                "retries": int(event.get("retries") or 0),
+                "note": event.get("note", ""),
+            }
+        )
+
+    map_observations: list[dict[str, Any]] = []
+    for observation in observations:
+        zone_id = str(observation.get("zone_id") or "")
+        base = zone_points.get(zone_id)
+        if base is None:
+            continue
+        pose = _offset_pose(base, len(map_observations) + 1)
+        map_observations.append(
+            {
+                "id": observation.get("id"),
+                "zone_id": zone_id,
+                "entity_id": observation.get("entity_id"),
+                "tag_id": observation.get("tag_id"),
+                "visible_tag_ids": _visible_tag_ids(observation),
+                "source": observation.get("source", "unknown"),
+                "x": pose[0],
+                "y": pose[1],
+            }
+        )
+
+    map_incidents: list[dict[str, Any]] = []
+    for incident in incidents:
+        entity_id = str(incident.get("entity_id") or "")
+        pose = entity_points.get(entity_id)
+        if pose is None and incident.get("related_package_id"):
+            pose = entity_points.get(str(incident["related_package_id"]))
+        if pose is None:
+            continue
+        map_incidents.append(
+            {
+                "id": incident.get("id"),
+                "entity_id": entity_id,
+                "related_package_id": incident.get("related_package_id"),
+                "severity": incident.get("severity", "INFO"),
+                "state": incident.get("state", "unknown"),
+                "x": pose[0],
+                "y": pose[1],
+            }
+        )
+
+    live = live_overlay or {
+        "ok": False,
+        "source": "DimOS live LCM topics",
+        "status": "not_requested",
+        "error": "",
+        "topics": {},
+        "costmap": None,
+        "path": [],
+        "route": [],
+        "robot_pose": None,
+        "target": None,
+    }
+    points = [
+        (item["x"], item["y"])
+        for group in (map_zones, map_assets, map_packages, map_route, map_observations)
+        for item in group
+    ]
+    points.extend(_live_overlay_points(live))
+    bounds = _map_bounds(points)
+    return {
+        "site_id": site.get("site_id"),
+        "site_name": site.get("site_name"),
+        "zones": map_zones,
+        "assets": map_assets,
+        "packages": map_packages,
+        "route": map_route,
+        "observations": map_observations,
+        "incidents": map_incidents,
+        "bounds": bounds,
+        "live": live,
+        "layers": {
+            "semantic": True,
+            "heatmap": bool((live.get("costmap") or {}).get("cells")) if isinstance(live, dict) else False,
+            "path": bool(live.get("path") or live.get("route")) if isinstance(live, dict) else False,
+            "robot": bool(live.get("robot_pose")) if isinstance(live, dict) else False,
+        },
+    }
+
+
+def _live_overlay_points(live: dict[str, Any]) -> list[tuple[float, float]]:
+    points: list[tuple[float, float]] = []
+    for point in [*(live.get("path") or []), *(live.get("route") or [])]:
+        maybe_point = _xy_point(point)
+        if maybe_point is not None:
+            points.append(maybe_point)
+    for point in (live.get("robot_pose"), live.get("target")):
+        maybe_point = _xy_point(point)
+        if maybe_point is not None:
+            points.append(maybe_point)
+    costmap = live.get("costmap") or {}
+    cells = costmap.get("cells") if isinstance(costmap, dict) else None
+    if isinstance(cells, list):
+        for cell in cells:
+            maybe_point = _xy_point(cell)
+            if maybe_point is None:
+                continue
+            x, y = maybe_point
+            width = _float_or_none(cell.get("width") if isinstance(cell, dict) else None) or 0.0
+            height = _float_or_none(cell.get("height") if isinstance(cell, dict) else None) or 0.0
+            points.append((x, y))
+            points.append((x + width, y + height))
+    return points
+
+
+def _xy_point(item: Any) -> tuple[float, float] | None:
+    if not isinstance(item, dict):
+        return None
+    x = _float_or_none(item.get("x"))
+    y = _float_or_none(item.get("y"))
+    if x is None or y is None:
+        return None
+    return x, y
+
+
+def _float_or_none(value: Any) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(result):
+        return None
+    return result
+
+
+def build_route_data(state: dict[str, Any], report: dict[str, Any]) -> dict[str, Any]:
+    map_data = build_map_data(state, report)
+    checkpoints = {
+        str(checkpoint.get("target_id")): checkpoint
+        for checkpoint in report.get("checkpoint_verifications") or []
+    }
+    nav_events = [event for event in state.get("nav_events") or [] if event.get("action") == "goto"]
+    nav_by_target = {str(event.get("target_id")): event for event in nav_events}
+    stops = []
+    for index, stop in enumerate(map_data["route"], 1):
+        target_id = str(stop["target_id"])
+        event = nav_by_target.get(target_id) or {}
+        checkpoint = checkpoints.get(target_id) or {}
+        stops.append(
+            {
+                "sequence": index,
+                "target_id": target_id,
+                "x": stop["x"],
+                "y": stop["y"],
+                "success": bool(stop.get("success", True)),
+                "guided": bool(stop.get("guided", False)),
+                "retries": int(stop.get("retries") or 0),
+                "elapsed_s": float(event.get("elapsed_s") or 0.0),
+                "note": stop.get("note", ""),
+                "expected_tag_id": checkpoint.get("expected_tag_id"),
+                "verification_observation_id": checkpoint.get("observation_id"),
+                "tag_verified": bool(checkpoint.get("verified", False)),
+            }
+        )
+    nav = report.get("nav_summary") or {}
+    return {
+        "run_id": report.get("run_id"),
+        "mission_id": report.get("mission_id"),
+        "route_targets": nav.get("route_targets", len(stops)),
+        "route_coverage": nav.get("route_coverage", 0.0),
+        "waypoints_reached": nav.get("waypoints_reached", 0),
+        "waypoints_total": nav.get("waypoints_total", len(stops)),
+        "tag_reacquisition_attempts": nav.get("tag_reacquisition_attempts", 0),
+        "tag_reacquisition_successes": nav.get("tag_reacquisition_successes", 0),
+        "stops": stops,
+    }
+
+
+def build_poi_data(state: dict[str, Any], report: dict[str, Any]) -> dict[str, Any]:
+    observations = state.get("observations") or []
+    incidents = report.get("incidents") or []
+    captures = []
+    for observation in observations:
+        observation_id = str(observation.get("id") or "")
+        related_incident_ids = [
+            str(incident.get("id"))
+            for incident in incidents
+            if observation_id in (incident.get("evidence_observation_ids") or [])
+        ]
+        captures.append(
+            {
+                "id": observation_id,
+                "zone_id": observation.get("zone_id"),
+                "entity_id": observation.get("entity_id"),
+                "tag_id": observation.get("tag_id"),
+                "visible_tag_ids": _visible_tag_ids(observation),
+                "source": observation.get("source", "unknown"),
+                "related_incident_ids": related_incident_ids,
+            }
+        )
+
+    readings = []
+    for asset in (state.get("site") or {}).get("assets") or []:
+        asset_id = str(asset.get("id") or "")
+        expected_state = asset.get("expected_state") or {}
+        if asset.get("expected_clear") is not None:
+            raw_clear = _latest_fact_value(observations, f"{asset_id}.clearance_clear")
+            clearance_clear = _to_bool(raw_clear)
+            if clearance_clear is None:
+                clearance_clear = bool(asset.get("expected_clear"))
+            readings.append(
+                {
+                    "asset_id": asset_id,
+                    "kind": "clearance",
+                    "state": "clear" if clearance_clear else "blocked",
+                    "clearance_clear": clearance_clear,
+                    "expected_clear": asset.get("expected_clear"),
+                }
+            )
+        threshold = _to_float(expected_state.get("max_celsius"))
+        if threshold is not None:
+            reading = _to_float(_latest_fact_value(observations, f"{asset_id}.temperature_c"))
+            source = "observation"
+            if reading is None:
+                reading = _to_float(expected_state.get("current_celsius"))
+                source = "expected_state"
+            if reading is None:
+                reading = round(threshold - 2.0, 1)
+                source = "deterministic_fallback"
+            readings.append(
+                {
+                    "asset_id": asset_id,
+                    "kind": "temperature",
+                    "reading_celsius": reading,
+                    "max_celsius": threshold,
+                    "within_threshold": reading <= threshold,
+                    "source": source,
+                }
+            )
+    return {
+        "run_id": report.get("run_id"),
+        "captures": captures,
+        "readings": readings,
+    }
+
+
+def render_site_map(state: dict[str, Any], report: dict[str, Any]) -> str:
+    map_data = build_map_data(state, report)
+    if not map_data["zones"]:
+        return '<div class="map-empty">Map data unavailable</div>'
+
+    bounds = map_data["bounds"]
+    bounds_attr = escape(json.dumps(bounds, separators=(",", ":")), quote=True)
+    projector = _MapProjector(bounds)
+    route_points = " ".join(
+        f"{projector.x(point['x']):.1f},{projector.y(point['y']):.1f}"
+        for point in map_data["route"]
+    )
+    grid = _render_grid(projector)
+    floor_cells = _render_floor_cells(projector, map_data)
+    point_cloud = _render_point_cloud(projector, map_data)
+    no_go = "".join(_render_no_go_zone(projector, zone) for zone in map_data["zones"])
+    zones = "".join(_render_zone(projector, zone) for zone in map_data["zones"])
+    assets = "".join(_render_asset(projector, asset) for asset in map_data["assets"])
+    packages = "".join(_render_package(projector, package) for package in map_data["packages"])
+    observations = "".join(
+        _render_observation(projector, observation) for observation in map_data["observations"]
+    )
+    incidents = "".join(
+        _render_incident(projector, incident) for incident in map_data["incidents"]
+    )
+    route = ""
+    if route_points:
+        route = (
+            f'<polyline class="map-route" points="{route_points}" />'
+            + "".join(_render_route_stop(projector, stop, index) for index, stop in enumerate(map_data["route"], 1))
+        )
+    robot = _render_live_robot_pose()
+    scan_items = "".join(_render_scan_item(observation) for observation in map_data["observations"])
+    legend = (
+        '<div class="map-legend">'
+        '<span><i class="legend-free"></i>free grid</span>'
+        '<span><i class="legend-heatmap"></i>DimOS heatmap</span>'
+        '<span><i class="legend-route"></i>trajectory</span>'
+        '<span><i class="legend-live"></i>live odom</span>'
+        '<span><i class="legend-tag"></i>tag return</span>'
+        '<span><i class="legend-no-go"></i>no-go cost</span>'
+        '<span><i class="legend-incident"></i>P1/P2 event</span>'
+        "</div>"
+    )
+    layer_controls = (
+        '<div class="map-layer-controls" data-map-layer-controls>'
+        '<button type="button" data-map-layer="semantic" aria-pressed="true">Semantic</button>'
+        '<button type="button" data-map-layer="heatmap" aria-pressed="true">Heatmap</button>'
+        '<button type="button" data-map-layer="path" aria-pressed="true">Path</button>'
+        '<button type="button" data-map-layer="robot" aria-pressed="true">Robot</button>'
+        "</div>"
+    )
+    return f"""
+      <div class="map-shell" data-map-surface>
+        {layer_controls}
+        <svg class="site-map" role="img" aria-label="DogOps mission map"
+          data-live-map-svg data-map-bounds="{bounds_attr}"
+          viewBox="0 0 {MAP_WIDTH} {MAP_HEIGHT}">
+          <defs>
+            <filter id="dogops-map-glow" x="-50%" y="-50%" width="200%" height="200%">
+              <feGaussianBlur stdDeviation="2.5" result="blur" />
+              <feMerge>
+                <feMergeNode in="blur" />
+                <feMergeNode in="SourceGraphic" />
+              </feMerge>
+            </filter>
+            <pattern id="dogops-map-hatch" width="8" height="8" patternUnits="userSpaceOnUse">
+              <path d="M-2,8 L8,-2 M0,10 L10,0" class="map-hatch-line" />
+            </pattern>
+          </defs>
+          <rect class="map-bg" x="0" y="0" width="{MAP_WIDTH}" height="{MAP_HEIGHT}" rx="8" />
+          <g data-layer="heatmap" data-live-heatmap></g>
+          <g data-layer="semantic">
+            {floor_cells}
+            {grid}
+            {point_cloud}
+            {no_go}
+            {zones}
+            {assets}
+            {packages}
+            {observations}
+            {incidents}
+          </g>
+          <g data-layer="path">
+            {route}
+            <polyline class="map-dimos-path" data-live-path points="" />
+          </g>
+          <g data-layer="robot">
+            {robot}
+          </g>
+        </svg>
+        {legend}
+        <div class="map-workflow">
+          <span class="map-command-status" data-map-command-status>Map command idle</span>
+        </div>
+        <div class="map-live-status" data-live-map-status>Live odom: waiting for Go2</div>
+        <ol class="scan-strip">{scan_items}</ol>
+      </div>
+    """
+
+
+def render_rerun_map_panel() -> str:
+    source_url = _trusted_rerun_source_url(os.environ.get("DOGOPS_RERUN_SOURCE_URL"))
+    web_url = _trusted_rerun_web_url(os.environ.get("DOGOPS_RERUN_WEB_URL"))
+    view_mode = (os.environ.get("DOGOPS_RERUN_VIEW_MODE") or "dogops-2d").strip().lower()
+    if view_mode not in {"dogops-2d", "native-3d"}:
+        view_mode = "dogops-2d"
+    source_url_attr = escape(source_url, quote=True)
+    web_url_attr = escape(web_url, quote=True)
+    view_mode_attr = escape(view_mode, quote=True)
+    return f"""
+      <div
+        class="rerun-map-viewer"
+        data-map-viewer
+        data-rerun-source-url="{source_url_attr}"
+        data-rerun-view-mode="{view_mode_attr}"
+        data-rerun-asset-base-url="/assets/vendor/@rerun-io/web-viewer/"
+      >
+        <div class="rerun-canvas" data-rerun-canvas></div>
+        <div class="viewer-offline" data-viewer-offline hidden>
+          <strong>Rerun stream offline</strong>
+          <span>Use the Mission Map below while the local Rerun source starts.</span>
+        </div>
+        <div class="rerun-viewer-toolbar">
+          <span class="rerun-status" data-rerun-status>Connecting to Rerun...</span>
+          <button type="button" data-rerun-action="focus">Focus Map</button>
+          <button type="button" data-rerun-action="replay">Replay</button>
+          <a href="{web_url_attr}" target="_blank" rel="noreferrer" data-rerun-web-link>Open Rerun Web</a>
+        </div>
+      </div>
+    """
 
 
 def render_dashboard_html(
@@ -16,46 +512,27 @@ def render_dashboard_html(
     report: dict[str, Any],
     *,
     robot_control_token: str | None = None,
-    runtime_mode: str | None = None,
 ) -> str:
     run = state["run"]
     nav = report.get("nav_summary") or {}
     packages = report.get("packages") or []
     incidents = report.get("incidents") or []
     work_orders = report.get("work_orders") or []
-    site_map = state.get("site_map") or {}
-    route_plan = state.get("route_plan") or {}
-    poi_captures = report.get("poi_captures") or []
-    sensor_readings = report.get("sensor_readings") or []
+    checkpoints = report.get("checkpoint_verifications") or []
     what_changed = report.get("what_changed") or []
-    open_incidents = [incident for incident in incidents if str(incident.get("state")) != "resolved"]
-    reading_alerts = [
-        reading
-        for reading in sensor_readings
-        if str(reading.get("status", "")).lower() not in {"normal", "ok", "clear", "pass"}
-    ]
-    target_options = _target_options(state)
     packages_metric = f"{report['packages_observed']}/{report['packages_expected']}"
     nav_metric = f"{nav.get('waypoints_reached', 0)}/{nav.get('waypoints_total', 0)}"
-    planned_waypoints = len(route_plan.get("waypoints") or [])
-    route_status_metric = nav_metric if nav.get("waypoints_total", 0) else f"{planned_waypoints} planned"
+    checkpoint_metric = f"{report.get('checkpoints_verified', 0)}/{report.get('checkpoints_total', 0)}"
     tag_recovery_metric = (
         f"{nav.get('tag_reacquisition_successes', 0)}/"
         f"{nav.get('tag_reacquisition_attempts', 0)}"
     )
     mean_target_time_metric = f"{nav.get('mean_elapsed_s', 0):.1f}s"
     route_coverage_metric = f"{float(nav.get('route_coverage', 0.0)) * 100:.0f}%"
-    coverage_metric = f"{float(site_map.get('coverage_ratio', 0.0)) * 100:.0f}%"
-    runtime = (runtime_mode or os.environ.get("DOGOPS_RUNTIME_MODE") or "real").strip().lower()
-    if runtime in {"sim", "demo"}:
-        runtime = "simulation"
-    if runtime in {"rerun_sim", "replay-sim", "replay_sim"}:
-        runtime = "rerun-sim"
-    runtime_label = "Simulation dog" if runtime == "simulation" else "Real dog"
-    if runtime == "rerun-sim":
-        runtime_label = "Rerun sim"
-    if runtime == "offline":
-        runtime_label = "Offline artifact"
+    rerun_map_html = render_rerun_map_panel()
+    map_html = render_site_map(state, report)
+    route_data = build_route_data(state, report)
+    poi_data = build_poi_data(state, report)
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -89,175 +566,395 @@ def render_dashboard_html(
       justify-content: space-between;
       gap: 18px;
       align-items: end;
-      position: sticky;
-      top: 0;
-      z-index: 10;
     }}
     h1, h2 {{ margin: 0; }}
     h1 {{ font-size: 22px; font-weight: 700; letter-spacing: 0; }}
-    h2 {{ font-size: 15px; margin-bottom: 10px; }}
+    h2 {{ font-size: 15px; margin-bottom: 8px; }}
     main {{
       padding: 22px 28px 32px;
       display: grid;
-      grid-template-columns: minmax(0, 1fr);
+      grid-template-columns: minmax(360px, 1.05fr) minmax(320px, 0.95fr);
       gap: 16px;
-      max-width: 1680px;
-      margin: 0 auto;
+      align-items: start;
     }}
     section {{
       background: var(--panel);
       border: 1px solid var(--line);
       border-radius: 8px;
-      padding: 14px;
-      overflow-wrap: anywhere;
-      min-width: 0;
-    }}
-    .wide {{ grid-column: 1 / -1; }}
-    .status-strip {{
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      justify-content: flex-end;
-    }}
-    .status-pill {{
-      min-width: 92px;
-      border: 1px solid rgba(255, 255, 255, 0.20);
-      border-radius: 6px;
-      background: rgba(255, 255, 255, 0.08);
-      padding: 6px 8px;
-    }}
-    .status-pill span {{
-      display: block;
-      color: #cbd5e1;
-      font-size: 11px;
-      text-transform: uppercase;
-    }}
-    .status-pill strong {{
-      display: block;
-      color: #ffffff;
-      font-size: 15px;
-    }}
-    .operator-console {{
-      padding: 0;
-      overflow: hidden;
-    }}
-    .console-header {{
-      display: grid;
-      grid-template-columns: minmax(0, 1fr);
-      gap: 14px;
-      align-items: start;
-      border-bottom: 1px solid var(--line);
-      padding: 12px 14px;
-    }}
-    .console-header p {{
-      margin: 4px 0 0;
-      color: var(--muted);
-    }}
-    .console-grid {{
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) minmax(340px, 440px);
-      gap: 0;
-      align-items: stretch;
-    }}
-    .map-stage {{
-      min-width: 0;
-      border-right: 1px solid var(--line);
-      background: #070b12;
-    }}
-    .ops-panel {{
-      display: grid;
-      align-content: start;
-      gap: 12px;
-      padding: 14px;
-      min-width: 0;
-      background: #fbfcfd;
-      height: clamp(620px, 72vh, 760px);
-      overflow: auto;
-    }}
-    .panel-block {{
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: #ffffff;
       padding: 12px;
-      min-width: 0;
     }}
-    .panel-block h3 {{
-      margin: 0 0 8px;
-      font-size: 13px;
-      text-transform: uppercase;
-      color: var(--muted);
-    }}
-    .attention-list,
-    .change-list,
-    .route-stepper,
-    .reading-cards {{
-      display: grid;
-      gap: 8px;
-    }}
-    .attention-item,
-    .reading-card,
-    .route-step,
-    .change-item {{
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      background: #fbfcfd;
-      padding: 9px;
-      min-width: 0;
-    }}
-    .attention-item.open,
-    .reading-card.alert {{
-      border-color: #fecaca;
-      background: #fff7f7;
-    }}
-    .attention-item strong,
-    .reading-card strong,
-    .route-step strong {{
-      display: block;
-    }}
-    .reading-value {{
-      display: flex;
-      justify-content: space-between;
-      gap: 8px;
-      align-items: baseline;
-    }}
-    .secondary-grid {{
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-      gap: 16px;
-    }}
+    .ops-stack {{ display: grid; gap: 10px; }}
+    .wide {{ grid-column: 1 / -1; }}
     .metric-row {{
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+      grid-template-columns: repeat(5, minmax(120px, 1fr));
       gap: 10px;
     }}
+    .ops-stack .metric-row {{ grid-template-columns: repeat(4, minmax(0, 1fr)); }}
     .metric {{
       border: 1px solid var(--line);
       border-radius: 6px;
-      padding: 10px;
+      min-height: 66px;
+      padding: 8px 10px;
       background: #fbfcfd;
     }}
-    .metric strong {{ display: block; font-size: 20px; }}
+    .metric strong {{ display: block; font-size: 19px; }}
     .muted {{ color: var(--muted); }}
-    table {{ border-collapse: collapse; table-layout: fixed; width: 100%; }}
+    table {{ border-collapse: collapse; width: 100%; }}
     th, td {{ border-bottom: 1px solid var(--line); padding: 8px 6px; text-align: left; }}
-    td, th, li, p {{ overflow-wrap: anywhere; }}
     th {{ color: var(--muted); font-size: 12px; text-transform: uppercase; }}
-    .state-resolved, .state-verified_closed, .state-found_ok {{ color: var(--accent); font-weight: 700; }}
+    .state-resolved, .state-verified, .state-verified_closed, .state-found_ok {{ color: var(--accent); font-weight: 700; }}
     .state-open, .state-missing {{ color: var(--danger); font-weight: 700; }}
     .severity-P1 {{ color: var(--danger); font-weight: 700; }}
     .timeline {{ display: grid; gap: 8px; }}
     .timeline div {{ border-left: 3px solid var(--accent); padding-left: 10px; }}
+    .evidence-grid {{
+      display: grid;
+      gap: 12px;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    }}
+    .compact-list {{
+      display: grid;
+      gap: 8px;
+      list-style: none;
+      margin: 0;
+      padding: 0;
+    }}
+    .compact-list li {{
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fbfcfd;
+      padding: 8px 10px;
+    }}
+    .map-panel {{
+      background: #07090d;
+      border-color: #1d2430;
+      color: #d8dee9;
+      min-height: 675px;
+      overflow: hidden;
+    }}
+    .map-panel h2 {{ color: #eef2f8; }}
+    .map-shell {{ display: grid; gap: 10px; }}
+    .rerun-map-panel {{
+      background: #07090d;
+      border-color: #1d2430;
+      color: #d8dee9;
+      min-height: 520px;
+      overflow: hidden;
+    }}
+    .rerun-map-panel h2 {{ color: #eef2f8; }}
+    .rerun-map-viewer {{
+      background: #03060b;
+      border: 1px solid #1d2430;
+      border-radius: 8px;
+      display: grid;
+      grid-template-rows: minmax(420px, 62vh) auto;
+      overflow: hidden;
+      position: relative;
+    }}
+    .rerun-canvas {{
+      min-height: 420px;
+      position: relative;
+    }}
+    .rerun-canvas > * {{
+      height: 100%;
+      width: 100%;
+    }}
+    .viewer-offline {{
+      align-items: center;
+      background:
+        linear-gradient(135deg, rgba(82, 224, 196, 0.12), rgba(125, 211, 252, 0.08)),
+        repeating-linear-gradient(90deg, rgba(148, 163, 184, 0.08) 0 1px, transparent 1px 34px),
+        repeating-linear-gradient(0deg, rgba(148, 163, 184, 0.08) 0 1px, transparent 1px 34px),
+        #05070c;
+      display: none;
+      gap: 10px;
+      inset: 0;
+      justify-items: center;
+      padding: 18px;
+      position: absolute;
+      text-align: center;
+      z-index: 1;
+    }}
+    .viewer-offline:not([hidden]) {{ display: grid; }}
+    .viewer-offline strong {{ color: #eef2f8; font-size: 18px; }}
+    .viewer-offline span {{ color: #a9b4c4; }}
+    .rerun-viewer-toolbar {{
+      align-items: center;
+      border-top: 1px solid #1d2430;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      justify-content: flex-end;
+      padding: 10px;
+    }}
+    .rerun-status {{
+      color: #a9b4c4;
+      font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace;
+      margin-right: auto;
+      min-height: 16px;
+    }}
+    .rerun-status[data-state="ok"] {{ color: #52e0c4; }}
+    .rerun-status[data-state="error"] {{ color: #fca5a5; }}
+    .rerun-viewer-toolbar button, .rerun-viewer-toolbar a {{
+      border: 1px solid #334155;
+      border-radius: 6px;
+      background: #0d1119;
+      color: #e5edf5;
+      cursor: pointer;
+      font: inherit;
+      min-height: 34px;
+      padding: 6px 10px;
+      text-decoration: none;
+    }}
+    .rerun-viewer-toolbar button:hover, .rerun-viewer-toolbar a:hover {{ border-color: #52e0c4; }}
+    .site-map {{
+      aspect-ratio: 23 / 14;
+      background: #03060b;
+      border: 1px solid #1d2430;
+      border-radius: 8px;
+      display: block;
+      max-height: 580px;
+      min-height: 420px;
+      width: 100%;
+    }}
+    .map-bg {{ fill: #05070c; }}
+    .map-free-cell {{ fill: #484981; opacity: 0.42; }}
+    .map-cost-cell {{ fill: #171b2b; opacity: 0.72; }}
+    .map-grid {{ stroke: #18202c; stroke-width: 1; }}
+    .map-grid-major {{ stroke: #2f4058; stroke-width: 1.2; }}
+    .map-hatch-line {{ stroke: #f87171; stroke-width: 1; opacity: 0.35; }}
+    .map-point {{ fill: #7dd3fc; opacity: 0.46; }}
+    .map-point.hot {{ fill: #f0abfc; opacity: 0.62; }}
+    .map-live-cost-cell {{ opacity: 0.64; stroke: rgba(255, 255, 255, 0.08); stroke-width: 0.4; }}
+    .map-no-go {{
+      fill: rgba(127, 29, 29, 0.42);
+      stroke: #ef4444;
+      stroke-dasharray: 8 5;
+      stroke-width: 1.6;
+    }}
+    .map-no-go-hatch {{ fill: url(#dogops-map-hatch); opacity: 0.55; }}
+    .map-route {{
+      fill: none;
+      filter: url(#dogops-map-glow);
+      stroke: #52e0c4;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      stroke-width: 4;
+    }}
+    .map-route-stop {{ fill: #05070c; stroke: #52e0c4; stroke-width: 2; }}
+    .map-route-index {{
+      dominant-baseline: central;
+      fill: #d8fff6;
+      font-size: 11px;
+      font-weight: 700;
+      text-anchor: middle;
+    }}
+    .map-zone-anchor {{ fill: #05070c; stroke: #8b95a7; stroke-width: 1.5; }}
+    .map-zone-label {{
+      fill: #b9c4d5;
+      font-size: 11px;
+      font-weight: 650;
+      letter-spacing: 0.03em;
+      paint-order: stroke;
+      stroke: #05070c;
+      stroke-linejoin: round;
+      stroke-width: 4px;
+      text-anchor: middle;
+    }}
+    .map-zone-label, .map-asset-label, .map-package-label {{
+      fill: #e5edf5;
+      font-size: 11px;
+      paint-order: stroke;
+      stroke: #05070c;
+      stroke-width: 4px;
+      stroke-linejoin: round;
+    }}
+    .map-asset {{ fill: #c7f9ff; stroke: #22d3ee; stroke-width: 1.5; }}
+    .map-asset-label {{ fill: #d6fbff; }}
+    .map-tag-face {{ fill: #05070c; stroke: #d1d5db; stroke-width: 1.5; }}
+    .map-tag-core {{ fill: #d1d5db; }}
+    .map-package {{ fill: #f59e0b; stroke: #fef3c7; stroke-width: 1.2; }}
+    .map-package.state-found_ok {{ fill: #34d399; stroke: #bbf7d0; }}
+    .map-package.state-missing {{ fill: #7f1d1d; stroke: #f87171; stroke-dasharray: 4 3; }}
+    .map-package.state-wrong_zone, .map-package.state-blocking_asset {{
+      fill: #fb923c;
+      stroke: #fed7aa;
+    }}
+    .map-observation {{ fill: #05070c; stroke: #a78bfa; stroke-width: 2; }}
+    .map-observation-ray {{ stroke: #a78bfa; stroke-dasharray: 4 5; stroke-width: 1.2; }}
+    .map-incident {{ fill: none; filter: url(#dogops-map-glow); stroke: #fb7185; stroke-width: 2.4; }}
+    .map-incident-label {{
+      fill: #fecdd3;
+      font-size: 11px;
+      font-weight: 700;
+      paint-order: stroke;
+      stroke: #05070c;
+      stroke-linejoin: round;
+      stroke-width: 4px;
+    }}
+    .map-robot {{ fill: rgba(82, 224, 196, 0.12); stroke: #52e0c4; stroke-width: 1.5; }}
+    .map-robot-core {{ fill: #52e0c4; stroke: #d8fff6; stroke-width: 1.2; }}
+    .map-live-trace {{
+      fill: none;
+      filter: url(#dogops-map-glow);
+      stroke: #facc15;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      stroke-width: 3.5;
+    }}
+    .map-dimos-path {{
+      fill: none;
+      filter: url(#dogops-map-glow);
+      stroke: #38bdf8;
+      stroke-dasharray: 9 7;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      stroke-width: 3;
+    }}
+    .map-live-robot-halo {{ fill: rgba(250, 204, 21, 0.16); stroke: #facc15; stroke-width: 1.5; }}
+    .map-live-robot-core {{ fill: #facc15; stroke: #fff7cc; stroke-width: 1.2; }}
+    .map-dimos-target-ring {{ fill: rgba(56, 189, 248, 0.16); stroke: #38bdf8; stroke-width: 2; }}
+    .map-dimos-target-core {{ fill: #38bdf8; stroke: #e0f2fe; stroke-width: 1.2; }}
+    .map-go-to-ring {{ fill: rgba(248, 113, 113, 0.14); stroke: #f87171; stroke-width: 2; }}
+    .map-go-to-cross {{ stroke: #fecaca; stroke-linecap: round; stroke-width: 2; }}
+    .map-axis-label {{ fill: #657184; font-size: 10px; }}
+    .site-map.go-to-armed {{ cursor: crosshair; }}
+    .map-legend {{
+      color: #a9b4c4;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      font-size: 12px;
+    }}
+    .map-legend span {{ align-items: center; display: inline-flex; gap: 6px; }}
+    .map-legend i {{
+      border-radius: 999px;
+      display: inline-block;
+      height: 10px;
+      width: 10px;
+    }}
+    .legend-free {{ background: #484981; }}
+    .legend-heatmap {{ background: #f97316; }}
+    .legend-route {{ background: #52e0c4; }}
+    .legend-live {{ background: #facc15; }}
+    .legend-tag {{ background: #a78bfa; }}
+    .legend-no-go {{ background: #ef4444; }}
+    .legend-incident {{ background: #fb7185; }}
+    .map-workflow {{
+      align-items: center;
+      color: #a9b4c4;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      font-size: 12px;
+    }}
+    .map-workflow a {{
+      color: #bfdbfe;
+      font-weight: 700;
+      text-decoration: none;
+    }}
+    .map-workflow a:hover {{ text-decoration: underline; }}
+    .map-command-status {{
+      color: #fecaca;
+      font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace;
+    }}
+    .map-command-status.ok {{ color: #86efac; }}
+    .map-command-status.error {{ color: #fca5a5; }}
+    .map-layer-controls {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }}
+    .map-layer-controls button {{
+      background: #0d1119;
+      border: 1px solid #334155;
+      border-radius: 999px;
+      color: #d8dee9;
+      cursor: pointer;
+      font: inherit;
+      min-height: 30px;
+      padding: 5px 10px;
+    }}
+    .map-layer-controls button[aria-pressed="true"] {{
+      background: #123b36;
+      border-color: #52e0c4;
+      color: #d8fff6;
+      font-weight: 700;
+    }}
+    .map-live-status {{
+      color: #f7d75d;
+      font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace;
+      min-height: 18px;
+    }}
+    .scan-strip {{
+      color: #b8c4d4;
+      display: grid;
+      gap: 6px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      list-style: none;
+      margin: 0;
+      padding: 0;
+    }}
+    .scan-strip li {{
+      background: #0d1119;
+      border: 1px solid #1d2430;
+      border-radius: 6px;
+      min-height: 36px;
+      padding: 7px 9px;
+    }}
+    .scan-strip strong {{ color: #eef2f8; }}
+    .map-empty {{
+      align-items: center;
+      background: #101721;
+      border: 1px solid #263241;
+      border-radius: 8px;
+      color: #cbd5e1;
+      display: flex;
+      min-height: 420px;
+      justify-content: center;
+    }}
     .robot-controls {{
       display: grid;
       grid-template-columns: repeat(3, minmax(72px, 1fr));
-      gap: 8px;
-      max-width: 360px;
+      gap: 6px;
+    }}
+    .keyboard-map {{
+      color: var(--muted);
+      display: grid;
+      gap: 6px;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      margin-top: 8px;
+    }}
+    .keyboard-map span {{
+      align-items: center;
+      display: inline-flex;
+      gap: 6px;
+      min-width: 0;
+    }}
+    kbd {{
+      background: #eef2f7;
+      border: 1px solid #cfd6df;
+      border-bottom-color: #b8c0cc;
+      border-radius: 4px;
+      color: #17202a;
+      display: inline-block;
+      font: 11px/1.1 ui-monospace, SFMono-Regular, Menlo, monospace;
+      min-width: 22px;
+      padding: 3px 5px;
+      text-align: center;
     }}
     .posture-controls {{
       display: flex;
       flex-wrap: wrap;
       gap: 8px;
-      margin-bottom: 12px;
+      margin-bottom: 8px;
+    }}
+    .map-controls {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 8px;
     }}
     .posture-controls button {{
       border: 1px solid var(--line);
@@ -266,16 +963,34 @@ def render_dashboard_html(
       color: var(--ink);
       cursor: pointer;
       font: inherit;
-      min-height: 38px;
-      padding: 8px 12px;
+      min-height: 34px;
+      padding: 6px 10px;
+    }}
+    .map-controls button {{
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #f8fafc;
+      color: var(--ink);
+      cursor: pointer;
+      font: inherit;
+      min-height: 34px;
+      padding: 6px 10px;
     }}
     .posture-controls button:hover {{ border-color: var(--accent); }}
+    .map-controls button:hover {{ border-color: var(--accent); }}
+    .map-controls button[aria-pressed="true"] {{
+      background: #fef2f2;
+      border-color: var(--danger);
+      color: var(--danger);
+      font-weight: 700;
+    }}
     .posture-controls button:disabled {{ cursor: wait; opacity: 0.65; }}
+    .map-controls button:disabled {{ cursor: wait; opacity: 0.65; }}
     .motion-controls {{
       display: flex;
       flex-wrap: wrap;
       gap: 8px;
-      margin-bottom: 12px;
+      margin-bottom: 8px;
     }}
     .motion-controls button {{
       border: 1px solid var(--line);
@@ -301,8 +1016,8 @@ def render_dashboard_html(
       color: var(--ink);
       cursor: pointer;
       font: inherit;
-      min-height: 42px;
-      padding: 8px 10px;
+      min-height: 36px;
+      padding: 6px 10px;
     }}
     .robot-controls button:hover {{ border-color: var(--accent); }}
     .robot-controls button:disabled {{ cursor: wait; opacity: 0.65; }}
@@ -313,411 +1028,35 @@ def render_dashboard_html(
       font-weight: 700;
     }}
     .robot-status {{
-      min-height: 20px;
-      margin-top: 10px;
+      min-height: 18px;
+      margin-top: 8px;
       color: var(--muted);
     }}
     .robot-status.error {{ color: var(--danger); }}
     .robot-status.ok {{ color: var(--accent); }}
-    .map-workspace {{
-      display: grid;
-      grid-template-columns: minmax(0, 1.45fr) minmax(320px, 0.65fr);
-      gap: 14px;
-      align-items: start;
+    @media (max-width: 920px) {{
+      main {{ gap: 12px; padding: 16px 18px 24px; }}
+      section {{ padding: 10px; }}
+      .ops-stack {{ gap: 8px; }}
+      .map-panel {{ min-height: 0; }}
+      .rerun-map-panel {{ min-height: 0; }}
+      .rerun-map-viewer {{ grid-template-rows: minmax(320px, 48vh) auto; }}
+      .rerun-canvas {{ min-height: 320px; }}
+      .site-map {{ min-height: 320px; }}
+      .keyboard-map {{
+        font-size: 12px;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }}
     }}
-    .map-viewer {{
-      position: relative;
-      width: 100%;
-      height: clamp(620px, 72vh, 760px);
-      min-height: 0;
-      border: 1px solid #101827;
-      border-radius: 0;
-      background: #070b12;
-      overflow: hidden;
-    }}
-    .rerun-canvas,
-    .rerun-frame {{
-      width: 100%;
-      height: 100%;
-      display: block;
-      background: #070b12;
-    }}
-    .rerun-frame {{
-      border: 0;
-    }}
-    .rerun-canvas[hidden] {{ display: none; }}
-    .rerun-canvas canvas {{
-      width: 100%;
-      height: 100%;
-      display: block;
-    }}
-    .viewer-offline {{
-      position: absolute;
-      inset: 0;
-      display: grid;
-      align-items: stretch;
-      background: #070b12;
-    }}
-    .viewer-offline[hidden] {{ display: none; }}
-    .viewer-offline .map-viz {{
-      border: 0;
-      border-radius: 0;
-      min-height: 100%;
-    }}
-    .viewer-offline svg {{
-      width: 100%;
-      height: 100%;
-      display: block;
-    }}
-    .viewer-offline [data-map-target-id] {{
-      cursor: pointer;
-    }}
-    .viewer-offline .map-target-hit {{
-      pointer-events: all;
-    }}
-    .viewer-offline [data-map-target-id]:hover circle {{
-      stroke: #111827;
-      stroke-width: 3;
-    }}
-    .map-target-overlay {{
-      position: absolute;
-      inset: 0;
-      z-index: 2;
-      pointer-events: none;
-    }}
-    .map-target-overlay [data-map-target-id] {{
-      position: absolute;
-      width: 24px;
-      height: 24px;
-      transform: translate(-50%, -50%);
-      border: 2px solid rgba(248, 250, 252, 0.92);
-      border-radius: 50%;
-      background: rgba(15, 118, 110, 0.80);
-      box-shadow: 0 0 0 4px rgba(15, 118, 110, 0.16);
-      cursor: crosshair;
-      pointer-events: auto;
-    }}
-    .map-target-overlay [data-map-target-id]:hover,
-    .map-target-overlay [data-map-target-id]:focus-visible {{
-      outline: 0;
-      border-color: #5eead4;
-      box-shadow: 0 0 0 5px rgba(94, 234, 212, 0.25);
-    }}
-    .map-target-overlay [data-map-target-id].is-poi {{
-      background: rgba(180, 83, 9, 0.90);
-      box-shadow: 0 0 0 4px rgba(245, 158, 11, 0.18);
-    }}
-    .map-target-overlay [data-map-target-id].is-inspection {{
-      background: #0f766e;
-      border-color: #ffffff;
-      box-shadow: 0 0 0 6px rgba(94, 234, 212, 0.24);
-    }}
-    .map-target-overlay [data-map-target-id] em {{
-      position: absolute;
-      inset: -9px auto auto -9px;
-      display: grid;
-      place-items: center;
-      width: 18px;
-      height: 18px;
-      border-radius: 50%;
-      background: #f8fafc;
-      color: #0f766e;
-      font-size: 11px;
-      font-style: normal;
-      font-weight: 800;
-      line-height: 1;
-    }}
-    .map-target-overlay [data-map-target-id] span {{
-      position: absolute;
-      top: -6px;
-      left: 20px;
-      max-width: 122px;
-      border: 1px solid rgba(255, 255, 255, 0.24);
-      border-radius: 5px;
-      background: rgba(7, 11, 18, 0.82);
-      color: #f8fafc;
-      font-size: 11px;
-      font-weight: 700;
-      line-height: 1.1;
-      overflow: hidden;
-      padding: 3px 5px;
-      opacity: 0;
-      pointer-events: none;
-      transform: translateX(-4px);
-      transition: opacity 140ms ease, transform 140ms ease;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }}
-    .map-target-overlay [data-map-target-id]:hover span,
-    .map-target-overlay [data-map-target-id]:focus-visible span {{
-      opacity: 1;
-      transform: translateX(0);
-    }}
-    .map-toolbar {{
-      position: absolute;
-      z-index: 2;
-      top: 10px;
-      left: 10px;
-      right: 10px;
-      display: flex;
-      justify-content: space-between;
-      gap: 10px;
-      pointer-events: none;
-    }}
-    .viewer-chip,
-    .viewer-links a {{
-      display: inline-flex;
-      align-items: center;
-      min-height: 30px;
-      border: 1px solid rgba(255, 255, 255, 0.22);
-      border-radius: 6px;
-      background: rgba(7, 11, 18, 0.82);
-      color: #f8fafc;
-      font-size: 12px;
-      padding: 6px 9px;
-      text-decoration: none;
-      pointer-events: auto;
-    }}
-    .viewer-links {{
-      display: flex;
-      gap: 8px;
-    }}
-    .viewer-hint {{
-      position: absolute;
-      z-index: 2;
-      left: 10px;
-      right: 10px;
-      bottom: 10px;
-      display: flex;
-      justify-content: space-between;
-      gap: 10px;
-      color: #e5e7eb;
-      font-size: 12px;
-      pointer-events: none;
-    }}
-    .viewer-hint span {{
-      border: 1px solid rgba(255, 255, 255, 0.18);
-      border-radius: 6px;
-      background: rgba(7, 11, 18, 0.78);
-      padding: 6px 8px;
-      max-width: min(520px, 100%);
-    }}
-    .viewer-hint [data-state="ok"] {{ color: #5eead4; }}
-    .viewer-hint [data-state="error"] {{ color: #fecaca; }}
-    .map-route-overlay {{
-      position: absolute;
-      z-index: 3;
-      top: 50px;
-      left: 10px;
-      width: min(320px, calc(100% - 20px));
-      border: 1px solid rgba(255, 255, 255, 0.18);
-      border-radius: 8px;
-      background: rgba(7, 11, 18, 0.78);
-      color: #f8fafc;
-      padding: 8px;
-      backdrop-filter: blur(10px);
-    }}
-    .map-route-overlay label {{
-      display: block;
-      margin-bottom: 6px;
-      color: #cbd5e1;
-      font-size: 12px;
-    }}
-    .map-route-overlay .route-status {{
-      color: #cbd5e1;
-      margin-top: 4px;
-      font-size: 12px;
-    }}
-    .map-route-overlay .route-status.error {{ color: #fecaca; }}
-    .map-route-overlay .route-status.ok {{ color: #5eead4; }}
-    .map-click-modes {{
-      display: grid;
-      gap: 6px;
-      margin-top: 6px;
-    }}
-    .map-click-modes button[aria-pressed="true"] {{
-      background: #dff6f1;
-      border-color: #5eead4;
-      color: #0f766e;
-      font-weight: 700;
-    }}
-    .map-click-hint {{
-      margin-top: 6px;
-      min-height: 16px;
-      color: #cbd5e1;
-      font-size: 12px;
-    }}
-    .map-click-hint.error {{ color: #fecaca; }}
-    .map-click-hint.ok {{ color: #5eead4; }}
-    .robot-dock {{
-      position: absolute;
-      z-index: 3;
-      right: 10px;
-      bottom: 54px;
-      width: min(320px, calc(100% - 20px));
-      border: 1px solid rgba(255, 255, 255, 0.18);
-      border-radius: 8px;
-      background: rgba(7, 11, 18, 0.80);
-      color: #f8fafc;
-      padding: 8px;
-      backdrop-filter: blur(10px);
-    }}
-    .robot-dock-bar {{
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      gap: 10px;
-      align-items: center;
-    }}
-    .robot-dock strong {{
-      display: block;
-      font-size: 13px;
-    }}
-    .robot-mode {{
-      display: inline-flex;
-      align-items: center;
-      min-height: 22px;
-      border: 1px solid rgba(94, 234, 212, 0.26);
-      border-radius: 999px;
-      color: #5eead4;
-      font-size: 11px;
-      margin: 4px 0;
-      padding: 2px 7px;
-    }}
-    .robot-dock summary {{
-      cursor: pointer;
-      font-weight: 700;
-      margin: 8px 0;
-    }}
-    .robot-dock .robot-status {{
-      color: #cbd5e1;
-      display: block;
-      font-size: 12px;
-      min-height: 18px;
-    }}
-    .robot-dock .robot-status.error {{ color: #fecaca; }}
-    .robot-dock .robot-status.ok {{ color: #5eead4; }}
-    .robot-dock .hard-stop {{
-      background: var(--danger);
-      border-color: var(--danger);
-      color: #ffffff;
-      font-weight: 700;
-      min-width: 92px;
-    }}
-    .sim-motion-note {{
-      border-top: 1px solid rgba(255, 255, 255, 0.16);
-      color: #cbd5e1;
-      font-size: 12px;
-      margin-top: 8px;
-      padding-top: 8px;
-    }}
-    .offline-snapshot {{
-      margin-top: 10px;
-      color: var(--muted);
-    }}
-    .offline-snapshot summary {{
-      cursor: pointer;
-      margin-bottom: 8px;
-    }}
-    .map-viz {{
-      width: 100%;
-      min-height: 300px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: #f8fafc;
-      overflow: hidden;
-    }}
-    .mission-map-panel {{
-      border-top: 1px solid var(--line);
-      background: #ffffff;
-      padding: 12px;
-    }}
-    .mission-map-panel h3 {{
-      margin: 0 0 4px;
-      font-size: 14px;
-    }}
-    .mission-map-panel p {{
-      margin: 0 0 10px;
-      color: var(--muted);
-      font-size: 12px;
-    }}
-    .mission-map-panel .map-viz {{
-      min-height: 360px;
-    }}
-    .route-tools {{
-      display: grid;
-      gap: 10px;
-      min-width: 0;
-    }}
-    .route-controls {{
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 8px;
-    }}
-    .route-controls select,
-    .route-controls button {{
-      min-height: 38px;
-      min-width: 0;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      background: #ffffff;
-      color: var(--ink);
-      font: inherit;
-      padding: 8px 10px;
-    }}
-    .map-route-overlay .route-controls select,
-    .map-route-overlay .route-controls button {{
-      min-height: 30px;
-      padding: 5px 8px;
-      font-size: 13px;
-    }}
-    .map-route-overlay .route-controls button,
-    .robot-dock button {{
-      background: rgba(255, 255, 255, 0.94);
-    }}
-    .route-controls select {{ grid-column: 1 / -1; width: 100%; }}
-    .route-controls button {{ cursor: pointer; }}
-    .route-controls button:hover {{ border-color: var(--accent); }}
-    .route-status {{ min-height: 20px; color: var(--muted); }}
-    .route-status.error {{ color: var(--danger); }}
-    .route-status.ok {{ color: var(--accent); }}
-    .evidence-grid {{
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-      gap: 10px;
-    }}
-    .evidence-item {{
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 10px;
-      background: #fbfcfd;
-    }}
-    .evidence-item img {{
-      width: 100%;
-      aspect-ratio: 16 / 9;
-      object-fit: cover;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      background: #e5e7eb;
-    }}
-    @media (max-width: 900px) {{
+    @media (max-width: 720px) {{
       header {{ align-items: start; flex-direction: column; }}
       main {{ grid-template-columns: 1fr; padding: 14px; }}
-      .console-header {{ grid-template-columns: 1fr; }}
-      .console-grid {{ grid-template-columns: 1fr; }}
-      .map-stage {{ border-right: 0; border-bottom: 1px solid var(--line); }}
-      .secondary-grid {{ grid-template-columns: 1fr; }}
       .metric-row {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
-      .map-workspace {{ grid-template-columns: 1fr; }}
-      .ops-panel {{ height: auto; max-height: none; }}
-      .map-viewer, .rerun-canvas, .rerun-frame {{ min-height: 420px; height: 420px; }}
-      .viewer-hint {{ flex-direction: column; }}
-      .map-route-overlay,
-      .robot-dock {{
-        position: static;
-        width: auto;
-        margin: 10px;
-      }}
-      .route-controls {{ grid-template-columns: 1fr; }}
+      .evidence-grid {{ grid-template-columns: 1fr; }}
+      .rerun-viewer-toolbar {{ justify-content: start; }}
+      .rerun-status {{ flex-basis: 100%; }}
+      .site-map {{ min-height: 330px; }}
+      .scan-strip {{ grid-template-columns: 1fr; }}
     }}
   </style>
 </head>
@@ -727,53 +1066,88 @@ def render_dashboard_html(
       <h1>DogOps SiteOps Agent</h1>
       <div class="muted">Mission {escape(str(run["mission_id"]))} / run {escape(str(run["id"]))}</div>
     </div>
-    <div class="status-strip">
-      {status_pill("Run", humanize(run["state"]))}
-      {status_pill("Mode", runtime_label)}
-      {status_pill("Packages", packages_metric)}
-      {status_pill("Map", f"{escape(str(site_map.get('status', 'empty')))} / {coverage_metric}")}
-      {status_pill("Open Issues", len(open_incidents))}
-      {status_pill("Readings", f"{len(sensor_readings) - len(reading_alerts)}/{len(sensor_readings) or 1} normal")}
-      {status_pill("Route", route_status_metric)}
-    </div>
+    <div>State: <strong>{escape(str(run["state"]))}</strong></div>
   </header>
   <main>
-    <section class="operator-console wide">
-      <div class="console-header">
-        <div>
-          <h2>Live Inspection Console</h2>
-          <p>Track machine readings, floor changes, route progress, and the live DimOS/Rerun map in one operator view.</p>
-        </div>
-      </div>
-      <div class="console-grid">
-        <div class="map-stage">
-          {map_viewer_panel(site_map, route_plan, target_options, runtime_label=runtime_label, runtime=runtime)}
-        </div>
-        <aside class="ops-panel" aria-label="Inspection status">
-          <div class="panel-block">
-            <h3>Needs Attention</h3>
-            {attention_list(open_incidents)}
-          </div>
-          <div class="panel-block">
-            <h3>Machine Readings</h3>
-            {reading_cards(sensor_readings)}
-          </div>
-          <div class="panel-block">
-            <h3>Floor Changes</h3>
-            {change_list(what_changed)}
-          </div>
-          <div class="panel-block">
-            <h3>Route</h3>
-            {inspection_stepper(route_plan)}
-          </div>
-        </aside>
-      </div>
+    <section class="rerun-map-panel wide">
+      <h2>Rerun Map</h2>
+      {rerun_map_html}
     </section>
-    <section class="wide">
-      <h2>Inspection Evidence</h2>
-      {capture_grid(poi_captures)}
-      {reading_table(sensor_readings)}
+    <section class="map-panel">
+      <h2>Mission Map</h2>
+      {map_html}
     </section>
+    <div class="ops-stack">
+      <section>
+        <h2>Run Summary</h2>
+        <div class="metric-row">
+          {metric("Packages", packages_metric)}
+          {metric("Exceptions", report["manifest_exceptions"])}
+          {metric("Incidents", report["incidents_opened"])}
+          {metric("Verified WOs", report["work_orders_verified_closed"])}
+          {metric("Nav", nav_metric)}
+          {metric("Tag Sign-In", checkpoint_metric)}
+          {metric("Coverage", route_coverage_metric)}
+        </div>
+      </section>
+      <section>
+        <h2>Robot Control</h2>
+        <div class="posture-controls" data-posture-controls>
+          <button type="button" data-posture="wake">Wake / Stand</button>
+          <button type="button" data-posture="balance">Balance</button>
+          <button type="button" data-posture="sleep">Sleep</button>
+        </div>
+        <div class="map-controls" data-map-controls>
+          <button type="button" data-map-action="start">Start Live Map</button>
+          <button type="button" data-map-action="origin">Set Map Origin</button>
+          <button type="button" data-map-action="arm_go_to" aria-pressed="false">Arm Go To</button>
+        </div>
+        <div class="motion-controls" data-motion-controls>
+          <button type="button" data-motion="nudge" aria-pressed="true">Nudge</button>
+          <button type="button" data-motion="step" aria-pressed="false">Step</button>
+          <button type="button" data-motion="walk" aria-pressed="false">Walk</button>
+        </div>
+        <div class="robot-controls" data-robot-controls>
+          <span></span>
+          <button type="button" data-command="forward" data-key-hint="W / Up">Forward</button>
+          <span></span>
+          <button type="button" data-command="left" data-key-hint="A / Left">Left</button>
+          <button type="button" class="hard-stop" data-command="hard_stop" data-key-hint="Space / Esc">HARD STOP</button>
+          <button type="button" data-command="right" data-key-hint="D / Right">Right</button>
+          <button type="button" data-command="yaw_left" data-key-hint="Q">Yaw L</button>
+          <button type="button" data-command="backward" data-key-hint="S / Down">Back</button>
+          <button type="button" data-command="yaw_right" data-key-hint="E">Yaw R</button>
+        </div>
+        <div class="keyboard-map" data-keyboard-map aria-label="Keyboard controls">
+          <span><kbd>W</kbd><kbd>Up</kbd>Forward</span>
+          <span><kbd>S</kbd><kbd>Down</kbd>Back</span>
+          <span><kbd>A</kbd><kbd>Left</kbd>Left</span>
+          <span><kbd>D</kbd><kbd>Right</kbd>Right</span>
+          <span><kbd>Q</kbd>Yaw L</span>
+          <span><kbd>E</kbd>Yaw R</span>
+          <span><kbd>Space</kbd><kbd>Esc</kbd>Hard stop</span>
+        </div>
+        <div class="robot-status" data-robot-status>Idle</div>
+      </section>
+      <section>
+        <h2>Checkpoint Sign-In</h2>
+        {checkpoint_table(checkpoints)}
+      </section>
+      <section>
+        <h2>Mission Timeline</h2>
+        <div class="timeline">
+          <div>Inbound scan completed</div>
+          <div>COOLING_1 inspected</div>
+          <div>INC-001 / WO-001 opened</div>
+          <div>Human remediation simulated</div>
+          <div>Verification completed</div>
+        </div>
+      </section>
+      <section>
+        <h2>What Changed</h2>
+        <ul>{''.join(f"<li>{escape(str(item))}</li>" for item in what_changed)}</ul>
+      </section>
+    </div>
     <section class="wide">
       <h2>Package Reconciliation</h2>
       {package_table(packages)}
@@ -797,74 +1171,354 @@ def render_dashboard_html(
         {metric("Mean Target Time", mean_target_time_metric)}
       </div>
     </section>
+    <section class="wide">
+      <h2>Route / POI Evidence</h2>
+      <div class="evidence-grid">
+        <div>
+          <h2>Route Stops</h2>
+          {route_table(route_data["stops"])}
+        </div>
+        <div>
+          <h2>POI Evidence</h2>
+          {poi_list(poi_data)}
+        </div>
+      </div>
+    </section>
   </main>
+  <script type="module">
+    import {{
+      focusDogOpsRerunMap,
+      mountDogOpsRerunViewers,
+      replayDogOpsRerunMap,
+    }} from "/assets/rerun-web-viewer.js";
+
+    const rerunReady = mountDogOpsRerunViewers();
+    document.querySelectorAll("[data-rerun-action]").forEach((button) => {{
+      button.addEventListener("click", async () => {{
+        const root = button.closest("[data-map-viewer]");
+        if (!root) return;
+        await rerunReady;
+        if (button.getAttribute("data-rerun-action") === "replay") {{
+          await replayDogOpsRerunMap(root);
+        }} else {{
+          await focusDogOpsRerunMap(root);
+        }}
+      }});
+    }});
+  </script>
   <script>
     (() => {{
-      const dogopsRuntimeMode = {json.dumps(runtime)};
       const controls = document.querySelector("[data-robot-controls]");
       const postureControls = document.querySelector("[data-posture-controls]");
       const motionControls = document.querySelector("[data-motion-controls]");
+      const mapControls = document.querySelector("[data-map-controls]");
+      const layerControls = document.querySelector("[data-map-layer-controls]");
+      const liveMapSvg = document.querySelector("[data-live-map-svg]");
+      const liveMapStatus = document.querySelector("[data-live-map-status]");
+      const mapCommandStatus = document.querySelector("[data-map-command-status]");
+      const liveHeatmap = liveMapSvg ? liveMapSvg.querySelector("[data-live-heatmap]") : null;
+      const livePath = liveMapSvg ? liveMapSvg.querySelector("[data-live-path]") : null;
+      const liveTrace = liveMapSvg ? liveMapSvg.querySelector("[data-live-trace]") : null;
+      const liveRobot = liveMapSvg ? liveMapSvg.querySelector("[data-live-robot]") : null;
+      const liveTarget = liveMapSvg ? liveMapSvg.querySelector("[data-live-target]") : null;
+      const goToMarker = liveMapSvg ? liveMapSvg.querySelector("[data-go-to-marker]") : null;
       const status = document.querySelector("[data-robot-status]");
-      const routeControls = document.querySelector("[data-route-controls]");
-      const routeStatus = document.querySelector("[data-route-status]");
-      const mapViewer = document.querySelector("[data-map-viewer]");
-      if (mapViewer) {{
-        const canvasHost = mapViewer.querySelector("[data-rerun-canvas]");
-        const offline = mapViewer.querySelector("[data-viewer-offline]");
-        const statusText = mapViewer.querySelector("[data-rerun-status]");
-        const frameHost = mapViewer.querySelector("[data-rerun-frame]");
-        const showFallback = (message) => {{
-          if (canvasHost) canvasHost.hidden = true;
-          if (frameHost) frameHost.hidden = true;
-          if (offline) offline.hidden = false;
-          if (statusText) {{
-            statusText.textContent = message;
-            statusText.dataset.state = "error";
-          }}
-        }};
-        if (dogopsRuntimeMode === "offline") {{
-          if (canvasHost) canvasHost.hidden = true;
-          if (frameHost) frameHost.hidden = true;
-          if (offline) offline.hidden = false;
-          if (statusText) {{
-            statusText.textContent = "Offline map artifact.";
-            statusText.dataset.state = "ok";
-          }}
-        }} else
-        if (frameHost) {{
-          if (offline) offline.hidden = true;
-          if (statusText) {{
-            statusText.textContent = "Native DimOS Rerun viewer embedded.";
-            statusText.dataset.state = "ok";
-          }}
-        }} else {{
-        const moduleUrl = mapViewer.getAttribute("data-rerun-module-url");
-        if (moduleUrl) {{
-          import(moduleUrl).then((module) => {{
-            if (!module.mountDogOpsRerunViewer) {{
-              throw new Error("missing WebViewer mount");
-            }}
-            window.DogOpsRerunModule = module;
-            return module.mountDogOpsRerunViewer(mapViewer);
-          }}).catch((error) => {{
-            console.warn("DogOps Rerun WebViewer unavailable", error);
-            showFallback("Rerun WebViewer unavailable; showing offline map artifact.");
-          }});
-        }} else {{
-          showFallback("Rerun WebViewer module is not configured.");
-        }}
-        }}
-      }}
       if (!controls || !status) return;
       let motionProfile = "nudge";
+      let robotBusy = false;
+      let liveMapPolling = false;
+      let dimosMapPolling = false;
+      let dimosRobotPoseActive = false;
+      let goToArmed = false;
+      let liveMapBounds = null;
+      let liveOverlayBounds = null;
+      try {{
+        liveMapBounds = liveMapSvg ? JSON.parse(liveMapSvg.dataset.mapBounds || "{{}}") : null;
+      }} catch (_) {{
+        liveMapBounds = null;
+      }}
+      liveOverlayBounds = liveMapBounds;
+      const liveMapSize = {{width: {MAP_WIDTH}, height: {MAP_HEIGHT}}};
+      const motionLabels = {{
+        nudge: "Nudge",
+        step: "Step",
+        walk: "Walk",
+      }};
       const robotControlToken = {json.dumps(robot_control_token)};
-      const buttons = Array.from(document.querySelectorAll("[data-command], [data-posture], [data-motion]"));
-      const setBusy = (busy) => buttons.forEach((button) => {{ button.disabled = busy; }});
+      const keyboardCommands = new Map([
+        ["KeyW", "forward"],
+        ["ArrowUp", "forward"],
+        ["KeyS", "backward"],
+        ["ArrowDown", "backward"],
+        ["KeyA", "left"],
+        ["ArrowLeft", "left"],
+        ["KeyD", "right"],
+        ["ArrowRight", "right"],
+        ["KeyQ", "yaw_left"],
+        ["KeyE", "yaw_right"],
+        ["Space", "hard_stop"],
+        ["Escape", "hard_stop"],
+      ]);
+      const buttons = Array.from(document.querySelectorAll("[data-command], [data-posture], [data-motion], [data-map-action]"));
+      const setBusy = (busy) => buttons.forEach((button) => {{
+        button.disabled = busy && button.getAttribute("data-command") !== "hard_stop";
+      }});
       const setStatus = (text, state) => {{
         status.textContent = text;
         status.className = `robot-status ${{state || ""}}`;
       }};
+      const setMapCommandStatus = (text, state) => {{
+        if (!mapCommandStatus) return;
+        mapCommandStatus.textContent = text;
+        mapCommandStatus.className = `map-command-status ${{state || ""}}`;
+      }};
+      const projectPoseWithBounds = (pose, bounds) => {{
+        if (!bounds || !pose) return null;
+        const spanX = Math.max(0.1, bounds.x_max - bounds.x_min);
+        const spanY = Math.max(0.1, bounds.y_max - bounds.y_min);
+        return {{
+          x: ((pose.x - bounds.x_min) / spanX) * liveMapSize.width,
+          y: liveMapSize.height - (((pose.y - bounds.y_min) / spanY) * liveMapSize.height),
+        }};
+      }};
+      const projectLivePose = (pose) => projectPoseWithBounds(pose, liveMapBounds);
+      const projectLiveOverlayPose = (pose) => projectPoseWithBounds(pose, liveOverlayBounds);
+      const projectWorldPoint = (x, y) => projectLivePose({{x, y}});
+      const projectLiveOverlayPoint = (x, y) => projectLiveOverlayPose({{x, y}});
+      const worldFromSvgEvent = (event) => {{
+        if (!liveMapSvg || !liveMapBounds) return null;
+        const matrix = liveMapSvg.getScreenCTM();
+        if (!matrix) return null;
+        const point = liveMapSvg.createSVGPoint();
+        point.x = event.clientX;
+        point.y = event.clientY;
+        const svgPoint = point.matrixTransform(matrix.inverse());
+        const spanX = Math.max(0.1, liveMapBounds.x_max - liveMapBounds.x_min);
+        const spanY = Math.max(0.1, liveMapBounds.y_max - liveMapBounds.y_min);
+        return {{
+          x: liveMapBounds.x_min + (svgPoint.x / liveMapSize.width) * spanX,
+          y: liveMapBounds.y_min + ((liveMapSize.height - svgPoint.y) / liveMapSize.height) * spanY,
+        }};
+      }};
+      const setGoToArmed = (armed) => {{
+        goToArmed = armed;
+        if (liveMapSvg) liveMapSvg.classList.toggle("go-to-armed", armed);
+        if (mapControls) {{
+          const button = mapControls.querySelector('[data-map-action="arm_go_to"]');
+          if (button) button.setAttribute("aria-pressed", armed ? "true" : "false");
+        }}
+        setMapCommandStatus(armed ? "Map Go To armed" : "Map command idle", armed ? "ok" : "");
+      }};
+      const setGoToMarker = (target) => {{
+        if (!goToMarker || !target) return;
+        const projected = projectWorldPoint(target.x, target.y);
+        if (!projected) return;
+        goToMarker.style.display = "";
+        goToMarker.setAttribute(
+          "transform",
+          `translate(${{projected.x.toFixed(1)}} ${{projected.y.toFixed(1)}})`
+        );
+      }};
+      const setLiveMapUnavailable = (text, keepRobot = false) => {{
+        if (liveMapStatus) liveMapStatus.textContent = text;
+        if (liveRobot && !keepRobot) liveRobot.style.display = "none";
+      }};
+      const heatColor = (cost) => {{
+        if (cost >= 0.75) return "#dc2626";
+        if (cost >= 0.5) return "#f97316";
+        if (cost >= 0.28) return "#eab308";
+        return "#22c55e";
+      }};
+      const renderLiveHeatmap = (costmap) => {{
+        if (!liveHeatmap) return 0;
+        liveHeatmap.textContent = "";
+        const cells = costmap && Array.isArray(costmap.cells) ? costmap.cells : [];
+        let rendered = 0;
+        for (const cell of cells) {{
+          const cost = Math.max(0, Math.min(1, Number(cell.cost || 0)));
+          if (cost < 0.12) continue;
+          const p1 = projectLiveOverlayPoint(Number(cell.x), Number(cell.y));
+          const p2 = projectLiveOverlayPoint(Number(cell.x) + Number(cell.width || 0), Number(cell.y) + Number(cell.height || 0));
+          if (!p1 || !p2) continue;
+          const rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+          rect.setAttribute("class", "map-live-cost-cell");
+          rect.setAttribute("x", Math.min(p1.x, p2.x).toFixed(1));
+          rect.setAttribute("y", Math.min(p1.y, p2.y).toFixed(1));
+          rect.setAttribute("width", Math.abs(p2.x - p1.x).toFixed(1));
+          rect.setAttribute("height", Math.abs(p2.y - p1.y).toFixed(1));
+          rect.setAttribute("fill", heatColor(cost));
+          rect.setAttribute("opacity", (0.18 + cost * 0.55).toFixed(2));
+          liveHeatmap.appendChild(rect);
+          rendered += 1;
+        }}
+        return rendered;
+      }};
+      const renderDimOSPath = (path) => {{
+        if (!livePath) return 0;
+        const points = Array.isArray(path) ? path : [];
+        const projected = points
+          .map((point) => projectLiveOverlayPoint(point.x, point.y))
+          .filter(Boolean)
+          .map((point) => `${{point.x.toFixed(1)}},${{point.y.toFixed(1)}}`);
+        livePath.setAttribute("points", projected.join(" "));
+        return projected.length;
+      }};
+      const renderDimOSTarget = (target) => {{
+        if (!liveTarget) return;
+        const projected = target ? projectLiveOverlayPoint(target.x, target.y) : null;
+        if (!projected) {{
+          liveTarget.style.display = "none";
+          return;
+        }}
+        liveTarget.style.display = "";
+        liveTarget.setAttribute(
+          "transform",
+          `translate(${{projected.x.toFixed(1)}} ${{projected.y.toFixed(1)}})`
+        );
+      }};
+      const updateDimOSMapLayers = (data) => {{
+        const live = data && data.live ? data.live : null;
+        if (!live) return;
+        if (data.bounds) liveOverlayBounds = data.bounds;
+        const heatmapCells = renderLiveHeatmap(live.costmap);
+        const pathPoints = renderDimOSPath(live.path || live.route || []);
+        renderDimOSTarget(live.target);
+        dimosRobotPoseActive = Boolean(live.robot_pose);
+        if (live.robot_pose) {{
+          const yawRad = Number.isFinite(live.robot_pose.theta_deg)
+            ? live.robot_pose.theta_deg * Math.PI / 180
+            : 0;
+          updateLiveMap(
+            {{ok: true, pose: {{x: live.robot_pose.x, y: live.robot_pose.y, yaw_rad: yawRad}}, trajectory: [], ts: Date.now() / 1000}},
+            liveOverlayBounds
+          );
+        }}
+        if (liveMapStatus) {{
+          if (live.ok) {{
+            liveMapStatus.textContent = `Live DimOS: heatmap=${{heatmapCells}} path=${{pathPoints}} source=${{live.source || "LCM topics"}}`;
+          }} else if (!liveMapStatus.textContent.startsWith("Live odom: x=")) {{
+            liveMapStatus.textContent = `Live DimOS: waiting for topics${{live.error ? ` (${{live.error}})` : ""}}`;
+          }}
+        }}
+      }};
+      const updateLiveMap = (data, bounds = liveMapBounds) => {{
+        if (!liveMapSvg || !liveTrace || !liveRobot || !liveMapStatus) return;
+        if (!data || !data.ok || !data.pose) {{
+          if (dimosRobotPoseActive) return;
+          const error = data && data.error ? data.error : "offline";
+          setLiveMapUnavailable(`Live odom: ${{error}}`);
+          return;
+        }}
+        const trajectory = Array.isArray(data.trajectory) ? data.trajectory : [];
+        const points = trajectory
+          .map((pose) => projectPoseWithBounds(pose, bounds))
+          .filter(Boolean)
+          .map((point) => `${{point.x.toFixed(1)}},${{point.y.toFixed(1)}}`);
+        liveTrace.setAttribute("points", points.join(" "));
+        const projected = projectPoseWithBounds(data.pose, bounds);
+        if (!projected) {{
+          if (!dimosRobotPoseActive) setLiveMapUnavailable("Live odom: map projection unavailable");
+          return;
+        }}
+        const yawDeg = (data.pose.yaw_rad || 0) * 180 / Math.PI;
+        liveRobot.style.display = "";
+        liveRobot.setAttribute(
+          "transform",
+          `translate(${{projected.x.toFixed(1)}} ${{projected.y.toFixed(1)}}) rotate(${{(-yawDeg).toFixed(1)}})`
+        );
+        const ageS = Math.max(0, Date.now() / 1000 - (data.ts || 0));
+        liveMapStatus.textContent = `Live odom: x=${{data.pose.x.toFixed(2)}}m y=${{data.pose.y.toFixed(2)}}m yaw=${{yawDeg.toFixed(0)}}deg age=${{ageS.toFixed(1)}}s`;
+      }};
+      const refreshLiveMap = async () => {{
+        if (liveMapPolling || !liveMapSvg) return;
+        liveMapPolling = true;
+        const controller = new AbortController();
+        const timeout = window.setTimeout(() => controller.abort(), 1500);
+        try {{
+          const response = await fetch("/api/robot/pose", {{
+            cache: "no-store",
+            signal: controller.signal,
+          }});
+          const result = await response.json();
+          updateLiveMap(result);
+        }} catch (error) {{
+          if (!dimosRobotPoseActive) setLiveMapUnavailable(`Live odom: ${{error.message}}`);
+        }} finally {{
+          window.clearTimeout(timeout);
+          liveMapPolling = false;
+        }}
+      }};
+      const refreshDimOSMap = async () => {{
+        if (dimosMapPolling || !liveMapSvg) return;
+        dimosMapPolling = true;
+        const controller = new AbortController();
+        const timeout = window.setTimeout(() => controller.abort(), 1800);
+        try {{
+          const response = await fetch("/api/map", {{
+            cache: "no-store",
+            signal: controller.signal,
+          }});
+          const result = await response.json();
+          updateDimOSMapLayers(result);
+        }} catch (error) {{
+          if (liveMapStatus && !liveMapStatus.textContent.startsWith("Live odom: x=")) {{
+            liveMapStatus.textContent = `Live DimOS: ${{error.message}}`;
+          }}
+        }} finally {{
+          window.clearTimeout(timeout);
+          dimosMapPolling = false;
+        }}
+      }};
+      const shouldIgnoreKeyboardEvent = (event) => {{
+        if (event.defaultPrevented || event.repeat) return true;
+        if (event.metaKey || event.ctrlKey || event.altKey) return true;
+        const target = event.target;
+        if (!target) return false;
+        const tagName = target.tagName ? target.tagName.toLowerCase() : "";
+        return (
+          target.isContentEditable ||
+          tagName === "input" ||
+          tagName === "textarea" ||
+          tagName === "select" ||
+          tagName === "button"
+        );
+      }};
+      const motionTextForCommand = (command) => (result) => {{
+        if (command === "hard_stop") return "Hard stop sent";
+        const profile = motionLabels[result.profile] || motionLabels[motionProfile] || motionProfile;
+        if (!result.observed) return `Sent ${{profile}} ${{command}}`;
+        const distanceCm = Math.round((result.observed_distance_m || 0) * 1000) / 10;
+        const yawDeg = Math.round(Math.abs(result.observed_dyaw_rad || 0) * 1800 / Math.PI) / 10;
+        if (distanceCm >= 0.5) return `Sent ${{profile}} ${{command}} / observed ${{distanceCm}} cm`;
+        if (yawDeg >= 0.5) return `Sent ${{profile}} ${{command}} / observed ${{yawDeg}} deg`;
+        return `Sent ${{profile}} ${{command}} / no clear odom movement`;
+      }};
+      const sendJogCommand = async (command, source = "button") => {{
+        if (robotBusy && command !== "hard_stop") return;
+        await sendRobotAction(
+          "/api/robot/jog",
+          {{command, profile: motionProfile, source}},
+          motionTextForCommand(command)
+        );
+        await refreshLiveMap();
+      }};
+      const sendGoToTarget = async (target) => {{
+        if (!target || robotBusy) return;
+        setGoToMarker(target);
+        setMapCommandStatus(`Sending Go To x=${{target.x.toFixed(2)}} y=${{target.y.toFixed(2)}}...`, "");
+        const result = await sendRobotAction(
+          "/api/robot/go_to",
+          {{command: "go_to", x: target.x, y: target.y, source: "map_click"}},
+          () => `Go To sent x=${{target.x.toFixed(2)}} y=${{target.y.toFixed(2)}}`
+        );
+        setMapCommandStatus(
+          result ? `Go To sent x=${{target.x.toFixed(2)}} y=${{target.y.toFixed(2)}}` : "Go To failed",
+          result ? "ok" : "error"
+        );
+        await refreshLiveMap();
+      }};
       const sendRobotAction = async (url, body, successText) => {{
+        robotBusy = true;
         setBusy(true);
         setStatus(`Sending ${{body.command}}...`, "");
         try {{
@@ -880,9 +1534,12 @@ def render_dashboard_html(
             throw new Error(result.error || "command_failed");
           }}
           setStatus(successText(result), "ok");
+          return result;
         }} catch (error) {{
           setStatus(`Robot command failed: ${{error.message}}`, "error");
+          return null;
         }} finally {{
+          robotBusy = false;
           setBusy(false);
         }}
       }};
@@ -890,20 +1547,28 @@ def render_dashboard_html(
         const button = event.target.closest("button[data-command]");
         if (!button) return;
         const command = button.getAttribute("data-command");
-        const motionText = (result) => {{
-          if (command === "hard_stop") return "Hard stop sent";
-          if (!result.observed) return `Sent ${{command}}`;
-          const distanceCm = Math.round((result.observed_distance_m || 0) * 1000) / 10;
-          const yawDeg = Math.round(Math.abs(result.observed_dyaw_rad || 0) * 1800 / Math.PI) / 10;
-          if (distanceCm >= 0.5) return `Sent ${{command}} / observed ${{distanceCm}} cm`;
-          if (yawDeg >= 0.5) return `Sent ${{command}} / observed ${{yawDeg}} deg`;
-          return `Sent ${{command}} / no clear odom movement`;
-        }};
-        await sendRobotAction(
-          "/api/robot/jog",
-          {{command, profile: motionProfile}},
-          motionText
-        );
+        button.blur();
+        await sendJogCommand(command);
+      }});
+      if (liveMapSvg) {{
+        liveMapSvg.addEventListener("click", async (event) => {{
+          if (!goToArmed) return;
+          event.preventDefault();
+          const target = worldFromSvgEvent(event);
+          setGoToArmed(false);
+          if (!target) {{
+            setMapCommandStatus("Go To target unavailable", "error");
+            return;
+          }}
+          await sendGoToTarget(target);
+        }});
+      }}
+      window.addEventListener("keydown", async (event) => {{
+        if (shouldIgnoreKeyboardEvent(event)) return;
+        const command = keyboardCommands.get(event.code);
+        if (!command) return;
+        event.preventDefault();
+        await sendJogCommand(command, "keyboard");
       }});
       if (motionControls) {{
         motionControls.addEventListener("click", (event) => {{
@@ -913,6 +1578,8 @@ def render_dashboard_html(
           motionControls.querySelectorAll("[data-motion]").forEach((item) => {{
             item.setAttribute("aria-pressed", item === button ? "true" : "false");
           }});
+          setStatus(`Motion: ${{motionLabels[motionProfile] || motionProfile}}`, "ok");
+          button.blur();
         }});
       }}
       if (postureControls) {{
@@ -920,174 +1587,453 @@ def render_dashboard_html(
           const button = event.target.closest("button[data-posture]");
           if (!button) return;
           const command = button.getAttribute("data-posture");
+          button.blur();
           await sendRobotAction(
             "/api/robot/posture",
             {{command}},
             () => command === "wake" ? "Wake / stand complete" : `Sent ${{command}}`
           );
+          await refreshLiveMap();
         }});
       }}
-      if (routeControls && routeStatus) {{
-        let mapClickMode = "";
-        const mapClickModeStorageKey = "dogops:map-click-mode";
-        const select = routeControls.querySelector("[data-route-target]");
-        const clickModeButtons = Array.from(routeControls.parentElement.querySelectorAll("[data-map-click-mode]"));
-        const mapClickStatus = document.querySelector("[data-map-click-status]");
-        const setRouteStatus = (text, state) => {{
-          routeStatus.textContent = text;
-          routeStatus.className = `route-status ${{state || ""}}`;
-        }};
-        const setMapClickStatus = (text, state) => {{
-          if (!mapClickStatus) return;
-          mapClickStatus.textContent = text;
-          mapClickStatus.className = `map-click-hint ${{state || ""}}`;
-        }};
-        const setMapClickMode = (mode, options) => {{
-          const force = Boolean(options && options.force);
-          mapClickMode = force ? mode : (mapClickMode === mode ? "" : mode);
-          try {{
-            if (mapClickMode) window.sessionStorage.setItem(mapClickModeStorageKey, mapClickMode);
-            else window.sessionStorage.removeItem(mapClickModeStorageKey);
-          }} catch (_) {{
-            // sessionStorage can be unavailable in stricter browser contexts.
-          }}
-          clickModeButtons.forEach((button) => {{
-            button.setAttribute(
-              "aria-pressed",
-              button.getAttribute("data-map-click-mode") === mapClickMode ? "true" : "false",
-            );
-          }});
-          setMapClickStatus(
-            mapClickMode ? "Click a mapped target to add an inspection point." : "Map authoring idle.",
-            "",
-          );
-        }};
-        try {{
-          const storedMapClickMode = window.sessionStorage.getItem(mapClickModeStorageKey) || "";
-          if (["inspection"].includes(storedMapClickMode)) {{
-            setMapClickMode(storedMapClickMode, {{force: true}});
-          }}
-        }} catch (_) {{
-          // sessionStorage can be unavailable in stricter browser contexts.
-        }}
-        const routePost = async (url, body) => {{
-          const response = await fetch(url, {{
-            method: "POST",
-            headers: {{"Content-Type": "application/json"}},
-            body: JSON.stringify(body || {{}}),
-          }});
-          const result = await response.json();
-          if (!response.ok || !result.ok) throw new Error(result.error || "route_failed");
-          return result;
-        }};
-        const replayRerunMap = () => {{
-          try {{
-            window.sessionStorage.setItem("dogops:rerun-replay", "map");
-          }} catch (_) {{
-            // sessionStorage can be unavailable in stricter browser contexts.
-          }}
-          if (window.DogOpsRerunWebViewer && window.DogOpsRerunWebViewer.replay && mapViewer) {{
-            window.DogOpsRerunWebViewer.replay(mapViewer);
-          }}
-        }};
-        const routeTargetAction = async (mode, targetId) => {{
-          if (!targetId) throw new Error("missing_target_id");
-          if (select) select.value = targetId;
-          if (mode === "inspection") {{
-            return routePost("/api/route/inspection_points", {{target_id: targetId}});
-          }}
-          throw new Error("unknown_map_mode");
-        }};
-        clickModeButtons.forEach((button) => {{
-          button.addEventListener("click", () => {{
-            setMapClickMode(button.getAttribute("data-map-click-mode") || "");
-          }});
-        }});
-        const routeMap = document.querySelector("[data-route-map]");
-        if (routeMap) {{
-          routeMap.addEventListener("click", async (event) => {{
-            if (!mapClickMode) return;
-            const target = event.target.closest("[data-map-target-id]");
-            if (!target) {{
-              setMapClickStatus("No mapped target selected.", "error");
-              return;
-            }}
-            const targetId = target.getAttribute("data-map-target-id");
-            setRouteStatus(`Adding inspection point ${{targetId}}...`, "");
-            try {{
-              await routeTargetAction(mapClickMode, targetId);
-              setMapClickStatus(`Added inspection point at ${{targetId}}.`, "ok");
-              setRouteStatus("Inspection route updated", "ok");
-              window.setTimeout(() => window.location.reload(), 450);
-            }} catch (error) {{
-              setMapClickStatus(`Map edit failed: ${{error.message}}`, "error");
-              setRouteStatus(`Route update failed: ${{error.message}}`, "error");
-            }}
-          }});
-        }}
-        routeControls.addEventListener("click", async (event) => {{
-          const button = event.target.closest("button[data-route-action]");
+      if (mapControls) {{
+        mapControls.addEventListener("click", async (event) => {{
+          const button = event.target.closest("button[data-map-action]");
           if (!button) return;
-          const action = button.getAttribute("data-route-action");
-          const targetId = select ? select.value : "";
-          setRouteStatus(`Running ${{action}}...`, "");
-          try {{
-            if (action === "explore") {{
-              setRouteStatus(
-                dogopsRuntimeMode === "rerun-sim" ? "Rerun LiDAR replay command sent" : "DimOS exploration command sent",
-                "ok",
-              );
-              const result = await routePost("/api/map/explore", {{}});
-              if (result.rerun) replayRerunMap();
-              setRouteStatus(
-                result.rerun ? "Rerun LiDAR mapping replay started" : "DimOS exploration started",
-                "ok",
-              );
-              if (!result.rerun) return;
-            }}
-            if (action === "stop-explore") {{
-              setRouteStatus(
-                dogopsRuntimeMode === "rerun-sim" ? "Rerun mapping replay stopped" : "DimOS stop command sent",
-                "ok",
-              );
-              await routePost("/api/map/stop_explore", {{}});
-              setRouteStatus(
-                dogopsRuntimeMode === "rerun-sim" ? "Rerun mapping replay stopped" : "DimOS exploration stopped",
-                "ok",
-              );
-              window.setTimeout(() => window.location.reload(), 450);
-              return;
-            }}
-            if (action === "replay-map") {{
-              await routePost("/api/rerun/replay_map", {{}});
-              replayRerunMap();
-              setRouteStatus("Replaying Rerun map scan", "ok");
-              return;
-            }}
-            if (action === "run") {{
-              setRouteStatus(
-                dogopsRuntimeMode === "rerun-sim" ? "Route replay sent to Rerun" : "Route goals sent to DimOS",
-                "ok",
-              );
-              const result = await routePost("/api/route/run", {{}});
-              if (result.rerun) replayRerunMap();
-            }}
-            if (action === "add-inspection") await routeTargetAction("inspection", targetId);
-            if (action === "clear-inspection") {{
-              await routePost("/api/route/inspection_points/clear", {{}});
-            }}
-            setRouteStatus("Inspection route updated", "ok");
-            window.setTimeout(() => window.location.reload(), 450);
-          }} catch (error) {{
-            setRouteStatus(`Route update failed: ${{error.message}}`, "error");
+          const action = button.getAttribute("data-map-action");
+          button.blur();
+          if (action === "start") {{
+            await sendRobotAction(
+              "/api/robot/map_start",
+              {{command: "map_start"}},
+              () => "Live map connected"
+            );
+          }} else if (action === "origin") {{
+            await sendRobotAction(
+              "/api/robot/map_origin",
+              {{command: "map_origin"}},
+              () => "Map origin set"
+            );
+          }} else if (action === "arm_go_to") {{
+            setGoToArmed(!goToArmed);
           }}
+          await refreshLiveMap();
         }});
       }}
+      if (layerControls) {{
+        layerControls.addEventListener("click", (event) => {{
+          const button = event.target.closest("button[data-map-layer]");
+          if (!button || !liveMapSvg) return;
+          const layer = button.getAttribute("data-map-layer");
+          const pressed = button.getAttribute("aria-pressed") !== "true";
+          button.setAttribute("aria-pressed", pressed ? "true" : "false");
+          liveMapSvg.querySelectorAll(`[data-layer="${{layer}}"]`).forEach((item) => {{
+            item.toggleAttribute("hidden", !pressed);
+          }});
+        }});
+      }}
+      refreshLiveMap();
+      refreshDimOSMap();
+      window.setInterval(refreshLiveMap, 1000);
+      window.setInterval(refreshDimOSMap, 1500);
     }})();
   </script>
 </body>
 </html>
 """
+
+
+class _MapProjector:
+    def __init__(self, bounds: dict[str, float]) -> None:
+        self.x_min = bounds["x_min"]
+        self.x_max = bounds["x_max"]
+        self.y_min = bounds["y_min"]
+        self.y_max = bounds["y_max"]
+
+    def x(self, value: float) -> float:
+        span = max(0.1, self.x_max - self.x_min)
+        return ((value - self.x_min) / span) * MAP_WIDTH
+
+    def y(self, value: float) -> float:
+        span = max(0.1, self.y_max - self.y_min)
+        return MAP_HEIGHT - (((value - self.y_min) / span) * MAP_HEIGHT)
+
+    def radius(self, value_m: float) -> float:
+        span_x = max(0.1, self.x_max - self.x_min)
+        span_y = max(0.1, self.y_max - self.y_min)
+        px_per_m = min(MAP_WIDTH / span_x, MAP_HEIGHT / span_y)
+        return max(22.0, value_m * px_per_m)
+
+    def size(self, value_m: float) -> float:
+        span_x = max(0.1, self.x_max - self.x_min)
+        span_y = max(0.1, self.y_max - self.y_min)
+        px_per_m = min(MAP_WIDTH / span_x, MAP_HEIGHT / span_y)
+        return max(2.0, value_m * px_per_m)
+
+
+def _zone_pose(zone: dict[str, Any]) -> tuple[float, float] | None:
+    pose = zone.get("pose_hint") or {}
+    try:
+        return float(pose["x"]), float(pose["y"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _offset_pose(base: tuple[float, float], index: int) -> tuple[float, float]:
+    dx, dy = ENTITY_OFFSETS_M[index % len(ENTITY_OFFSETS_M)]
+    return base[0] + dx, base[1] + dy
+
+
+def _package_pose(base: tuple[float, float], index: int) -> tuple[float, float]:
+    dx, dy = PACKAGE_OFFSETS_M[index % len(PACKAGE_OFFSETS_M)]
+    return base[0] + dx, base[1] + dy
+
+
+def _visible_tag_ids(observation: dict[str, Any]) -> list[int]:
+    facts = observation.get("facts") or {}
+    raw = facts.get("visible_tag_ids")
+    if isinstance(raw, str):
+        tag_ids = []
+        for item in raw.split(","):
+            item = item.strip()
+            if item:
+                try:
+                    tag_ids.append(int(item))
+                except ValueError:
+                    continue
+        return tag_ids
+    if isinstance(raw, list):
+        return [int(item) for item in raw if isinstance(item, int | str)]
+    tag_id = observation.get("tag_id")
+    return [int(tag_id)] if isinstance(tag_id, int) else []
+
+
+def _trusted_rerun_web_url(raw_url: str | None) -> str:
+    fallback = "http://127.0.0.1:9877"
+    if not raw_url:
+        return fallback
+    try:
+        parsed = urlparse(raw_url)
+    except ValueError:
+        return fallback
+    if parsed.scheme not in {"http", "https"}:
+        return fallback
+    host = (parsed.hostname or "").lower()
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        return fallback
+    return raw_url
+
+
+def _trusted_rerun_source_url(raw_url: str | None) -> str:
+    if not raw_url:
+        return DEFAULT_RERUN_SOURCE_URL
+    if not raw_url.startswith("rerun+"):
+        return DEFAULT_RERUN_SOURCE_URL
+    try:
+        parsed = urlparse(raw_url.removeprefix("rerun+"))
+    except ValueError:
+        return DEFAULT_RERUN_SOURCE_URL
+    if parsed.scheme not in {"http", "https", "ws", "wss"}:
+        return DEFAULT_RERUN_SOURCE_URL
+    host = (parsed.hostname or "").lower()
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        return DEFAULT_RERUN_SOURCE_URL
+    return raw_url
+
+
+def _map_bounds(points: list[tuple[float, float]]) -> dict[str, float]:
+    if not points:
+        return {"x_min": -1.0, "x_max": 1.0, "y_min": -1.0, "y_max": 1.0}
+    xs = [point[0] for point in points]
+    ys = [point[1] for point in points]
+    x_min = min(xs) - MAP_PADDING_M
+    x_max = max(xs) + MAP_PADDING_M
+    y_min = min(ys) - MAP_PADDING_M
+    y_max = max(ys) + MAP_PADDING_M
+    if math.isclose(x_min, x_max):
+        x_min -= 1.0
+        x_max += 1.0
+    if math.isclose(y_min, y_max):
+        y_min -= 1.0
+        y_max += 1.0
+    return {"x_min": x_min, "x_max": x_max, "y_min": y_min, "y_max": y_max}
+
+
+def _render_floor_cells(projector: _MapProjector, map_data: dict[str, Any]) -> str:
+    free_cells: set[tuple[int, int]] = set()
+    cost_cells: set[tuple[int, int]] = set()
+    route_positions = [(float(point["x"]), float(point["y"])) for point in map_data["route"]]
+
+    for x, y in _route_samples(route_positions):
+        _add_cells(free_cells, x, y, radius_m=0.38)
+
+    for zone in map_data["zones"]:
+        x = float(zone["x"])
+        y = float(zone["y"])
+        if zone.get("no_go"):
+            _add_cells(cost_cells, x, y, radius_m=float(zone.get("radius_m") or 0.8))
+        else:
+            _add_cells(free_cells, x, y, radius_m=0.42)
+
+    for item in [*map_data["assets"], *map_data["packages"], *map_data["observations"]]:
+        _add_cells(free_cells, float(item["x"]), float(item["y"]), radius_m=0.24)
+
+    free_cells -= cost_cells
+    free_markup = "".join(_render_cell(projector, cell, "map-free-cell") for cell in sorted(free_cells))
+    cost_markup = "".join(_render_cell(projector, cell, "map-cost-cell") for cell in sorted(cost_cells))
+    return free_markup + cost_markup
+
+
+def _render_point_cloud(projector: _MapProjector, map_data: dict[str, Any]) -> str:
+    points: list[tuple[float, float, bool]] = []
+    for index, observation in enumerate(map_data["observations"]):
+        x = float(observation["x"])
+        y = float(observation["y"])
+        visible_tags = observation.get("visible_tag_ids") or []
+        count = max(4, len(visible_tags) * 3)
+        for point_index in range(count):
+            angle = (index * 0.91) + (point_index * 2.399)
+            radius = 0.05 + ((point_index % 5) * 0.035)
+            points.append(
+                (
+                    x + math.cos(angle) * radius,
+                    y + math.sin(angle) * radius,
+                    bool(visible_tags),
+                )
+            )
+
+    for package in map_data["packages"]:
+        x = float(package["x"])
+        y = float(package["y"])
+        points.extend(
+            [
+                (x - 0.035, y - 0.025, True),
+                (x + 0.038, y - 0.015, True),
+                (x + 0.004, y + 0.041, True),
+            ]
+        )
+
+    markup = []
+    for x, y, hot in points:
+        css_class = "map-point hot" if hot else "map-point"
+        markup.append(
+            f'<circle class="{css_class}" cx="{projector.x(x):.1f}" '
+            f'cy="{projector.y(y):.1f}" r="2.1" />'
+        )
+    return "".join(markup)
+
+
+def _route_samples(route_positions: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    if not route_positions:
+        return []
+    samples = [route_positions[0]]
+    for start, end in pairwise(route_positions):
+        dx = end[0] - start[0]
+        dy = end[1] - start[1]
+        distance = math.hypot(dx, dy)
+        steps = max(1, int(distance / MAP_CELL_M))
+        for step in range(1, steps + 1):
+            ratio = step / steps
+            samples.append((start[0] + dx * ratio, start[1] + dy * ratio))
+    return samples
+
+
+def _add_cells(cells: set[tuple[int, int]], x: float, y: float, *, radius_m: float) -> None:
+    radius_cells = max(1, math.ceil(radius_m / MAP_CELL_M))
+    center_x = round(x / MAP_CELL_M)
+    center_y = round(y / MAP_CELL_M)
+    for dx in range(-radius_cells, radius_cells + 1):
+        for dy in range(-radius_cells, radius_cells + 1):
+            cell_x = center_x + dx
+            cell_y = center_y + dy
+            world_x = cell_x * MAP_CELL_M
+            world_y = cell_y * MAP_CELL_M
+            if math.hypot(world_x - x, world_y - y) <= radius_m:
+                cells.add((cell_x, cell_y))
+
+
+def _render_cell(projector: _MapProjector, cell: tuple[int, int], css_class: str) -> str:
+    world_x = cell[0] * MAP_CELL_M
+    world_y = cell[1] * MAP_CELL_M
+    size = projector.size(MAP_CELL_M) * 0.9
+    x = projector.x(world_x) - size / 2
+    y = projector.y(world_y) - size / 2
+    return f'<rect class="{css_class}" x="{x:.1f}" y="{y:.1f}" width="{size:.1f}" height="{size:.1f}" />'
+
+
+def _render_grid(projector: _MapProjector) -> str:
+    x_start = math.floor(projector.x_min * 2) / 2
+    x_stop = math.ceil(projector.x_max * 2) / 2
+    y_start = math.floor(projector.y_min * 2) / 2
+    y_stop = math.ceil(projector.y_max * 2) / 2
+    lines = []
+    x_value = x_start
+    while x_value <= x_stop + 0.001:
+        x = projector.x(float(x_value))
+        is_major = math.isclose(x_value % 1.0, 0.0, abs_tol=0.001)
+        css_class = "map-grid-major" if is_major else "map-grid"
+        lines.append(
+            f'<line class="{css_class}" x1="{x:.1f}" y1="0" x2="{x:.1f}" y2="{MAP_HEIGHT}" />'
+        )
+        if is_major:
+            label = round(x_value)
+            lines.append(
+                f'<text class="map-axis-label" x="{x + 4:.1f}" y="{MAP_HEIGHT - 8}">{label}m</text>'
+            )
+        x_value += 0.5
+
+    y_value = y_start
+    while y_value <= y_stop + 0.001:
+        y = projector.y(float(y_value))
+        is_major = math.isclose(y_value % 1.0, 0.0, abs_tol=0.001)
+        css_class = "map-grid-major" if is_major else "map-grid"
+        lines.append(
+            f'<line class="{css_class}" x1="0" y1="{y:.1f}" x2="{MAP_WIDTH}" y2="{y:.1f}" />'
+        )
+        if is_major:
+            label = round(y_value)
+            lines.append(f'<text class="map-axis-label" x="8" y="{y - 4:.1f}">{label}m</text>')
+        y_value += 0.5
+    return "".join(lines)
+
+
+def _render_no_go_zone(projector: _MapProjector, zone: dict[str, Any]) -> str:
+    if not zone.get("no_go"):
+        return ""
+    x = projector.x(float(zone["x"]))
+    y = projector.y(float(zone["y"]))
+    radius = projector.size(float(zone.get("radius_m") or 0.8))
+    width = radius * 1.55
+    height = radius * 1.25
+    title = escape(str(zone.get("display_name") or zone["id"]))
+    return (
+        f'<g><title>{title}</title>'
+        f'<rect class="map-no-go" x="{x - width / 2:.1f}" y="{y - height / 2:.1f}" '
+        f'width="{width:.1f}" height="{height:.1f}" rx="4" />'
+        f'<rect class="map-no-go-hatch" x="{x - width / 2:.1f}" y="{y - height / 2:.1f}" '
+        f'width="{width:.1f}" height="{height:.1f}" rx="4" />'
+        "</g>"
+    )
+
+
+def _render_zone(projector: _MapProjector, zone: dict[str, Any]) -> str:
+    x = projector.x(float(zone["x"]))
+    y = projector.y(float(zone["y"]))
+    label = escape(str(zone["id"]))
+    title = escape(str(zone.get("display_name") or zone["id"]))
+    return (
+        f'<g><title>{title}</title>'
+        f'<line class="map-zone-anchor" x1="{x - 8:.1f}" y1="{y:.1f}" x2="{x + 8:.1f}" y2="{y:.1f}" />'
+        f'<line class="map-zone-anchor" x1="{x:.1f}" y1="{y - 8:.1f}" x2="{x:.1f}" y2="{y + 8:.1f}" />'
+        f'<circle class="map-zone-anchor" cx="{x:.1f}" cy="{y:.1f}" r="4.5" />'
+        f'<text class="map-zone-label" x="{x:.1f}" y="{y + 19:.1f}">{label}</text>'
+        "</g>"
+    )
+
+
+def _render_asset(projector: _MapProjector, asset: dict[str, Any]) -> str:
+    x = projector.x(float(asset["x"]))
+    y = projector.y(float(asset["y"]))
+    label = escape(str(asset["id"]))
+    title = escape(str(asset.get("display_name") or asset["id"]))
+    return (
+        f'<g><title>{title}</title>'
+        f'<rect class="map-asset" x="{x - 7:.1f}" y="{y - 7:.1f}" width="14" height="14" rx="2" />'
+        f'<rect class="map-tag-face" x="{x - 3:.1f}" y="{y - 3:.1f}" width="6" height="6" />'
+        f'<text class="map-asset-label" x="{x + 10:.1f}" y="{y + 4:.1f}">{label}</text>'
+        "</g>"
+    )
+
+
+def _render_package(projector: _MapProjector, package: dict[str, Any]) -> str:
+    x = projector.x(float(package["x"]))
+    y = projector.y(float(package["y"]))
+    state = str(package.get("state") or "unknown")
+    label = escape(str(package["id"]))
+    title = escape(f"{package['id']} / {state}")
+    return (
+        f'<g><title>{title}</title>'
+        f'<rect class="map-package state-{escape(state)}" x="{x - 7:.1f}" y="{y - 7:.1f}" '
+        f'width="14" height="14" rx="2" transform="rotate(45 {x:.1f} {y:.1f})" />'
+        f'<text class="map-package-label" x="{x + 11:.1f}" y="{y + 4:.1f}">{label}</text>'
+        "</g>"
+    )
+
+
+def _render_observation(projector: _MapProjector, observation: dict[str, Any]) -> str:
+    zone_x = projector.x(float(observation["x"]))
+    zone_y = projector.y(float(observation["y"]))
+    label = escape(str(observation["id"]))
+    title = escape(
+        f"{observation.get('id')} tags {','.join(str(tag) for tag in observation['visible_tag_ids'])}"
+    )
+    return (
+        f'<g><title>{title}</title>'
+        f'<circle class="map-observation" cx="{zone_x:.1f}" cy="{zone_y:.1f}" r="5.5" />'
+        f'<text class="map-asset-label" x="{zone_x + 8:.1f}" y="{zone_y - 7:.1f}">{label}</text>'
+        "</g>"
+    )
+
+
+def _render_incident(projector: _MapProjector, incident: dict[str, Any]) -> str:
+    x = projector.x(float(incident["x"]))
+    y = projector.y(float(incident["y"]))
+    label = escape(str(incident["id"]))
+    title = escape(
+        f"{incident.get('id')} {incident.get('severity')} {incident.get('state')}"
+    )
+    return (
+        f'<g><title>{title}</title>'
+        f'<circle class="map-incident" cx="{x:.1f}" cy="{y:.1f}" r="15" />'
+        f'<text class="map-incident-label" x="{x + 14:.1f}" y="{y - 13:.1f}">{label}</text>'
+        "</g>"
+    )
+
+
+def _render_route_stop(projector: _MapProjector, stop: dict[str, Any], index: int) -> str:
+    x = projector.x(float(stop["x"]))
+    y = projector.y(float(stop["y"]))
+    title = escape(str(stop.get("target_id") or "route stop"))
+    return (
+        f'<g><title>{title}</title>'
+        f'<circle class="map-route-stop" cx="{x:.1f}" cy="{y:.1f}" r="9" />'
+        f'<text class="map-route-index" x="{x:.1f}" y="{y + 1:.1f}">{index}</text>'
+        "</g>"
+    )
+
+
+def _render_live_robot_pose() -> str:
+    return (
+        '<polyline class="map-live-trace" data-live-trace points="" />'
+        '<g data-live-robot style="display:none" transform="translate(0 0)">'
+        "<title>Live Go2 odometry pose</title>"
+        '<circle class="map-live-robot-halo" cx="0" cy="0" r="18" />'
+        '<path class="map-live-robot-core" d="M 14 0 L -9 -8 L -5 0 L -9 8 Z" />'
+        "</g>"
+        '<g data-live-target style="display:none" transform="translate(0 0)">'
+        "<title>DimOS planner target</title>"
+        '<circle class="map-dimos-target-ring" cx="0" cy="0" r="14" />'
+        '<circle class="map-dimos-target-core" cx="0" cy="0" r="4" />'
+        "</g>"
+        '<g data-go-to-marker style="display:none" transform="translate(0 0)">'
+        "<title>DimOS go_to target</title>"
+        '<circle class="map-go-to-ring" cx="0" cy="0" r="13" />'
+        '<line class="map-go-to-cross" x1="-17" y1="0" x2="-6" y2="0" />'
+        '<line class="map-go-to-cross" x1="6" y1="0" x2="17" y2="0" />'
+        '<line class="map-go-to-cross" x1="0" y1="-17" x2="0" y2="-6" />'
+        '<line class="map-go-to-cross" x1="0" y1="6" x2="0" y2="17" />'
+        "</g>"
+    )
+
+
+def _render_scan_item(observation: dict[str, Any]) -> str:
+    tag_ids = ", ".join(str(tag_id) for tag_id in observation["visible_tag_ids"]) or "none"
+    return (
+        "<li>"
+        f"<strong>{escape(str(observation['id']))}</strong> "
+        f"{escape(str(observation['zone_id']))} / tags {escape(tag_ids)}"
+        "</li>"
+    )
 
 
 def metric(label: str, value: object) -> str:
@@ -1096,671 +2042,6 @@ def metric(label: str, value: object) -> str:
         f"<span class=\"muted\">{escape(label)}</span>"
         f"<strong>{escape(str(value))}</strong>"
         "</div>"
-    )
-
-
-def status_pill(label: str, value: object) -> str:
-    return (
-        '<div class="status-pill">'
-        f"<span>{escape(label)}</span>"
-        f"<strong>{escape(str(value))}</strong>"
-        "</div>"
-    )
-
-
-def humanize(value: object) -> str:
-    return str(value).replace("_", " ").strip().title()
-
-
-def format_reading_value(value: object, unit: object) -> str:
-    text = str(value)
-    display = humanize(text) if "_" in text else text
-    unit_text = str(unit or "")
-    return f"{display} {unit_text}".strip()
-
-
-def attention_list(incidents: list[dict[str, Any]]) -> str:
-    if not incidents:
-        return '<p class="muted">No open safety or orderliness issues.</p>'
-    rows = []
-    for incident in incidents:
-        state = str(incident.get("state", "open"))
-        rows.append(
-            f'<div class="attention-item {escape(state)}">'
-            f"<strong>{escape(str(incident.get('title', 'Issue')))}</strong>"
-            f"<span>{escape(str(incident.get('severity', '')))} / {escape(humanize(state))}</span>"
-            f"<p class=\"muted\">{escape(str(incident.get('recommended_action', 'Review issue.')))}</p>"
-            "</div>"
-        )
-    return '<div class="attention-list">' + "".join(rows) + "</div>"
-
-
-def reading_cards(readings: list[dict[str, Any]]) -> str:
-    if not readings:
-        return '<p class="muted">No machine readings yet.</p>'
-    cards = []
-    for reading in readings:
-        status = str(reading.get("status", "unknown"))
-        is_alert = status.lower() not in {"normal", "ok", "clear", "pass"}
-        value = format_reading_value(reading.get("value"), reading.get("unit"))
-        cards.append(
-            f'<div class="reading-card {"alert" if is_alert else ""}">'
-            '<div class="reading-value">'
-            f"<strong>{escape(humanize(reading.get('name', 'reading')))}</strong>"
-            f"<span>{escape(value)}</span>"
-            "</div>"
-            f"<span>{escape(humanize(status))}</span>"
-            f"<p class=\"muted\">{escape(str(reading.get('notes') or reading.get('source') or ''))}</p>"
-            "</div>"
-        )
-    return '<div class="reading-cards">' + "".join(cards) + "</div>"
-
-
-def change_list(changes: list[object]) -> str:
-    if not changes:
-        return '<p class="muted">No floor changes recorded yet.</p>'
-    return (
-        '<div class="change-list">'
-        + "".join(f'<div class="change-item">{escape(str(change))}</div>' for change in changes)
-        + "</div>"
-    )
-
-
-def route_stepper(route_plan: dict[str, Any]) -> str:
-    waypoints = route_plan.get("waypoints") or []
-    if not waypoints:
-        return '<p class="muted">No route set.</p>'
-    return (
-        '<div class="route-stepper">'
-        + "".join(
-            '<div class="route-step">'
-            f"<strong>{escape(str(waypoint.get('order')))}. "
-            f"{escape(str(waypoint.get('target_id')))}</strong>"
-            f"<span>{escape(humanize(waypoint.get('action', 'go')))} / "
-            f"{escape(str(waypoint.get('display_name', '')))}</span>"
-            "</div>"
-            for waypoint in waypoints
-        )
-        + "</div>"
-    )
-
-
-def inspection_stepper(route_plan: dict[str, Any]) -> str:
-    pois = route_plan.get("points_of_interest") or []
-    if not pois:
-        return route_stepper(route_plan)
-    waypoint_order = {
-        waypoint.get("id"): waypoint.get("order")
-        for waypoint in route_plan.get("waypoints") or []
-    }
-    return (
-        '<div class="route-stepper">'
-        + "".join(
-            '<div class="route-step">'
-            f"<strong>{escape(str(waypoint_order.get(poi.get('waypoint_id'), index + 1)))}. "
-            f"{escape(str(poi.get('target_id')))}</strong>"
-            f"<span>{escape(str(poi.get('display_name') or 'Inspection point'))}</span>"
-            "</div>"
-            for index, poi in enumerate(pois)
-        )
-        + "</div>"
-    )
-
-
-def poi_stepper(route_plan: dict[str, Any]) -> str:
-    pois = route_plan.get("points_of_interest") or []
-    if not pois:
-        return '<p class="muted">No photo or reading points set.</p>'
-    return (
-        '<div class="route-stepper">'
-        + "".join(
-            '<div class="route-step">'
-            f"<strong>{escape(str(poi.get('id')))} / {escape(str(poi.get('target_id')))}</strong>"
-            f"<span>{escape(', '.join(str(item) for item in poi.get('reading_keys') or []))}</span>"
-            "</div>"
-            for poi in pois
-        )
-        + "</div>"
-    )
-
-
-def map_viewer_panel(
-    site_map: dict[str, Any],
-    route_plan: dict[str, Any],
-    target_options: list[dict[str, str]],
-    *,
-    runtime_label: str = "Real dog",
-    runtime: str = "real",
-) -> str:
-    urls = dimos_viewer_urls()
-    rerun_source_url = escape(urls["rerun_source"], quote=True)
-    web_viewer_module_url = escape(urls["web_viewer_module"], quote=True)
-    web_viewer_asset_base_url = escape(urls["web_viewer_asset_base"], quote=True)
-    command_center_url = escape(urls["command_center"], quote=True)
-    rerun_view_mode = escape(urls["rerun_view_mode"], quote=True)
-    rerun_embed_url = escape(urls["rerun_embed"], quote=True)
-    rerun_mode_label = (
-        "DimOS native 3D Rerun"
-        if urls["rerun_view_mode"] == "native-3d"
-        else "DimOS/Rerun top-down map"
-    )
-    inspection_count = len(route_plan.get("points_of_interest") or [])
-    inspection_limit = 3
-    motion_panel = (
-        '<div class="sim-motion-note">Manual motion is skipped for simulation setup. Use DimOS mapping, target selection, and route run controls here.</div>'
-        if runtime in {"simulation", "rerun-sim"}
-        else (
-            '<details>'
-            "<summary>Manual motion</summary>"
-            '<div class="posture-controls" data-posture-controls>'
-            '<button type="button" data-posture="wake">Wake / Stand</button>'
-            '<button type="button" data-posture="balance">Balance</button>'
-            '<button type="button" data-posture="sleep">Sleep</button>'
-            "</div>"
-            '<div class="motion-controls" data-motion-controls>'
-            '<button type="button" data-motion="nudge" aria-pressed="true">Nudge</button>'
-            '<button type="button" data-motion="step" aria-pressed="false">Step</button>'
-            '<button type="button" data-motion="walk" aria-pressed="false">Walk</button>'
-            "</div>"
-            '<div class="robot-controls">'
-            "<span></span>"
-            '<button type="button" data-command="forward">Forward</button>'
-            "<span></span>"
-            '<button type="button" data-command="left">Left</button>'
-            "<span></span>"
-            '<button type="button" data-command="right">Right</button>'
-            '<button type="button" data-command="yaw_left">Yaw L</button>'
-            '<button type="button" data-command="backward">Back</button>'
-            '<button type="button" data-command="yaw_right">Yaw R</button>'
-            "</div>"
-            "</details>"
-        )
-    )
-    rerun_surface = (
-        f'<iframe class="rerun-frame" data-rerun-frame src="{rerun_embed_url}" '
-        'title="DimOS Rerun viewer"></iframe>'
-        if rerun_embed_url
-        else '<div class="rerun-canvas" data-rerun-canvas></div>'
-    )
-    map_click_controls = (
-        ""
-        if runtime == "rerun-sim"
-        else (
-            '<div class="map-click-modes" aria-label="Map drawing mode">'
-            '<button type="button" data-map-click-mode="inspection" aria-pressed="false">Inspection Point Mode</button>'
-            "</div>"
-        )
-    )
-    target_overlay = (
-        ""
-        if runtime == "rerun-sim"
-        else f'<div class="map-target-overlay" data-route-map>{map_target_overlay(site_map, route_plan)}</div>'
-    )
-    return (
-        "<div>"
-        '<div class="map-viewer" data-map-viewer '
-        f'data-rerun-source-url="{rerun_source_url}" '
-        f'data-rerun-view-mode="{rerun_view_mode}" '
-        f'data-rerun-embed-url="{rerun_embed_url}" '
-        f'data-rerun-module-url="{web_viewer_module_url}" '
-        f'data-rerun-asset-base-url="{web_viewer_asset_base_url}">'
-        '<div class="map-toolbar">'
-        f'<div class="viewer-chip"><span>{escape(rerun_mode_label)}</span></div>'
-        '<div class="viewer-links">'
-        f'<a href="{command_center_url}" target="_blank" rel="noreferrer">Open Command Center</a>'
-        "</div>"
-        "</div>"
-        '<div class="map-route-overlay">'
-        f"<label>Inspection points ({inspection_count}/{inspection_limit})</label>"
-        '<div class="route-controls" data-route-controls>'
-        f"<select data-route-target>{target_option_html(target_options)}</select>"
-        '<button type="button" data-route-action="explore">Map Open Space</button>'
-        '<button type="button" data-route-action="stop-explore">Stop Mapping</button>'
-        '<button type="button" data-route-action="add-inspection">Add Inspection Point</button>'
-        '<button type="button" data-route-action="clear-inspection">Clear Points</button>'
-        '<button type="button" data-route-action="run">Run Route</button>'
-        '<button type="button" data-route-action="replay-map">Replay Map</button>'
-        "</div>"
-        + map_click_controls +
-        '<div class="map-click-hint" data-map-click-status>Map authoring idle.</div>'
-        '<div class="route-status" data-route-status>Route editor ready</div>'
-        "</div>"
-        '<div class="robot-dock" data-robot-controls>'
-        '<div class="robot-dock-bar">'
-        f'<div><strong>Robot Control</strong><span class="robot-mode">{escape(runtime_label)}</span>'
-        '<span class="robot-status" data-robot-status>Idle</span></div>'
-        '<button type="button" class="hard-stop" data-command="hard_stop">HARD STOP</button>'
-        "</div>"
-        + motion_panel +
-        "</div>"
-        + rerun_surface
-        + target_overlay +
-        '<div class="viewer-offline" data-viewer-offline hidden>'
-        f'<div class="map-viz">{map_svg(site_map, route_plan)}</div>'
-        "</div>"
-        '<div class="viewer-hint">'
-        "<span><strong>Rerun</strong> is mounted inside DogOps.</span>"
-        "<span data-rerun-status>Connecting to Rerun...</span>"
-        "</div>"
-        "</div>"
-        '<div class="mission-map-panel" data-mission-map>'
-        "<h3>Mission Map</h3>"
-        "<p>DimOS/DogOps map artifact and route plan. Rerun above remains the live map surface.</p>"
-        f'<div class="map-viz">{map_svg(site_map, route_plan)}</div>'
-        "</div>"
-        "</div>"
-    )
-
-
-def map_target_overlay(site_map: dict[str, Any], route_plan: dict[str, Any]) -> str:
-    features = site_map.get("features") or []
-    if not features:
-        return ""
-    poi_targets = {poi.get("target_id") for poi in route_plan.get("points_of_interest") or []}
-    poi_order = {poi.get("target_id"): index + 1 for index, poi in enumerate(route_plan.get("points_of_interest") or [])}
-    route_targets = {waypoint.get("target_id") for waypoint in route_plan.get("waypoints") or []}
-    rows = []
-    for feature in features:
-        pose = feature.get("pose") or {}
-        if pose.get("x") is None or pose.get("y") is None:
-            continue
-        x, y = _map_pixel(site_map, float(pose["x"]), float(pose["y"]))
-        left_pct = (x / 720) * 100
-        top_pct = (y / 420) * 100
-        target_id = str(feature.get("id") or "")
-        if not target_id:
-            continue
-        display_name = str(feature.get("display_name") or target_id)
-        classes = ["is-inspection"] if target_id in poi_targets else []
-        if target_id in route_targets:
-            classes.append("is-route")
-        class_attr = f' class="{" ".join(classes)}"' if classes else ""
-        order = poi_order.get(target_id)
-        order_badge = f"<em>{escape(str(order))}</em>" if order is not None else ""
-        rows.append(
-            f'<button type="button"{class_attr} '
-            f'data-map-target-id="{escape(target_id, quote=True)}" '
-            f'data-map-target-name="{escape(display_name, quote=True)}" '
-            f'aria-label="Map target {escape(display_name, quote=True)}" '
-            f'style="left:{left_pct:.2f}%;top:{top_pct:.2f}%;">'
-            f"{order_badge}"
-            f"<span>{escape(target_id)}</span>"
-            "</button>"
-        )
-    return "".join(rows)
-
-
-def dimos_viewer_urls() -> dict[str, str]:
-    return {
-        "rerun_source": _trusted_rerun_source_url(
-            os.environ.get("DOGOPS_RERUN_SOURCE_URL") or "rerun+http://127.0.0.1:9877/proxy",
-        ),
-        "web_viewer_module": _trusted_asset_url(
-            os.environ.get("DOGOPS_RERUN_WEB_VIEWER_MODULE_URL") or "/assets/rerun-web-viewer.js",
-            "/assets/rerun-web-viewer.js",
-        ),
-        "web_viewer_asset_base": _trusted_asset_url(
-            os.environ.get("DOGOPS_RERUN_WEB_VIEWER_ASSET_BASE_URL")
-            or "/assets/vendor/@rerun-io/web-viewer/",
-            "/assets/vendor/@rerun-io/web-viewer/",
-        ),
-        "command_center": _trusted_local_viewer_url(
-            os.environ.get("DOGOPS_COMMAND_CENTER_URL") or "http://127.0.0.1:7779/command-center",
-            "http://127.0.0.1:7779/command-center",
-        ),
-        "rerun_view_mode": _trusted_rerun_view_mode(
-            os.environ.get("DOGOPS_RERUN_VIEW_MODE") or "dogops-2d",
-        ),
-        "rerun_embed": _trusted_optional_local_viewer_url(
-            os.environ.get("DOGOPS_RERUN_EMBED_URL") or "",
-        ),
-    }
-
-
-def _trusted_rerun_view_mode(raw_mode: str) -> str:
-    return raw_mode if raw_mode in {"dogops-2d", "native-3d"} else "dogops-2d"
-
-
-def _trusted_asset_url(raw_url: str, fallback: str) -> str:
-    if raw_url.startswith("/"):
-        return raw_url
-    return _trusted_local_viewer_url(raw_url, fallback)
-
-
-def _trusted_optional_local_viewer_url(raw_url: str) -> str:
-    if not raw_url:
-        return ""
-    return _trusted_local_viewer_url(raw_url, "")
-
-
-def _trusted_rerun_source_url(raw_url: str) -> str:
-    fallback = "rerun+http://127.0.0.1:9877/proxy"
-    if not raw_url.startswith("rerun+"):
-        return fallback
-    parsed = urlparse(raw_url.removeprefix("rerun+"))
-    hostname = parsed.hostname or ""
-    if parsed.scheme in {"http", "https"} and hostname in {"127.0.0.1", "localhost", "::1"}:
-        return raw_url
-    if os.environ.get("DOGOPS_ALLOW_REMOTE_VIEWER") == "1":
-        return raw_url
-    return fallback
-
-
-def _trusted_local_viewer_url(raw_url: str, fallback: str) -> str:
-    parsed = urlparse(raw_url)
-    hostname = parsed.hostname or ""
-    if parsed.scheme in {"http", "https"} and hostname in {"127.0.0.1", "localhost", "::1"}:
-        return raw_url
-    if os.environ.get("DOGOPS_ALLOW_REMOTE_VIEWER") == "1":
-        return raw_url
-    return fallback
-
-
-def _map_pixel(site_map: dict[str, Any], x: float, y: float) -> tuple[float, float]:
-    width = 720
-    height = 420
-    pad = 34
-    map_width_m = float(site_map.get("width_m") or 4.5)
-    map_height_m = float(site_map.get("height_m") or 3.0)
-    origin = site_map.get("origin") or {}
-    origin_x = float(origin.get("x") or 0.0)
-    origin_y = float(origin.get("y") or 0.0)
-    resolution = float(site_map.get("resolution_m") or 0.5)
-    dimos_costmap = site_map.get("dimos_costmap") or {}
-    dimos_grid_payload = dimos_costmap.get("grid") if isinstance(dimos_costmap, dict) else None
-    grid_rows = (
-        decode_dimos_costmap_full(dimos_grid_payload)
-        if isinstance(dimos_grid_payload, dict)
-        else []
-    )
-    if grid_rows and isinstance(dimos_costmap, dict):
-        origin_vector = (dimos_costmap.get("origin") or {}).get("c") or []
-        if len(origin_vector) >= 2:
-            origin_x = float(origin_vector[0])
-            origin_y = float(origin_vector[1])
-        resolution = float(dimos_costmap.get("resolution") or resolution)
-        map_width_m = max(resolution, len(grid_rows[0]) * resolution)
-        map_height_m = max(resolution, len(grid_rows) * resolution)
-
-    px = pad + ((x - origin_x) / map_width_m) * (width - 2 * pad)
-    py = height - pad - ((y - origin_y) / map_height_m) * (height - 2 * pad)
-    return px, py
-
-
-def map_svg(site_map: dict[str, Any], route_plan: dict[str, Any]) -> str:
-    width = 720
-    height = 420
-    pad = 34
-    cells = site_map.get("cells") or []
-    dimos_costmap = site_map.get("dimos_costmap") or {}
-    dimos_grid_payload = dimos_costmap.get("grid") if isinstance(dimos_costmap, dict) else None
-    grid_rows = (
-        decode_dimos_costmap_full(dimos_grid_payload)
-        if isinstance(dimos_grid_payload, dict)
-        else []
-    )
-    map_width_m = float(site_map.get("width_m") or 4.5)
-    map_height_m = float(site_map.get("height_m") or 3.0)
-    origin = site_map.get("origin") or {}
-    origin_x = float(origin.get("x") or 0.0)
-    origin_y = float(origin.get("y") or 0.0)
-    resolution = float(site_map.get("resolution_m") or 0.5)
-    if grid_rows and isinstance(dimos_costmap, dict):
-        origin_vector = (dimos_costmap.get("origin") or {}).get("c") or []
-        if len(origin_vector) >= 2:
-            origin_x = float(origin_vector[0])
-            origin_y = float(origin_vector[1])
-        resolution = float(dimos_costmap.get("resolution") or resolution)
-        map_width_m = max(resolution, len(grid_rows[0]) * resolution)
-        map_height_m = max(resolution, len(grid_rows) * resolution)
-    features = site_map.get("features") or []
-    path = site_map.get("explored_path") or []
-    dimos_path = site_map.get("dimos_path") or {}
-    dimos_path_points = dimos_path.get("points") if isinstance(dimos_path, dict) else None
-    if isinstance(dimos_path_points, list):
-        path = [
-            {"x": point[0], "y": point[1]}
-            for point in dimos_path_points
-            if isinstance(point, (list, tuple)) and len(point) >= 2
-        ]
-    waypoints = route_plan.get("waypoints") or []
-    pois = route_plan.get("points_of_interest") or []
-
-    def sx(x: float) -> float:
-        return pad + ((x - origin_x) / map_width_m) * (width - 2 * pad)
-
-    def sy(y: float) -> float:
-        return height - pad - ((y - origin_y) / map_height_m) * (height - 2 * pad)
-
-    def cell_color(state: str) -> str:
-        return {
-            "free": "#dbeafe",
-            "occupied": "#fecaca",
-            "restricted": "#fde68a",
-            "unknown": "#f1f5f9",
-        }.get(state, "#f1f5f9")
-
-    def cost_color(value: int) -> str:
-        if value == -1:
-            return "#f1f5f9"
-        if value == 0:
-            return "#dbeafe"
-        return "#fecaca"
-
-    if not cells and not grid_rows:
-        return (
-            f'<svg viewBox="0 0 {width} {height}" role="img" aria-label="DogOps map">'
-            '<rect width="720" height="420" fill="#f8fafc"/>'
-            '<text x="48" y="72" fill="#17202a" font-family="Arial, sans-serif" '
-            'font-size="24" font-weight="700">Map is empty</text>'
-            '<text x="48" y="108" fill="#5b6776" font-family="Arial, sans-serif" '
-            'font-size="16">Use Map Open Space to populate the simulated local map.</text>'
-            "</svg>"
-        )
-
-    cell_w = max(2.0, (resolution / map_width_m) * (width - 2 * pad))
-    cell_h = max(2.0, (resolution / map_height_m) * (height - 2 * pad))
-    cell_rects = []
-    if grid_rows:
-        for y_index, row in enumerate(grid_rows):
-            for x_index, value in enumerate(row):
-                x = origin_x + (x_index * resolution)
-                y = origin_y + (y_index * resolution)
-                cell_rects.append(
-                    f'<rect x="{sx(x):.1f}" y="{sy(y + resolution):.1f}" '
-                    f'width="{cell_w + 0.8:.1f}" height="{cell_h + 0.8:.1f}" '
-                    f'fill="{cost_color(value)}"/>'
-                )
-    else:
-        for cell in cells:
-            x = origin_x + (int(cell["x_index"]) * resolution)
-            y = origin_y + (int(cell["y_index"]) * resolution)
-            cell_rects.append(
-                f'<rect x="{sx(x):.1f}" y="{sy(y + resolution):.1f}" '
-                f'width="{cell_w + 0.8:.1f}" height="{cell_h + 0.8:.1f}" '
-                f'fill="{cell_color(str(cell.get("state", "unknown")))}"/>'
-            )
-
-    path_points = " ".join(
-        f"{sx(float(point.get('x') or 0.0)):.1f},{sy(float(point.get('y') or 0.0)):.1f}"
-        for point in path
-    )
-    route_points = " ".join(
-        f"{sx(float((waypoint.get('pose') or {}).get('x') or 0.0)):.1f},"
-        f"{sy(float((waypoint.get('pose') or {}).get('y') or 0.0)):.1f}"
-        for waypoint in waypoints
-    )
-    feature_marks = []
-    poi_targets = {poi.get("target_id") for poi in pois}
-    poi_order = {poi.get("target_id"): index + 1 for index, poi in enumerate(pois)}
-    for feature in features:
-        pose = feature.get("pose") or {}
-        x = sx(float(pose.get("x") or 0.0))
-        y = sy(float(pose.get("y") or 0.0))
-        is_poi = feature.get("id") in poi_targets
-        color = "#0f766e" if not is_poi else "#b45309"
-        label = str(feature.get("id", ""))
-        display_name = str(feature.get("display_name") or label)
-        feature_marks.append(
-            f'<g data-map-target-id="{escape(label, quote=True)}" '
-            f'data-map-target-name="{escape(display_name, quote=True)}">'
-            f"<title>{escape(display_name)}</title>"
-        )
-        feature_marks.append(
-            f'<circle class="map-target-hit" cx="{x:.1f}" cy="{y:.1f}" r="18" '
-            'fill="#ffffff" opacity="0.01"/>'
-        )
-        feature_marks.append(
-            f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{7 if is_poi else 5}" fill="{color}"/>'
-        )
-        if is_poi:
-            feature_marks.append(
-                f'<text x="{x:.1f}" y="{y + 4:.1f}" fill="#ffffff" '
-                'font-family="Arial, sans-serif" font-size="10" font-weight="700" '
-                f'text-anchor="middle">{escape(str(poi_order.get(feature.get("id"), "")))}</text>'
-            )
-        elif feature.get("kind") == "zone" and label != "RACK_ROW_A":
-            feature_marks.append(
-                f'<text x="{x:.1f}" y="{y - 11:.1f}" fill="#17202a" '
-                'font-family="Arial, sans-serif" font-size="12" text-anchor="middle">'
-                f"{escape(label)}</text>"
-            )
-        feature_marks.append("</g>")
-
-    robot_pose = site_map.get("robot_pose") or {}
-    robot_mark = ""
-    if isinstance(robot_pose, dict) and robot_pose.get("x") is not None and robot_pose.get("y") is not None:
-        robot_x = sx(float(robot_pose.get("x") or 0.0))
-        robot_y = sy(float(robot_pose.get("y") or 0.0))
-        theta = float(robot_pose.get("theta_deg") or 0.0)
-        heading_x = robot_x + (16 * math.cos(math.radians(theta)))
-        heading_y = robot_y - (16 * math.sin(math.radians(theta)))
-        robot_mark = (
-            f'<circle cx="{robot_x:.1f}" cy="{robot_y:.1f}" r="10" fill="#111827" '
-            'stroke="#ffffff" stroke-width="3"/>'
-            f'<line x1="{robot_x:.1f}" y1="{robot_y:.1f}" x2="{heading_x:.1f}" '
-            f'y2="{heading_y:.1f}" stroke="#111827" stroke-width="4" stroke-linecap="round"/>'
-            f'<text x="{robot_x + 13:.1f}" y="{robot_y - 13:.1f}" fill="#111827" '
-            'font-family="Arial, sans-serif" font-size="12" font-weight="700">dog</text>'
-        )
-
-    return (
-        f'<svg viewBox="0 0 {width} {height}" role="img" aria-label="DogOps map">'
-        '<rect width="720" height="420" fill="#f8fafc"/>'
-        + "".join(cell_rects)
-        + (
-            f'<polyline points="{path_points}" fill="none" stroke="#2563eb" '
-            'stroke-width="4" stroke-linecap="round" stroke-linejoin="round" opacity="0.55"/>'
-            if path_points
-            else ""
-        )
-        + (
-            f'<polyline points="{route_points}" fill="none" stroke="#0f766e" '
-            'stroke-width="3" stroke-dasharray="8 7" stroke-linecap="round"/>'
-            if route_points
-            else ""
-        )
-        + "".join(feature_marks)
-        + robot_mark
-        + '<rect x="18" y="18" width="190" height="34" rx="6" fill="#ffffff" stroke="#d7dce3"/>'
-        + '<text x="32" y="41" fill="#17202a" font-family="Arial, sans-serif" font-size="14">'
-        + f'{escape(str(site_map.get("status", "empty")))} / '
-        + f'{float(site_map.get("coverage_ratio", 0.0)) * 100:.0f}% coverage</text>'
-        + '<text x="32" y="396" fill="#5b6776" font-family="Arial, sans-serif" font-size="12">'
-        + f'{escape(str(site_map.get("dimos_schema", "dimos.web.websocket_vis.v1")))}</text>'
-        + "</svg>"
-    )
-
-
-def target_option_html(options: list[dict[str, str]]) -> str:
-    return "".join(
-        f'<option value="{escape(option["id"])}">{escape(option["label"])}</option>'
-        for option in options
-    )
-
-
-def route_table(route_plan: dict[str, Any]) -> str:
-    waypoints = route_plan.get("waypoints") or []
-    if not waypoints:
-        return '<p class="muted">No waypoints set.</p>'
-    rows = []
-    for waypoint in waypoints:
-        rows.append(
-            "<tr>"
-            f"<td>{escape(str(waypoint.get('order')))}</td>"
-            f"<td>{escape(str(waypoint.get('target_id')))}</td>"
-            f"<td>{escape(str(waypoint.get('action')))}</td>"
-            f"<td>{escape(str(waypoint.get('display_name')))}</td>"
-            "</tr>"
-        )
-    return (
-        "<table><thead><tr><th>#</th><th>Target</th><th>Action</th><th>Name</th>"
-        "</tr></thead><tbody>"
-        + "".join(rows)
-        + "</tbody></table>"
-    )
-
-
-def poi_table(route_plan: dict[str, Any]) -> str:
-    pois = route_plan.get("points_of_interest") or []
-    if not pois:
-        return '<p class="muted">No photo points set.</p>'
-    rows = []
-    for poi in pois:
-        rows.append(
-            "<tr>"
-            f"<td>{escape(str(poi.get('id')))}</td>"
-            f"<td>{escape(str(poi.get('target_id')))}</td>"
-            f"<td>{escape(', '.join(str(item) for item in poi.get('reading_keys') or []))}</td>"
-            "</tr>"
-        )
-    return (
-        "<table><thead><tr><th>POI</th><th>Target</th><th>Readings</th>"
-        "</tr></thead><tbody>"
-        + "".join(rows)
-        + "</tbody></table>"
-    )
-
-
-def capture_grid(captures: list[dict[str, Any]]) -> str:
-    if not captures:
-        return '<p class="muted">No point-of-interest photos captured yet.</p>'
-    items = []
-    for capture in captures:
-        image_path = Path(str(capture.get("image_path") or ""))
-        src = f"/evidence/{escape(image_path.name)}" if image_path.name else ""
-        image = f'<img src="{src}" alt="{escape(str(capture.get("poi_id")))} evidence">' if src else ""
-        items.append(
-            '<div class="evidence-item">'
-            f"{image}"
-            f"<h3>{escape(str(capture.get('poi_id')))}</h3>"
-            f"<p>{escape(str(capture.get('analysis')))}</p>"
-            f"<p class=\"muted\">{escape(str(capture.get('vlm_provider')))} analysis</p>"
-            "</div>"
-        )
-    return '<div class="evidence-grid">' + "".join(items) + "</div>"
-
-
-def reading_table(readings: list[dict[str, Any]]) -> str:
-    if not readings:
-        return '<p class="muted">No readings analyzed yet.</p>'
-    rows = []
-    for reading in readings:
-        value = format_reading_value(reading.get("value"), reading.get("unit"))
-        rows.append(
-            "<tr>"
-            f"<td>{escape(str(reading.get('poi_id')))}</td>"
-            f"<td>{escape(str(reading.get('name')))}</td>"
-            f"<td>{escape(value)}</td>"
-            f"<td>{escape(str(reading.get('status')))}</td>"
-            f"<td>{escape(str(reading.get('source')))}</td>"
-            "</tr>"
-        )
-    return (
-        "<table><thead><tr><th>POI</th><th>Reading</th><th>Value</th>"
-        "<th>Status</th><th>Source</th></tr></thead><tbody>"
-        + "".join(rows)
-        + "</tbody></table>"
     )
 
 
@@ -1825,23 +2106,85 @@ def work_order_table(work_orders: list[dict[str, Any]]) -> str:
     )
 
 
-def write_dashboard_html(
-    run_dir: str | Path,
-    *,
-    robot_control_token: str | None = None,
-    runtime_mode: str | None = None,
-) -> Path:
+def checkpoint_table(checkpoints: list[dict[str, Any]]) -> str:
+    rows = []
+    for checkpoint in checkpoints:
+        verified = bool(checkpoint.get("verified"))
+        state = "verified" if verified else "missing"
+        tag_id = checkpoint.get("expected_tag_id")
+        observation_id = checkpoint.get("observation_id") or "not observed"
+        rows.append(
+            "<tr>"
+            f"<td>{escape(str(checkpoint['target_id']))}</td>"
+            f"<td>{escape(str(tag_id if tag_id is not None else 'none'))}</td>"
+            f"<td>{escape(str(observation_id))}</td>"
+            f"<td class=\"state-{state}\">{state}</td>"
+            "</tr>"
+        )
+    return (
+        "<table><thead><tr><th>Target</th><th>Tag</th><th>Observation</th><th>State</th>"
+        "</tr></thead><tbody>"
+        + "".join(rows)
+        + "</tbody></table>"
+    )
+
+
+def route_table(stops: list[dict[str, Any]]) -> str:
+    rows = []
+    for stop in stops:
+        state = "verified" if stop.get("tag_verified") else "missing"
+        tag_id = stop.get("expected_tag_id")
+        rows.append(
+            "<tr>"
+            f"<td>{escape(str(stop['sequence']))}</td>"
+            f"<td>{escape(str(stop['target_id']))}</td>"
+            f"<td>{escape(str(tag_id if tag_id is not None else 'none'))}</td>"
+            f"<td>{escape(str(stop.get('retries', 0)))}</td>"
+            f"<td class=\"state-{state}\">{state}</td>"
+            "</tr>"
+        )
+    return (
+        "<table><thead><tr><th>#</th><th>Target</th><th>Tag</th><th>Retries</th>"
+        "<th>State</th></tr></thead><tbody>"
+        + "".join(rows)
+        + "</tbody></table>"
+    )
+
+
+def poi_list(poi_data: dict[str, Any]) -> str:
+    captures = poi_data.get("captures") or []
+    readings = poi_data.get("readings") or []
+    items = []
+    for capture in captures[:4]:
+        tags = ", ".join(str(tag_id) for tag_id in capture.get("visible_tag_ids") or []) or "none"
+        incidents = capture.get("related_incident_ids") or []
+        incident_text = f" / incidents {', '.join(incidents)}" if incidents else ""
+        items.append(
+            "<li>"
+            f"<strong>{escape(str(capture['id']))}</strong> "
+            f"{escape(str(capture.get('zone_id') or 'unknown'))} / tags {escape(tags)}"
+            f"{escape(incident_text)}"
+            "</li>"
+        )
+    for reading in readings[:3]:
+        if reading.get("kind") == "temperature":
+            label = (
+                f"{reading['asset_id']} {reading['reading_celsius']}C "
+                f"<= {reading['max_celsius']}C"
+            )
+        else:
+            label = f"{reading['asset_id']} {reading.get('state', 'unknown')}"
+        items.append(f"<li><strong>{escape(str(reading['kind']))}</strong> {escape(label)}</li>")
+    return '<ul class="compact-list">' + "".join(items) + "</ul>"
+
+
+def write_dashboard_html(run_dir: str | Path, *, robot_control_token: str | None = None) -> Path:
     root = Path(run_dir)
     state = _read_json(root / "state.json")
     report = _read_json(root / "report.json")
     html_path = root / "dashboard.html"
     html_path.write_text(
-        render_dashboard_html(
-            state,
-            report,
-            robot_control_token=robot_control_token,
-            runtime_mode=runtime_mode,
-        ),
+        render_dashboard_html(state, report, robot_control_token=robot_control_token),
         encoding="utf-8",
     )
     return html_path
@@ -1851,16 +2194,34 @@ def _read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _target_options(state: dict[str, Any]) -> list[dict[str, str]]:
-    site = state.get("site") or {}
-    options: list[dict[str, str]] = []
-    for collection in ("zones", "assets", "packages"):
-        for entity in site.get(collection) or []:
-            entity_id = str(entity.get("id"))
-            label = f"{entity_id} - {entity.get('display_name', entity_id)}"
-            options.append({"id": entity_id, "label": label})
-    for entity in (site.get("special_entities") or {}).values():
-        entity_id = str(entity.get("id"))
-        label = f"{entity_id} - {entity.get('display_name', entity_id)}"
-        options.append({"id": entity_id, "label": label})
-    return options
+def _latest_fact_value(observations: list[dict[str, Any]], key: str) -> object | None:
+    for observation in reversed(observations):
+        facts = observation.get("facts") or {}
+        if key in facts:
+            return facts[key]
+    return None
+
+
+def _to_float(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int | float):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _to_bool(value: object) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "yes", "1", "clear"}:
+            return True
+        if normalized in {"false", "no", "0", "blocked"}:
+            return False
+    return None

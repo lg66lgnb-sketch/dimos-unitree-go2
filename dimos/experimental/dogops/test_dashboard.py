@@ -1,18 +1,32 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
+import re
+import sys
 import threading
+import time
 from typing import Any
 import urllib.request
 
 import pytest
 
-from dimos.experimental.dogops import dashboard
+from dimos.experimental.dogops import dashboard, dashboard_static
 from dimos.experimental.dogops.dashboard import DogOpsDashboardModule, make_dashboard_server
-from dimos.experimental.dogops.dashboard_static import dimos_viewer_urls, write_dashboard_html
+from dimos.experimental.dogops.dashboard_static import (
+    build_map_data,
+    build_poi_data,
+    build_route_data,
+    write_dashboard_html,
+)
+from dimos.experimental.dogops.live_map import (
+    DogOpsLiveMapAdapter,
+    LIVE_TOPIC_MAX_AGE_S,
+    _extend_dimos_package_path,
+    _grid_to_costmap,
+)
 from dimos.experimental.dogops.mission_engine import run_offline_simulation
-from dimos.experimental.dogops.store import DogOpsStore
 
 
 def _get_json(url: str) -> dict[str, object]:
@@ -54,52 +68,63 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     content = html_path.read_text(encoding="utf-8")
 
     assert "DogOps SiteOps Agent" in content
-    assert "PKG-104" in content
-    assert "INC-001" in content
-    assert "Live Inspection Console" in content
-    assert "Needs Attention" in content
-    assert "Machine Readings" in content
-    assert "Floor Changes" in content
-    assert "Inspection points" in content
-    assert "<span>Mode</span><strong>Real dog</strong>" in content
+    assert "Mission Map" in content
+    assert 'data-map-surface' in content
+    assert "map-route" in content
+    assert "map-free-cell" in content
+    assert "map-live-cost-cell" in content
+    assert "map-dimos-path" in content
+    assert 'data-map-layer="heatmap"' in content
+    assert 'data-live-heatmap' in content
+    assert 'data-live-path' in content
+    assert 'data-live-target' in content
+    assert "refreshDimOSMap" in content
+    assert "map-point" in content
+    assert "map-robot-core" in content
+    assert "free grid" in content
+    assert "tag return" in content
+    assert "no-go cost" in content
+    assert content.index("Rerun Map") < content.index("Mission Map")
     assert 'data-map-viewer' in content
-    assert 'data-mission-map' in content
-    assert content.index('data-map-viewer') < content.index('data-mission-map')
     assert 'data-rerun-source-url="rerun+http://127.0.0.1:9877/proxy"' in content
-    assert 'data-rerun-view-mode="dogops-2d"' in content
-    assert 'data-rerun-embed-url=""' in content
-    assert "DimOS/Rerun top-down map" in content
-    assert 'data-rerun-module-url="/assets/rerun-web-viewer.js"' in content
-    assert 'data-rerun-asset-base-url="/assets/vendor/@rerun-io/web-viewer/"' in content
     assert 'data-rerun-canvas' in content
     assert 'data-viewer-offline' in content
-    assert 'class="map-target-overlay" data-route-map' in content
-    assert "data-viewer-offline data-route-map" not in content
-    assert "Mission Map" in content
-    assert "Rerun above remains the live map surface." in content
-    assert "Inspection Evidence" in content
-    assert 'data-route-action="explore"' in content
-    assert 'data-route-action="stop-explore"' in content
-    assert 'data-route-action="replay-map"' in content
-    assert "Inspection points (3/3)" in content
-    assert 'data-route-action="add-inspection"' in content
-    assert 'data-route-action="clear-inspection"' in content
-    assert 'data-route-action="add-waypoint"' not in content
-    assert 'data-route-action="add-poi"' not in content
-    assert 'data-map-click-mode="inspection"' in content
-    assert 'data-map-click-mode="waypoint"' not in content
-    assert 'data-map-click-mode="poi"' not in content
-    assert "dogops:map-click-mode" in content
-    assert "Rerun WebViewer unavailable; showing offline map artifact." in Path(
-        "dimos/experimental/dogops/static/rerun-web-viewer.js"
-    ).read_text(encoding="utf-8")
-    assert 'data-map-target-id="COOLING_1"' in content
-    assert "/evidence/" in content
+    assert 'data-rerun-action="focus"' in content
+    assert 'data-rerun-action="replay"' in content
+    assert '"/assets/rerun-web-viewer.js"' in content
+    assert 'data-rerun-frame' not in content
+    assert 'data-rerun-web-link' in content
+    assert 'data-map-command-status' in content
+    assert 'data-map-action="arm_go_to"' in content
+    assert 'data-go-to-marker' in content
+    assert "/api/robot/go_to" in content
+    assert "worldFromSvgEvent" in content
+    assert "map-zone no-go" not in content
+    assert "OBS-003" in content
+    assert "PKG-104" in content
+    assert "INC-001" in content
     assert "Navigation Eval" in content
+    assert "Route / POI Evidence" in content
+    assert "Route Stops" in content
+    assert "POI Evidence" in content
     assert "Robot Control" in content
-    assert "Real dog" in content
+    assert "Checkpoint Sign-In" in content
+    assert "Tag Sign-In" in content
+    assert "OBS-005" in content
     assert 'data-command="forward"' in content
     assert 'data-command="hard_stop"' in content
+    assert 'data-command="yaw_left" data-key-hint="Q"' in content
+    assert 'data-command="yaw_right" data-key-hint="E"' in content
+    assert 'data-key-hint="W / Up"' in content
+    assert 'data-key-hint="Space / Esc"' in content
+    assert 'data-keyboard-map' in content
+    assert '["KeyW", "forward"]' in content
+    assert '["KeyQ", "yaw_left"]' in content
+    assert '["KeyE", "yaw_right"]' in content
+    assert '["ArrowDown", "backward"]' in content
+    assert '["Space", "hard_stop"]' in content
+    assert '["Escape", "hard_stop"]' in content
+    assert "shouldIgnoreKeyboardEvent" in content
     assert 'data-posture="wake"' in content
     assert 'data-posture="sleep"' in content
     assert 'data-motion="nudge"' in content
@@ -108,66 +133,62 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert "X-DogOps-Control-Token" in content
 
 
-def test_dashboard_static_html_surfaces_planned_route_before_run(tmp_path) -> None:
-    run_dir = tmp_path / "latest"
-    run_offline_simulation(out=run_dir)
-    store = DogOpsStore.load_existing(run_dir)
-    state = store.state
-    assert state is not None
-    state.nav_events = []
-    state.nav_summary.waypoints_total = 0
-    state.nav_summary.waypoints_reached = 0
-    store.write_state(state.run.id)
-    store.write_report(state.run.id)
-    write_dashboard_html(run_dir)
-
-    content = (run_dir / "dashboard.html").read_text(encoding="utf-8")
-
-    assert "<span>Route</span><strong>6 planned</strong>" in content
-
-
-def test_dashboard_rerun_sim_mode_keeps_rerun_as_primary_map(tmp_path) -> None:
+def test_dashboard_map_layer_controls_match_svg_layers(tmp_path) -> None:
     run_dir = tmp_path / "latest"
     run_offline_simulation(out=run_dir)
 
-    html_path = write_dashboard_html(run_dir, runtime_mode="rerun-sim")
+    html_path = write_dashboard_html(run_dir)
     content = html_path.read_text(encoding="utf-8")
 
-    assert "<span>Mode</span><strong>Rerun sim</strong>" in content
-    assert "Offline map artifact." in content
-    assert 'if (dogopsRuntimeMode === "offline")' in content
-    assert 'data-rerun-canvas' in content
-    assert 'data-viewer-offline hidden' in content
-    assert 'class="map-target-overlay" data-route-map' not in content
-    assert 'data-map-click-mode="inspection"' not in content
+    controls = set(re.findall(r'data-map-layer="([^"]+)"', content))
+    layers = set(re.findall(r'data-layer="([^"]+)"', content))
+    assert controls == {"semantic", "heatmap", "path", "robot"}
+    assert controls <= layers
+    assert 'querySelectorAll(`[data-layer="${layer}"]`)' in content
+    assert 'item.toggleAttribute("hidden", !pressed)' in content
+    assert "let dimosRobotPoseActive = false" in content
+    assert "if (dimosRobotPoseActive) return" in content
+    assert "let liveOverlayBounds = null" in content
+    assert "if (data.bounds) liveOverlayBounds = data.bounds" in content
+    assert "const projectWorldPoint = (x, y) => projectLivePose({x, y})" in content
+    assert "const projectLiveOverlayPoint = (x, y) => projectLiveOverlayPose({x, y})" in content
 
 
-def test_dashboard_viewer_urls_default_local_and_remote_gated(monkeypatch) -> None:
-    monkeypatch.setenv("DOGOPS_RERUN_SOURCE_URL", "rerun+http://10.0.0.5:9877/proxy")
-    monkeypatch.setenv("DOGOPS_RERUN_WEB_VIEWER_MODULE_URL", "https://cdn.example/viewer.js")
-    monkeypatch.setenv("DOGOPS_RERUN_WEB_VIEWER_ASSET_BASE_URL", "https://cdn.example/assets/")
-    monkeypatch.setenv("DOGOPS_COMMAND_CENTER_URL", "http://10.0.0.5:7779/command-center")
-    monkeypatch.setenv("DOGOPS_RERUN_EMBED_URL", "http://10.0.0.5:9878")
+def test_dashboard_rerun_web_url_stays_loopback_only() -> None:
+    fallback = "http://127.0.0.1:9877"
 
-    assert dimos_viewer_urls() == {
-        "rerun_source": "rerun+http://127.0.0.1:9877/proxy",
-        "web_viewer_module": "/assets/rerun-web-viewer.js",
-        "web_viewer_asset_base": "/assets/vendor/@rerun-io/web-viewer/",
-        "command_center": "http://127.0.0.1:7779/command-center",
-        "rerun_view_mode": "dogops-2d",
-        "rerun_embed": "",
-    }
+    assert dashboard_static._trusted_rerun_web_url(None) == fallback
+    assert dashboard_static._trusted_rerun_web_url("http://127.0.0.1:9877") == fallback
+    assert (
+        dashboard_static._trusted_rerun_web_url("http://localhost:9877/?dataset=dogops")
+        == "http://localhost:9877/?dataset=dogops"
+    )
+    assert (
+        dashboard_static._trusted_rerun_web_url("https://[::1]:9877")
+        == "https://[::1]:9877"
+    )
+    assert dashboard_static._trusted_rerun_web_url("https://rerun.example.com") == fallback
+    assert dashboard_static._trusted_rerun_web_url("javascript:alert(1)") == fallback
 
-    monkeypatch.setenv("DOGOPS_ALLOW_REMOTE_VIEWER", "1")
-    monkeypatch.setenv("DOGOPS_RERUN_VIEW_MODE", "native-3d")
-    assert dimos_viewer_urls() == {
-        "rerun_source": "rerun+http://10.0.0.5:9877/proxy",
-        "web_viewer_module": "https://cdn.example/viewer.js",
-        "web_viewer_asset_base": "https://cdn.example/assets/",
-        "command_center": "http://10.0.0.5:7779/command-center",
-        "rerun_view_mode": "native-3d",
-        "rerun_embed": "http://10.0.0.5:9878",
-    }
+
+def test_dashboard_rerun_source_url_stays_loopback_only() -> None:
+    fallback = "rerun+http://127.0.0.1:9877/proxy"
+
+    assert dashboard_static._trusted_rerun_source_url(None) == fallback
+    assert (
+        dashboard_static._trusted_rerun_source_url("rerun+http://127.0.0.1:9877/proxy")
+        == fallback
+    )
+    assert (
+        dashboard_static._trusted_rerun_source_url("rerun+ws://localhost:9877/proxy")
+        == "rerun+ws://localhost:9877/proxy"
+    )
+    assert dashboard_static._trusted_rerun_source_url("http://127.0.0.1:9877") == fallback
+    assert (
+        dashboard_static._trusted_rerun_source_url("rerun+https://rerun.example.com/proxy")
+        == fallback
+    )
+    assert dashboard_static._trusted_rerun_source_url("javascript:alert(1)") == fallback
 
 
 def test_dashboard_module_writes_dashboard_and_reports_status(tmp_path) -> None:
@@ -194,10 +215,12 @@ def test_dashboard_api_serves_state_report_and_nav(tmp_path) -> None:
     try:
         with urllib.request.urlopen(f"{base_url}/", timeout=5) as response:
             html = response.read().decode("utf-8")
+        with urllib.request.urlopen(f"{base_url}/assets/rerun-web-viewer.js", timeout=5) as response:
+            rerun_asset = response.read().decode("utf-8")
         state = _get_json(f"{base_url}/api/state")
         report = _get_json(f"{base_url}/api/report")
         nav = _get_json(f"{base_url}/api/nav")
-        site_map = _get_json(f"{base_url}/api/map")
+        map_data = _get_json(f"{base_url}/api/map")
         route = _get_json(f"{base_url}/api/route")
         poi = _get_json(f"{base_url}/api/poi")
     finally:
@@ -206,20 +229,75 @@ def test_dashboard_api_serves_state_report_and_nav(tmp_path) -> None:
         thread.join(timeout=5)
 
     assert "DogOps SiteOps Agent" in html
+    assert "mountDogOpsRerunViewer" in rerun_asset
     assert state["run"]["state"] == "done"  # type: ignore[index]
     assert report["manifest_exceptions"] == 2
+    assert report["checkpoints_verified"] == 4
+    assert report["checkpoint_verifications"][2]["target_id"] == "COOLING_1"  # type: ignore[index]
+    assert report["checkpoint_verifications"][2]["expected_tag_id"] == 41  # type: ignore[index]
     assert nav["waypoints_reached"] == 4
-    assert site_map["status"] == "mapped"
-    assert site_map["dimos_schema"] == "dimos.web.websocket_vis.v1"
-    assert site_map["dimos_costmap"]["type"] == "costmap"  # type: ignore[index]
-    assert site_map["dimos_path"]["type"] == "path"  # type: ignore[index]
-    assert site_map["robot_pose"]["source"] in {"nav_event", "dimos_odom"}  # type: ignore[index]
-    assert len(route["waypoints"]) >= 5  # type: ignore[arg-type]
-    assert len(poi["captures"]) == 3  # type: ignore[arg-type]
+    assert [stop["target_id"] for stop in map_data["route"]] == [
+        "HOME",
+        "INBOUND_DOCK",
+        "COOLING_1",
+        "QA_HOLD",
+    ]
+    assert [stop["target_id"] for stop in route["stops"]] == [
+        "HOME",
+        "INBOUND_DOCK",
+        "COOLING_1",
+        "QA_HOLD",
+    ]
+    assert route["stops"][2]["tag_verified"] is True  # type: ignore[index]
+    assert any(capture["id"] == "OBS-003" for capture in poi["captures"])  # type: ignore[index]
+    assert any(reading["asset_id"] == "TEMP_1" for reading in poi["readings"])  # type: ignore[index]
+    assert any(package["id"] == "PKG-104" for package in map_data["packages"])
+    assert map_data["live"]["source"] == "DimOS live LCM topics"  # type: ignore[index]
+    assert "costmap" in map_data["live"]  # type: ignore[operator]
 
 
-def test_dashboard_route_editor_mutates_local_run(tmp_path, monkeypatch) -> None:
-    monkeypatch.setenv("DOGOPS_RUNTIME_MODE", "offline")
+def test_dashboard_map_data_projects_site_route_and_observations(tmp_path) -> None:
+    run_dir = tmp_path / "latest"
+    state = run_offline_simulation(out=run_dir)
+    report = json.loads((run_dir / "report.json").read_text(encoding="utf-8"))
+
+    map_data = build_map_data(state.model_dump(mode="json"), report)
+
+    assert map_data["site_id"] == "dogops_demo_site"
+    assert {zone["id"] for zone in map_data["zones"]} >= {"HOME", "INBOUND_DOCK", "QA_HOLD"}
+    assert [stop["target_id"] for stop in map_data["route"]] == [
+        "HOME",
+        "INBOUND_DOCK",
+        "COOLING_1",
+        "QA_HOLD",
+    ]
+    assert any(observation["id"] == "OBS-003" for observation in map_data["observations"])
+    assert any(incident["id"] == "INC-001" for incident in map_data["incidents"])
+    assert map_data["live"]["status"] == "not_requested"
+
+
+def test_dashboard_map_data_includes_dimos_live_layers(tmp_path, monkeypatch) -> None:
+    class FakeLiveMapAdapter:
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "ok": True,
+                "source": "DimOS live LCM topics",
+                "status": "receiving",
+                "error": "",
+                "topics": {"global_costmap": {"received": True}},
+                "costmap": {
+                    "source": "DimOS live costmap",
+                    "columns": 1,
+                    "rows": 1,
+                    "cells": [{"x": 1.0, "y": 2.0, "width": 0.5, "height": 0.5, "cost": 0.9}],
+                },
+                "path": [{"x": 1.0, "y": 2.0}, {"x": 2.0, "y": 3.0}],
+                "route": [{"target_id": "LIVE-PATH-001", "x": 1.0, "y": 2.0}],
+                "robot_pose": {"x": 1.2, "y": 2.1, "theta_deg": 45.0, "source": "odom"},
+                "target": {"x": 2.0, "y": 3.0, "theta_deg": None, "source": "target"},
+            }
+
+    monkeypatch.setattr(dashboard, "_LIVE_MAP_ADAPTER", FakeLiveMapAdapter())
     run_dir = tmp_path / "latest"
     run_offline_simulation(out=run_dir)
     server = make_dashboard_server(run_dir, "127.0.0.1", 0)
@@ -228,154 +306,225 @@ def test_dashboard_route_editor_mutates_local_run(tmp_path, monkeypatch) -> None
     base_url = f"http://127.0.0.1:{server.server_address[1]}"
 
     try:
-        map_status, map_result = _post_json(f"{base_url}/api/map/explore", {})
-        replay_status, replay_result = _post_json(f"{base_url}/api/rerun/replay_map", {})
-        clear_status, clear_result = _post_json(f"{base_url}/api/route/inspection_points/clear", {})
-        first_status, first_result = _post_json(
-            f"{base_url}/api/route/inspection_points",
-            {"target_id": "COOLING_1"},
-        )
-        duplicate_status, duplicate_result = _post_json(
-            f"{base_url}/api/route/inspection_points",
-            {"target_id": "COOLING_1"},
-        )
-        second_status, second_result = _post_json(
-            f"{base_url}/api/route/inspection_points",
-            {"target_id": "TEMP_1"},
-        )
-        third_status, third_result = _post_json(
-            f"{base_url}/api/route/inspection_points",
-            {"target_id": "QA_HOLD"},
-        )
-        limit_status, limit_result = _post_json(
-            f"{base_url}/api/route/inspection_points",
-            {"target_id": "INBOUND_DOCK"},
-        )
-        run_status, run_result = _post_json(f"{base_url}/api/route/run", {})
-        poi = _get_json(f"{base_url}/api/poi")
-        rerun_command = json.loads((run_dir / "rerun_command.json").read_text(encoding="utf-8"))
+        map_data = _get_json(f"{base_url}/api/map")
     finally:
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
 
-    assert map_status == 200
-    assert map_result["map"]["status"] == "mapped"  # type: ignore[index]
-    assert map_result["rerun"]["action"] == "replay_mapping"  # type: ignore[index]
-    assert replay_status == 200
-    assert replay_result["rerun"]["action"] == "replay_mapping"  # type: ignore[index]
-    assert clear_status == 200
-    assert clear_result["inspection_points"] == 0
-    assert first_status == 200
-    assert first_result["inspection_points"] == 1
-    assert duplicate_status == 200
-    assert duplicate_result["inspection_points"] == 1
-    assert second_status == 200
-    assert second_result["inspection_points"] == 2
-    assert third_status == 200
-    assert third_result["inspection_points"] == 3
-    assert limit_status == 400
-    assert limit_result["error"] == "inspection_point_limit"
-    assert run_status == 200
-    assert run_result["captures"] == 3
-    assert run_result["rerun"]["action"] == "replay_route"  # type: ignore[index]
-    assert rerun_command["action"] == "replay_route"
-    assert len(poi["readings"]) >= 4  # type: ignore[arg-type]
+    assert map_data["live"]["ok"] is True  # type: ignore[index]
+    assert map_data["live"]["costmap"]["source"] == "DimOS live costmap"  # type: ignore[index]
+    assert map_data["live"]["path"][1]["x"] == 2.0  # type: ignore[index]
+    assert map_data["live"]["target"]["source"] == "target"  # type: ignore[index]
+    assert map_data["layers"]["heatmap"] is True  # type: ignore[index]
+    assert map_data["layers"]["path"] is True  # type: ignore[index]
 
 
-def test_dashboard_simulation_runtime_dispatches_dimos_controls(tmp_path, monkeypatch) -> None:
-    events: list[tuple[str, dict[str, Any] | None]] = []
-
-    def fake_emit(event: str, data: dict[str, Any] | None = None) -> dict[str, object]:
-        events.append((event, data))
-        return {"event": event, "data": data, "sent": True}
-
-    monkeypatch.setenv("DOGOPS_RUNTIME_MODE", "simulation")
-    monkeypatch.setattr(dashboard, "_emit_dimos_socket_event", fake_emit)
+def test_dashboard_map_data_bounds_include_live_overlay(tmp_path) -> None:
     run_dir = tmp_path / "latest"
-    run_offline_simulation(out=run_dir)
-    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+    state = run_offline_simulation(out=run_dir)
+    report = json.loads((run_dir / "report.json").read_text(encoding="utf-8"))
 
-    try:
-        explore_status, explore_result = _post_json(f"{base_url}/api/map/explore", {})
-        stop_status, stop_result = _post_json(f"{base_url}/api/map/stop_explore", {})
-        jog_status, jog_result = _post_json(
-            f"{base_url}/api/robot/jog",
-            {"command": "hard_stop"},
-            headers=_robot_headers(server),
-        )
-        posture_status, posture_result = _post_json(
-            f"{base_url}/api/robot/posture",
-            {"command": "sleep"},
-            headers=_robot_headers(server),
-        )
-        run_status, run_result = _post_json(f"{base_url}/api/route/run", {})
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=5)
+    map_data = build_map_data(
+        state.model_dump(mode="json"),
+        report,
+        live_overlay={
+            "ok": True,
+            "source": "DimOS live LCM topics",
+            "status": "receiving",
+            "error": "",
+            "topics": {},
+            "costmap": {
+                "cells": [{"x": 99.0, "y": 101.0, "width": 2.0, "height": 3.0, "cost": 1.0}]
+            },
+            "path": [{"x": -20.0, "y": -10.0}],
+            "route": [],
+            "robot_pose": {"x": 120.0, "y": 130.0},
+            "target": {"x": -30.0, "y": -40.0},
+        },
+    )
 
-    assert explore_status == 200
-    assert explore_result["mode"] == "simulation"
-    assert explore_result["map"]["status"] == "mapping"  # type: ignore[index]
-    assert stop_status == 200
-    assert stop_result["mode"] == "simulation"
-    assert jog_status == 200
-    assert jog_result["mode"] == "simulation"
-    assert posture_status == 200
-    assert posture_result["mode"] == "simulation"
-    assert run_status == 200
-    assert run_result["mode"] == "simulation"
-    assert [event for event, _ in events].count("start_explore") == 1
-    assert [event for event, _ in events].count("stop_explore") == 1
-    assert [event for event, _ in events].count("move_command") >= 2
-    assert [event for event, _ in events].count("click") >= 1
+    assert map_data["bounds"]["x_min"] <= -30.0
+    assert map_data["bounds"]["y_min"] <= -40.0
+    assert map_data["bounds"]["x_max"] >= 120.0
+    assert map_data["bounds"]["y_max"] >= 130.0
 
 
-def test_dashboard_rerun_sim_runtime_uses_replay_without_dimos_control(tmp_path, monkeypatch) -> None:
-    def fail_emit(event: str, data: dict[str, Any] | None = None) -> dict[str, object]:
-        raise AssertionError(f"rerun-sim mode must not emit DimOS socket event {event}: {data}")
+def test_live_map_adapter_does_not_assume_local_dimos_checkout(monkeypatch) -> None:
+    before = list(sys.path)
+    monkeypatch.delenv("DIMOS_ROOT", raising=False)
 
-    monkeypatch.setenv("DOGOPS_RUNTIME_MODE", "rerun-sim")
-    monkeypatch.setattr(dashboard, "_emit_dimos_socket_event", fail_emit)
+    _extend_dimos_package_path()
+
+    assert sys.path == before
+
+
+def test_live_map_adapter_snapshot_converts_recorded_dimos_messages() -> None:
+    class Pose:
+        def __init__(self, x: float, y: float, yaw: float = 0.0) -> None:
+            self.x = x
+            self.y = y
+            self.yaw = yaw
+
+    class Path:
+        poses = [Pose(1.0, 2.0), Pose(3.0, 4.0)]
+
+    class Costmap:
+        width = 2
+        height = 2
+        resolution = 0.5
+        origin = Pose(-1.0, -2.0)
+        grid: list[list[int]]
+
+    adapter = DogOpsLiveMapAdapter()
+    adapter._started = True
+    global_costmap = Costmap()
+    global_costmap.grid = [[0, 25], [50, 75]]
+    navigation_costmap = Costmap()
+    navigation_costmap.grid = [[100, 0], [0, 0]]
+
+    adapter._record("global_costmap", global_costmap)
+    adapter._record("navigation_costmap", navigation_costmap)
+    adapter._record("odom", Pose(0.2, 0.3, math.pi / 2))
+    adapter._record("path", Path())
+    adapter._record("clicked_point", Pose(5.0, 6.0))
+
+    snapshot = adapter.snapshot()
+
+    assert snapshot["ok"] is True
+    assert snapshot["status"] == "receiving"
+    assert snapshot["topics"]["global_costmap"]["received"] is True
+    assert snapshot["topics"]["navigation_costmap"]["received"] is True
+    assert snapshot["topics"]["clicked_point"]["received"] is True
+    assert snapshot["costmap"]["cells"][0]["cost"] == 1.0
+    assert snapshot["path"] == [
+        {"x": 1.0, "y": 2.0, "theta_deg": 0.0, "source": "path"},
+        {"x": 3.0, "y": 4.0, "theta_deg": 0.0, "source": "path"},
+    ]
+    assert snapshot["route"][1]["target_id"] == "LIVE-PATH-002"
+    assert snapshot["robot_pose"] == {
+        "x": 0.2,
+        "y": 0.3,
+        "theta_deg": 90.0,
+        "source": "odom",
+    }
+    assert snapshot["target"] == {
+        "x": 5.0,
+        "y": 6.0,
+        "theta_deg": 0.0,
+        "source": "target",
+    }
+
+
+def test_live_map_adapter_snapshot_reports_waiting_without_topics() -> None:
+    adapter = DogOpsLiveMapAdapter()
+    adapter._started = True
+
+    snapshot = adapter.snapshot()
+
+    assert snapshot["ok"] is False
+    assert snapshot["status"] == "waiting_for_topics"
+    assert snapshot["costmap"] is None
+    assert snapshot["path"] == []
+    assert snapshot["robot_pose"] is None
+
+
+def test_live_map_adapter_snapshot_expires_stale_topics() -> None:
+    class Pose:
+        x = 1.0
+        y = 2.0
+        yaw = 0.0
+
+    adapter = DogOpsLiveMapAdapter()
+    adapter._started = True
+    adapter._latest["odom"] = (time.time() - LIVE_TOPIC_MAX_AGE_S - 1.0, Pose())
+
+    snapshot = adapter.snapshot()
+
+    assert snapshot["ok"] is False
+    assert snapshot["topics"]["odom"]["received"] is False
+    assert snapshot["topics"]["odom"]["stale"] is True
+    assert snapshot["robot_pose"] is None
+
+
+def test_live_costmap_downsampling_stays_within_source_bounds() -> None:
+    class Position:
+        x = 0.0
+        y = 0.0
+
+    class Origin:
+        position = Position()
+
+    class Costmap:
+        width = 50
+        height = 50
+        resolution = 1.0
+        origin = Origin()
+
+    Costmap.grid = [[0 for _ in range(Costmap.width)] for _ in range(Costmap.height)]
+    Costmap.grid[-1][-1] = 100
+
+    costmap = _grid_to_costmap(Costmap(), max_columns=48, max_rows=32)
+
+    assert len(costmap["cells"]) == 48 * 32
+    assert all(cell["width"] > 0 for cell in costmap["cells"])  # type: ignore[index]
+    assert all(cell["height"] > 0 for cell in costmap["cells"])  # type: ignore[index]
+    assert max(cell["x"] + cell["width"] for cell in costmap["cells"]) <= 50  # type: ignore[index]
+    assert max(cell["y"] + cell["height"] for cell in costmap["cells"]) <= 50  # type: ignore[index]
+    assert max(cell["cost"] for cell in costmap["cells"]) == 1.0  # type: ignore[index]
+
+
+def test_dashboard_server_close_stops_live_adapter_and_robot_sessions(monkeypatch) -> None:
+    class Handler(dashboard.DogOpsDashboardHandler):
+        run_dir = Path(".")
+        robot_control_token = "test"
+        robot_ip = "192.168.12.1"
+
+    class FakeLiveAdapter:
+        stopped = False
+
+        def stop(self) -> None:
+            self.stopped = True
+
+    class FakeRobotSession:
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    adapter = FakeLiveAdapter()
+    session = FakeRobotSession()
+    monkeypatch.setitem(dashboard._ROBOT_SESSIONS, "192.168.12.1", session)
+    server = dashboard.DogOpsDashboardServer(("127.0.0.1", 0), Handler, live_map_adapter=adapter)
+
+    server.server_close()
+
+    assert adapter.stopped is True
+    assert session.closed is True
+    assert dashboard._ROBOT_SESSIONS == {}
+
+
+def test_dashboard_route_and_poi_data_project_evidence(tmp_path) -> None:
     run_dir = tmp_path / "latest"
-    run_offline_simulation(out=run_dir)
-    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+    state = run_offline_simulation(out=run_dir)
+    report = json.loads((run_dir / "report.json").read_text(encoding="utf-8"))
 
-    try:
-        explore_status, explore_result = _post_json(f"{base_url}/api/map/explore", {})
-        stop_status, stop_result = _post_json(f"{base_url}/api/map/stop_explore", {})
-        run_status, run_result = _post_json(f"{base_url}/api/route/run", {})
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=5)
+    route = build_route_data(state.model_dump(mode="json"), report)
+    poi = build_poi_data(state.model_dump(mode="json"), report)
 
-    assert explore_status == 200
-    assert explore_result["mode"] == "rerun-sim"
-    assert explore_result["rerun"]["action"] == "replay_mapping"  # type: ignore[index]
-    assert stop_status == 200
-    assert stop_result["mode"] == "rerun-sim"
-    assert run_status == 200
-    assert run_result["mode"] == "rerun-sim"
-    assert run_result["rerun"]["action"] == "replay_route"  # type: ignore[index]
-
-
-def test_dimos_control_url_rejects_remote_by_default(monkeypatch) -> None:
-    monkeypatch.setenv("DOGOPS_DIMOS_CONTROL_URL", "http://10.0.0.5:7779")
-    monkeypatch.delenv("DOGOPS_ALLOW_REMOTE_VIEWER", raising=False)
-
-    with pytest.raises(ValueError, match="loopback"):
-        dashboard._dimos_control_url()
-
-    monkeypatch.setenv("DOGOPS_ALLOW_REMOTE_VIEWER", "1")
-    assert dashboard._dimos_control_url() == "http://10.0.0.5:7779"
+    assert route["route_coverage"] == 1.0
+    assert route["stops"][2]["target_id"] == "COOLING_1"  # type: ignore[index]
+    assert route["stops"][2]["expected_tag_id"] == 41  # type: ignore[index]
+    assert route["stops"][2]["tag_verified"] is True  # type: ignore[index]
+    assert any(capture["id"] == "OBS-003" for capture in poi["captures"])  # type: ignore[index]
+    assert any(
+        reading["asset_id"] == "COOLING_1" and reading["clearance_clear"] is True
+        for reading in poi["readings"]  # type: ignore[index]
+    )
+    assert any(
+        reading["asset_id"] == "TEMP_1" and reading["within_threshold"] is True
+        for reading in poi["readings"]  # type: ignore[index]
+    )
 
 
 def test_dashboard_robot_jog_sends_low_speed_bounded_pulse(tmp_path, monkeypatch) -> None:
@@ -451,9 +600,9 @@ def test_dashboard_robot_jog_applies_motion_profile(tmp_path, monkeypatch) -> No
     assert status == 200
     assert result["ok"] is True
     assert result["profile"] == "walk"
-    assert result["linear_x"] == pytest.approx(0.2025)
-    assert result["duration_s"] == 1.2
-    assert calls == [(0.2025, 0.0, 0.0, 1.2, "192.168.12.1")]
+    assert result["linear_x"] == pytest.approx(0.6)
+    assert result["duration_s"] == 2.0
+    assert calls == [(0.6, 0.0, 0.0, 2.0, "192.168.12.1")]
 
 
 def test_dashboard_robot_jog_ignores_payload_robot_ip(tmp_path, monkeypatch) -> None:
@@ -724,6 +873,99 @@ def test_dashboard_robot_posture_rejects_unknown_command(tmp_path, monkeypatch) 
     assert result["error"] == "unknown_posture_command"
 
 
+def test_dashboard_robot_go_to_calls_dimos_bridge(tmp_path, monkeypatch) -> None:
+    calls: list[tuple[float, float]] = []
+
+    def fake_go_to(x: float, y: float) -> dict[str, object]:
+        calls.append((x, y))
+        return {"transport": "dimos_mcp", "skill": "go_to"}
+
+    monkeypatch.setattr(dashboard, "_run_robot_go_to", fake_go_to)
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        status, result = _post_json(
+            f"{base_url}/api/robot/go_to",
+            {"command": "go_to", "x": 1.25, "y": -0.5, "source": "map_click"},
+            headers=_robot_headers(server),
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 200
+    assert result["ok"] is True
+    assert result["command"] == "go_to"
+    assert result["source"] == "map_click"
+    assert result["transport"] == "dimos_mcp"
+    assert result["skill"] == "go_to"
+    assert calls == [(1.25, -0.5)]
+
+
+def test_dashboard_robot_go_to_rejects_bad_target(tmp_path, monkeypatch) -> None:
+    def fail_go_to(*_: object) -> dict[str, object]:
+        raise AssertionError("bad go_to targets must not run")
+
+    monkeypatch.setattr(dashboard, "_run_robot_go_to", fail_go_to)
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        status, result = _post_json(
+            f"{base_url}/api/robot/go_to",
+            {"command": "go_to", "x": "nan", "y": 0.0},
+            headers=_robot_headers(server),
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 400
+    assert result["ok"] is False
+    assert result["error"] == "invalid_go_to_target"
+
+
+def test_dimos_mcp_call_command_prefers_configured_prefix(monkeypatch) -> None:
+    monkeypatch.setenv("DOGOPS_DIMOS_MCP_CALL", "python -m dimos mcp call")
+
+    command = dashboard._dimos_mcp_call_command("go_to", {"x": 1.0, "y": 2.0})
+
+    assert command == [
+        "python",
+        "-m",
+        "dimos",
+        "mcp",
+        "call",
+        "go_to",
+        "--json-args",
+        '{"x":1.0,"y":2.0}',
+    ]
+
+
+def test_dimos_mcp_call_skill_treats_tool_error_as_failure(monkeypatch) -> None:
+    class _Result:
+        returncode = 0
+        stdout = '{"ok":false,"error":"navigation_stream_unavailable"}'
+        stderr = ""
+
+    monkeypatch.setattr(dashboard.subprocess, "run", lambda *_, **__: _Result())
+    monkeypatch.setattr(dashboard, "_dimos_mcp_call_command", lambda *_: ["dimos", "mcp"])
+
+    with pytest.raises(RuntimeError, match="navigation_stream_unavailable"):
+        dashboard._call_dimos_mcp_skill("go_to", {"x": 1.0, "y": 2.0})
+
+
 @pytest.mark.parametrize(
     ("command", "linear_x", "linear_y", "angular_z"),
     [
@@ -731,8 +973,8 @@ def test_dashboard_robot_posture_rejects_unknown_command(tmp_path, monkeypatch) 
         ("backward", -0.15, 0.0, 0.0),
         ("left", 0.0, 0.15, 0.0),
         ("right", 0.0, -0.15, 0.0),
-        ("yaw_left", 0.0, 0.0, 0.30),
-        ("yaw_right", 0.0, 0.0, -0.30),
+        ("yaw_left", 0.0, 0.0, 0.35),
+        ("yaw_right", 0.0, 0.0, -0.35),
         ("hard_stop", 0.0, 0.0, 0.0),
         ("stop", 0.0, 0.0, 0.0),
     ],

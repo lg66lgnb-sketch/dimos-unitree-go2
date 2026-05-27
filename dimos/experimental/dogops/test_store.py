@@ -11,10 +11,6 @@ def test_store_writes_required_run_files(tmp_path) -> None:
     assert (run_dir / "incidents.jsonl").is_file()
     assert (run_dir / "work_orders.jsonl").is_file()
     assert (run_dir / "nav_events.jsonl").is_file()
-    assert (run_dir / "map.json").is_file()
-    assert (run_dir / "route_plan.json").is_file()
-    assert (run_dir / "poi_captures.jsonl").is_file()
-    assert (run_dir / "sensor_readings.jsonl").is_file()
     assert (run_dir / "state.json").is_file()
     assert (run_dir / "report.json").is_file()
     assert (run_dir / "report.md").is_file()
@@ -23,7 +19,3 @@ def test_store_writes_required_run_files(tmp_path) -> None:
     state = DogOpsStore.load_existing(run_dir).load_state()
     assert state.run.id == "latest"
     assert len(state.incidents) == 2
-    assert state.site_map.status == "mapped"
-    assert state.route_plan.points_of_interest
-    assert state.poi_captures
-    assert state.sensor_readings

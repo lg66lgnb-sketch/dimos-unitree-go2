@@ -1,6 +1,6 @@
 # DogOps Hardware Handoff
 
-This is the Mac/Go2 Air handoff checklist. The real Unitree Go2 Air is available, so final validation should happen from the full DimOS checkout at `$DIMOS_ROOT`.
+This is the Mac/Go2 handoff checklist. The real Go2 is available, so final validation should happen from the full DimOS checkout at `$DIMOS_ROOT`.
 
 Do not use UTM unless the active thread is explicitly a VM-only development thread.
 
@@ -19,6 +19,22 @@ uv run --no-sync pytest -q -o addopts='' dimos/utils/cli/test_apriltag.py
 uv run --no-sync dimos apriltag --ids '10,20,101-104' --size-mm 100 --family tag36h11 --out /tmp/dogops-tags.pdf
 ```
 
+Fast path when the robot is in front of you:
+
+```bash
+cd $DIMOS_ROOT
+export GO2_IP=<GO2_IP>
+./scripts/dogops_go2_preflight.sh
+RUN_GO2_SMOKE=1 ./scripts/dogops_go2_preflight.sh
+RUN_DOGOPS_SMOKE=1 ./scripts/dogops_go2_preflight.sh
+```
+
+Keep this command visible before starting any hardware smoke:
+
+```bash
+uv run dimos stop --force
+```
+
 After DogOps is implemented:
 
 ```bash
@@ -26,7 +42,7 @@ uv run --no-sync pytest -q -o addopts='' dimos/experimental/dogops
 uv run --no-sync python -m dimos.experimental.dogops.cli simulate --out .dogops/runs/latest
 uv run --no-sync ruff check dimos/experimental/dogops dimos/robot/unitree/go2/blueprints/agentic/unitree_go2_dogops.py || true
 uv run --no-sync dimos list | rg dogops
-uv run --no-sync dimos mcp list-tools | rg 'run_mission|scan_zone|verify_work_order|nav_eval_report'
+uv run --no-sync dimos mcp list-tools | rg 'run_mission|go_to|scan_zone|read_gauge|check_clearance|detect_blocked_aisle|scan_receiving_manifest|verify_work_order|nav_eval_report'
 ```
 
 If ruff is unavailable in the full DimOS venv, record that and continue with tests plus `git diff --check`. If replay deploys DogOps modules plus `McpServer` but `dimos status` and `dimos mcp list-tools` do not see a running instance, treat MCP exposure as unvalidated until the hardware run or a corrected DimOS launch mode proves it.
@@ -73,7 +89,7 @@ cd $DIMOS_ROOT
 export GO2_IP=<GO2_IP>
 ping -c 3 "$GO2_IP"
 uv run --no-sync dimos stop --force || true
-uv run --no-sync dimos run unitree-go2 --robot-ip "$GO2_IP" --viewer none --daemon
+uv run --no-sync dimos --viewer none run unitree-go2 -o "go2connection.ip=${GO2_IP}" --daemon
 uv run --no-sync dimos status
 uv run --no-sync dimos log -n 100
 uv run --no-sync dimos stop --force
@@ -85,11 +101,15 @@ If this fails, stop DogOps hardware work and record the exact network/WebRTC/log
 
 ```bash
 uv run --no-sync dimos stop --force || true
-uv run --no-sync dimos run unitree-go2-dogops --robot-ip "$GO2_IP" --viewer none --daemon
+uv run --no-sync dimos --viewer none run unitree-go2-dogops -o "go2connection.ip=${GO2_IP}" --daemon
 uv run --no-sync dimos status
-uv run --no-sync dimos mcp list-tools | rg 'run_mission|scan_zone|verify_work_order|nav_eval_report'
+uv run --no-sync dimos mcp list-tools | rg 'run_mission|go_to|scan_zone|read_gauge|check_clearance|detect_blocked_aisle|scan_receiving_manifest|verify_work_order|nav_eval_report'
 uv run --no-sync dimos mcp call run_mission --json-args '{"mission_id":"receiving_sre_demo"}'
 uv run --no-sync dimos mcp call scan_zone --json-args '{"zone_id":"INBOUND_DOCK"}'
+uv run --no-sync dimos mcp call scan_receiving_manifest --json-args '{"zone_id":"INBOUND_DOCK"}'
+uv run --no-sync dimos mcp call read_gauge --json-args '{"asset_id":"TEMP_1"}'
+uv run --no-sync dimos mcp call check_clearance --json-args '{"asset_id":"COOLING_1"}'
+uv run --no-sync dimos mcp call detect_blocked_aisle --json-args '{"zone_id":"AISLE_1"}'
 uv run --no-sync dimos mcp call nav_eval_report
 uv run --no-sync dimos log -n 200
 uv run --no-sync dimos stop --force
@@ -134,8 +154,8 @@ Collect:
 
 If guided navigation is used:
 
-> This is running on the Go2 Air with guided navigation for safety. DogOps records that intervention in the nav metrics while the SiteOps loop, work-order lifecycle, verification, and report run live.
+> This is running on the Go2 with guided navigation for safety. DogOps records that intervention in the nav metrics while the SiteOps loop, work-order lifecycle, verification, and report run live.
 
 If MCP or real-time streams fail:
 
-> This run uses the deterministic DogOps dashboard/report fallback with real Go2 Air movement evidence. Guided or offline steps are recorded honestly in the navigation metrics.
+> This run uses the deterministic DogOps dashboard/report fallback with real Go2 movement evidence. Guided or offline steps are recorded honestly in the navigation metrics.

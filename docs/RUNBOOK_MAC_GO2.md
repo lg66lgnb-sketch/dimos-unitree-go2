@@ -51,16 +51,6 @@ If this fails, fix the DimOS environment before asking Codex to implement DogOps
 
 ## Real Go2 Network Check
 
-For native simulation/replay on macOS, first inspect and, if needed, prepare the local LCM multicast route and socket buffers:
-
-```bash
-./scripts/macos_dimos_lcm_network.sh status
-./scripts/macos_dimos_lcm_network.sh dry-run-apply
-./scripts/macos_dimos_lcm_network.sh apply
-```
-
-See [macos_dimos_lcm_network.md](macos_dimos_lcm_network.md) for snapshot and restore steps.
-
 Set the IP once known:
 
 ```bash
@@ -68,11 +58,31 @@ export GO2_IP=<GO2_IP>
 ping -c 3 "$GO2_IP"
 ```
 
+Fast preflight before touching the robot:
+
+```bash
+cd $DIMOS_ROOT
+export GO2_IP=<GO2_IP>
+./scripts/dogops_go2_preflight.sh
+```
+
+When the route is clear and a human is at the stop terminal, run the base robot smoke:
+
+```bash
+RUN_GO2_SMOKE=1 ./scripts/dogops_go2_preflight.sh
+```
+
+Only after base `unitree-go2` passes, run the DogOps hardware smoke:
+
+```bash
+RUN_DOGOPS_SMOKE=1 ./scripts/dogops_go2_preflight.sh
+```
+
 Then prove the base DimOS robot path:
 
 ```bash
 uv run dimos stop --force || true
-uv run dimos run unitree-go2 --robot-ip "$GO2_IP" --viewer none --daemon
+uv run dimos --viewer none run unitree-go2 -o "go2connection.ip=${GO2_IP}" --daemon
 uv run dimos status
 uv run dimos log -n 100
 uv run dimos stop --force
@@ -110,7 +120,7 @@ uv run pytest dimos/robot/test_all_blueprints_generation.py || true
 git diff -- dimos/robot/all_blueprints.py
 uv run pytest dimos/robot/test_all_blueprints_generation.py
 uv run dimos list | rg dogops
-uv run dimos mcp list-tools | rg 'run_mission|scan_zone|verify_work_order|nav_eval_report'
+uv run dimos mcp list-tools | rg 'run_mission|go_to|scan_zone|read_gauge|check_clearance|detect_blocked_aisle|scan_receiving_manifest|verify_work_order|nav_eval_report'
 ```
 
 Do not mark DimOS integration complete until `unitree-go2-dogops` appears in `dimos list`.
@@ -119,11 +129,15 @@ Do not mark DimOS integration complete until `unitree-go2-dogops` appears in `di
 
 ```bash
 uv run dimos stop --force || true
-uv run dimos run unitree-go2-dogops --robot-ip "$GO2_IP" --viewer none --daemon
+uv run dimos --viewer none run unitree-go2-dogops -o "go2connection.ip=${GO2_IP}" --daemon
 uv run dimos status
-uv run dimos mcp list-tools | rg 'run_mission|scan_zone|verify_work_order|nav_eval_report'
+uv run dimos mcp list-tools | rg 'run_mission|go_to|scan_zone|read_gauge|check_clearance|detect_blocked_aisle|scan_receiving_manifest|verify_work_order|nav_eval_report'
 uv run dimos mcp call run_mission --json-args '{"mission_id":"receiving_sre_demo"}'
 uv run dimos mcp call scan_zone --json-args '{"zone_id":"INBOUND_DOCK"}'
+uv run dimos mcp call scan_receiving_manifest --json-args '{"zone_id":"INBOUND_DOCK"}'
+uv run dimos mcp call read_gauge --json-args '{"asset_id":"TEMP_1"}'
+uv run dimos mcp call check_clearance --json-args '{"asset_id":"COOLING_1"}'
+uv run dimos mcp call detect_blocked_aisle --json-args '{"zone_id":"AISLE_1"}'
 uv run dimos mcp call nav_eval_report
 uv run dimos log -n 200
 uv run dimos stop --force

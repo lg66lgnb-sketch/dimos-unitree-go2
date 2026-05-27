@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
 import json
 import math
@@ -8,8 +9,8 @@ import socket
 import time
 from typing import Any, Literal
 from urllib.parse import urlparse
+import zlib
 
-from dimos.experimental.dogops.mapping import decode_dimos_costmap_full
 from dimos.experimental.dogops.store import DogOpsStore
 
 DEFAULT_RERUN_SOURCE_URL = "rerun+http://127.0.0.1:9877/proxy"
@@ -25,6 +26,17 @@ RERUN_COMMAND_FILENAME = "rerun_command.json"
 RERUN_MAPPING_REPLAY_FRAMES = 72
 RERUN_MAPPING_REPLAY_DELAY_S = 0.12
 RerunViewMode = Literal["dogops-2d", "native-3d"]
+ASSET_OFFSETS_M = {
+    "COOLING_1": (-0.22, 0.22),
+    "AISLE_1": (0.0, -0.24),
+    "TEMP_1": (0.28, 0.24),
+}
+PACKAGE_OFFSETS_M = {
+    "PKG-101": (-0.22, 0.18),
+    "PKG-102": (0.18, -0.16),
+    "PKG-103": (0.0, 0.28),
+    "PKG-104": (-0.28, -0.20),
+}
 
 
 @dataclass(frozen=True)
@@ -97,10 +109,167 @@ class WorldOverlayScene:
     obstacles: list[SimObstacle]
 
 
+def _site_map_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    existing = payload.get("site_map")
+    if isinstance(existing, dict) and existing:
+        return existing
+
+    site = payload.get("site") or {}
+    features: list[dict[str, Any]] = []
+    zone_poses: dict[str, dict[str, float]] = {}
+    for zone in site.get("zones") or []:
+        pose = _pose_dict(zone.get("pose_hint"))
+        if pose is None:
+            continue
+        zone_id = str(zone.get("id") or "")
+        zone_poses[zone_id] = pose
+        features.append(
+            {
+                "id": zone_id,
+                "display_name": zone.get("display_name") or zone_id,
+                "kind": "zone",
+                "pose": pose,
+            }
+        )
+
+    for asset in site.get("assets") or []:
+        asset_id = str(asset.get("id") or "")
+        zone_pose = zone_poses.get(str(asset.get("zone_id") or ""))
+        if not asset_id or zone_pose is None:
+            continue
+        dx, dy = ASSET_OFFSETS_M.get(asset_id, (0.0, 0.0))
+        features.append(
+            {
+                "id": asset_id,
+                "display_name": asset.get("display_name") or asset_id,
+                "kind": "asset",
+                "pose": _offset_pose_dict(zone_pose, dx, dy),
+            }
+        )
+
+    latest_package_zones = _latest_package_zones(payload.get("observations") or [])
+    for package in site.get("packages") or []:
+        package_id = str(package.get("id") or "")
+        zone_id = latest_package_zones.get(package_id) or package.get("expected_zone_id")
+        zone_pose = zone_poses.get(str(zone_id or ""))
+        if not package_id or zone_pose is None:
+            continue
+        dx, dy = PACKAGE_OFFSETS_M.get(package_id, (0.0, 0.0))
+        features.append(
+            {
+                "id": package_id,
+                "display_name": package.get("display_name") or package_id,
+                "kind": "package",
+                "pose": _offset_pose_dict(zone_pose, dx, dy),
+            }
+        )
+
+    robot_pose = None
+    for event in reversed(payload.get("nav_events") or []):
+        target = event.get("target_id")
+        pose = _feature_pose(features, str(target or ""))
+        if pose is not None:
+            robot_pose = {**pose, "theta_deg": 0.0}
+            break
+
+    if not robot_pose and features:
+        robot_pose = {**features[0]["pose"], "theta_deg": 0.0}
+
+    return {
+        "width_m": 4.5,
+        "height_m": 3.0,
+        "origin": {"x": -0.6, "y": -2.0},
+        "resolution_m": 0.25,
+        "features": features,
+        "explored_path": [
+            {"x": point[0], "y": point[1]} for point in _route_or_feature_points(payload, features)
+        ],
+        "robot_pose": robot_pose,
+    }
+
+
+def _route_plan_payload(payload: dict[str, Any], site_map: dict[str, Any]) -> dict[str, Any]:
+    existing = payload.get("route_plan")
+    if isinstance(existing, dict) and existing:
+        return existing
+
+    features = site_map.get("features") or []
+    feature_ids = {str(feature.get("id")) for feature in features}
+    waypoints: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for event in payload.get("nav_events") or []:
+        target_id = str(event.get("target_id") or "")
+        if not target_id or target_id in seen or target_id not in feature_ids:
+            continue
+        pose = _feature_pose(features, target_id)
+        if pose is None:
+            continue
+        seen.add(target_id)
+        waypoints.append({"target_id": target_id, "pose": pose})
+
+    if len(waypoints) < 2:
+        for point in _route_or_feature_points(payload, features):
+            waypoints.append({"target_id": f"ROUTE-{len(waypoints) + 1}", "pose": {"x": point[0], "y": point[1]}})
+
+    points_of_interest = [
+        {"id": f"POI-{feature.get('id')}", "target_id": feature.get("id"), "pose": feature.get("pose")}
+        for feature in features
+        if feature.get("kind") == "asset"
+    ]
+    return {"waypoints": waypoints, "points_of_interest": points_of_interest}
+
+
+def _route_or_feature_points(payload: dict[str, Any], features: list[dict[str, Any]]) -> list[list[float]]:
+    points: list[list[float]] = []
+    for event in payload.get("nav_events") or []:
+        pose = _feature_pose(features, str(event.get("target_id") or ""))
+        if pose is not None:
+            points.append([float(pose["x"]), float(pose["y"])])
+    if len(points) >= 2:
+        return points
+
+    preferred = ["HOME", "INBOUND_DOCK", "COOLING_1", "QA_HOLD", "HOME"]
+    for target_id in preferred:
+        pose = _feature_pose(features, target_id)
+        if pose is not None:
+            points.append([float(pose["x"]), float(pose["y"])])
+    return points
+
+
+def _pose_dict(raw_pose: Any) -> dict[str, float] | None:
+    if not isinstance(raw_pose, dict):
+        return None
+    if raw_pose.get("x") is None or raw_pose.get("y") is None:
+        return None
+    return {"x": float(raw_pose["x"]), "y": float(raw_pose["y"])}
+
+
+def _offset_pose_dict(pose: dict[str, float], dx: float, dy: float) -> dict[str, float]:
+    return {"x": float(pose["x"]) + dx, "y": float(pose["y"]) + dy}
+
+
+def _feature_pose(features: list[dict[str, Any]], target_id: str) -> dict[str, float] | None:
+    for feature in features:
+        if feature.get("id") != target_id:
+            continue
+        return _pose_dict(feature.get("pose"))
+    return None
+
+
+def _latest_package_zones(observations: list[dict[str, Any]]) -> dict[str, str]:
+    zones: dict[str, str] = {}
+    for observation in observations:
+        facts = observation.get("facts") or {}
+        for key, value in facts.items():
+            if key.startswith("PKG-") and key.endswith(".zone_id") and isinstance(value, str):
+                zones[key.removesuffix(".zone_id")] = value
+    return zones
+
+
 def build_rerun_scene(state: Any) -> RerunScene:
     payload = state.model_dump(mode="json") if hasattr(state, "model_dump") else state
-    site_map = payload.get("site_map") or {}
-    route_plan = payload.get("route_plan") or {}
+    site_map = _site_map_payload(payload)
+    route_plan = _route_plan_payload(payload, site_map)
     projection = projection_from_site_map(site_map)
     image_rgb = costmap_rgb(site_map, projection)
 
@@ -173,8 +342,8 @@ def build_mapping_frames(
     prefer_route: bool = True,
 ) -> list[SimFrame]:
     payload = state.model_dump(mode="json") if hasattr(state, "model_dump") else state
-    site_map = payload.get("site_map") or {}
-    route_plan = payload.get("route_plan") or {}
+    site_map = _site_map_payload(payload)
+    route_plan = _route_plan_payload(payload, site_map)
     projection = projection_from_site_map(site_map)
     path_world = _route_or_map_path(site_map, route_plan, prefer_route=prefer_route)
     if len(path_world) < 2:
@@ -238,7 +407,7 @@ def build_mapping_frames(
 
 def demo_obstacles(state: Any) -> list[SimObstacle]:
     payload = state.model_dump(mode="json") if hasattr(state, "model_dump") else state
-    site_map = payload.get("site_map") or {}
+    site_map = _site_map_payload(payload)
     projection = projection_from_site_map(site_map)
     feature_by_id = {feature.get("id"): feature for feature in site_map.get("features") or []}
     if not feature_by_id:
@@ -270,8 +439,8 @@ def demo_obstacles(state: Any) -> list[SimObstacle]:
 
 def build_world_overlay_scene(state: Any) -> WorldOverlayScene:
     payload = state.model_dump(mode="json") if hasattr(state, "model_dump") else state
-    site_map = payload.get("site_map") or {}
-    route_plan = payload.get("route_plan") or {}
+    site_map = _site_map_payload(payload)
+    route_plan = _route_plan_payload(payload, site_map)
     path_points = _world_path_points(site_map)
     route_points = _route_world_points(route_plan)
 
@@ -325,7 +494,7 @@ def build_world_overlay_scene(state: Any) -> WorldOverlayScene:
 
 def demo_obstacles_world(state: Any) -> list[SimObstacle]:
     payload = state.model_dump(mode="json") if hasattr(state, "model_dump") else state
-    site_map = payload.get("site_map") or {}
+    site_map = _site_map_payload(payload)
     feature_by_id = {feature.get("id"): feature for feature in site_map.get("features") or []}
     if not feature_by_id:
         return []
@@ -511,9 +680,10 @@ def log_state_to_rerun(
         if animate_mapping:
             _log_mapping_animation(rr, frames, delay_s=frame_delay_s)
         else:
+            _set_sim_time(rr, frames[-1].sequence)
             _log_mapping_frame(rr, frames[-1])
     else:
-        rr.set_time("sim_step", sequence=0)
+        _set_sim_time(rr, 0)
         _log_points(
             rr,
             "dogops/lidar/mapped_free",
@@ -696,8 +866,18 @@ def _costmap_grid(site_map: dict[str, Any]) -> list[list[int]]:
     dimos_costmap = site_map.get("dimos_costmap") or {}
     dimos_grid_payload = dimos_costmap.get("grid") if isinstance(dimos_costmap, dict) else None
     if isinstance(dimos_grid_payload, dict):
-        return decode_dimos_costmap_full(dimos_grid_payload)
+        return _decode_dimos_costmap_full(dimos_grid_payload)
     return []
+
+
+def _decode_dimos_costmap_full(payload: dict[str, Any]) -> list[list[int]]:
+    if payload.get("update_type") != "full":
+        raise ValueError("DogOps Rerun sim currently renders full DimOS costmap payloads only")
+    shape = payload.get("shape") or [0, 0]
+    height, width = int(shape[0]), int(shape[1])
+    raw = zlib.decompress(base64.b64decode(str(payload.get("data", ""))))
+    values = [(-1 if value == 255 else int(value)) for value in raw]
+    return [values[index : index + width] for index in range(0, height * width, width)]
 
 
 def _dimos_path_points(site_map: dict[str, Any]) -> list[list[float]]:
@@ -1088,9 +1268,15 @@ def _log_mapping_frame(rr: Any, frame: SimFrame) -> None:
     _log_line(rr, "dogops/map/robot_heading", frame.robot_heading, [248, 250, 252, 255], "heading")
 
 
+def _set_sim_time(rr: Any, sequence: int) -> None:
+    set_time = getattr(rr, "set_time", None)
+    if set_time is not None:
+        set_time("sim_step", sequence=sequence)
+
+
 def _log_mapping_animation(rr: Any, frames: list[SimFrame], *, delay_s: float) -> None:
     for frame in frames:
-        rr.set_time("sim_step", sequence=frame.sequence)
+        _set_sim_time(rr, frame.sequence)
         _log_mapping_frame(rr, frame)
         if delay_s > 0:
             time.sleep(delay_s)
@@ -1149,7 +1335,7 @@ def _log_poi_cameras(rr: Any, state: Any) -> None:
         target_id = str(poi.get("target_id") or capture.get("poi_id") or f"poi_{index + 1}")
         image = _poi_camera_image(target_id)
         entity_path = f"dogops/camera/{_safe_entity_name(target_id)}"
-        rr.set_time("sim_step", sequence=100 + index)
+        _set_sim_time(rr, 100 + index)
         rr.log(
             entity_path,
             rr.Image(bytes=image, width=320, height=180, color_model="RGB", datatype="U8"),

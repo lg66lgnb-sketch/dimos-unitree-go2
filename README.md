@@ -1,140 +1,181 @@
-# DogOps Codex Project Pack
+# DogOps SiteOps Agent
 
-This pack is the launch material for building **DogOps: DimOS SiteOps Agent** in a full DimOS checkout with a real Unitree Go2 Air available.
+DogOps turns a Unitree Go2 running on DimOS into a physical SiteOps agent for spaces where software alerts cannot see the real world: warehouses, lab rooms, data-center rows, maker spaces, construction offices, and industrial floors.
 
-Use it with Codex `/goal` on GPT-5.5 with high reasoning (`xhigh`). The goal prompt is in [codex_goal.txt](codex_goal.txt) and duplicated in [CODEX_GOAL.md](CODEX_GOAL.md).
+The current dashboard combines the DogOps semantic facility view with live DimOS navigation data from the dog: costmap heatmap, odom robot pose, planned path, and target overlays on the same map.
 
-## What DogOps Must Do
+The dashboard does not require Rerun to render these top-map layers. Rerun remains optional as a separate DimOS viewer, while the DogOps map consumes the underlying DimOS messages directly.
 
-DogOps turns a Unitree Go2 Air into a closed-loop physical operations agent:
+## Product Direction
+
+The full DogOps loop is a physical SiteOps workflow: the robot receives a site policy and receiving manifest, maps the demo facility, follows an inspection route, scans AprilTag-labeled packages and assets, reconciles physical state against expected state, opens spatial work orders for exceptions, revisits after human remediation, and produces a dashboard report with package status, incident history, evidence, and navigation metrics.
+
+DogOps is designed to run without cloud API keys or an LLM. The core workflow is deterministic and MCP-callable; Gemini/OpenAI/VLM analysis is optional, server-side, and limited to narration or extra image analysis around the same base product loop.
+
+## Demo Loop
+
+This is the target loop for the product demo and the direction for future hardening:
 
 ```text
-manifest + site policy
--> short real-world route through the demo facility
--> map the open space in the embedded Rerun viewer
--> operator edits route waypoints and photo points
--> scan AprilTag packages/assets
--> reconcile manifest
--> detect PKG-104 blocking COOLING_1
--> open INC-001 / WO-001
--> wait while a human moves PKG-104 to QA_HOLD
--> revisit COOLING_1
--> verify closure
--> analyze POI photos and readings such as TEMP_1
+site policy + receiving manifest
+-> autonomous route through a staged facility
+-> DimOS-backed map with DogOps semantic overlays
+-> AprilTag package/asset inspection
+-> manifest reconciliation
+-> physical hazard and work-order creation
+-> human remediation request
+-> robot revisits the same location
+-> closure verification
 -> dashboard + report + navigation metrics
 ```
 
-The map layer uses the existing DimOS Go2 map/navigation stack. DogOps does not implement SLAM: `DogOpsLiveMapModule` consumes DimOS `global_costmap`, planner `path`, and `odom`, then the dashboard overlays semantic labels, incidents, inspection points, and run reporting on the embedded Rerun WebViewer. One inspection point creates both the DimOS route waypoint and the photo/reading POI, with the demo UI capped at three points to keep the operator flow simple. `map.json` is still written for reports/tests and offline fallback, but the normal operator map is Rerun. The base demo requires no cloud API keys and no LLM. POI photo/readings analysis is deterministic in simulation; optional Gemini/OpenAI/VLM analysis is stretch only and must stay server-side.
+In the default demo scenario, `PKG-104` is placed in the wrong zone and blocks `COOLING_1`. DogOps detects both the logistics exception and the facility hazard, opens `INC-001` / `WO-001`, waits for the package to move to `QA_HOLD`, revisits `COOLING_1`, verifies the fix, and leaves `PKG-103` as the intentional missing-package exception.
 
-Dashboard runtime modes are explicit. The default is `DOGOPS_RUNTIME_MODE=real`: route/map buttons send DimOS navigation commands and manual motion controls command the real Go2 through the local WebRTC/Sport API. Use `DOGOPS_RUNTIME_MODE=simulation` when DimOS is running with `--simulation`; the dashboard map and route buttons send DimOS `start_explore`, `stop_explore`, and click-goal events to the simulator while manual movement is intentionally out of the main simulation setup flow. Use `DOGOPS_RUNTIME_MODE=rerun-sim` for the no-robot local Rerun/LiDAR replay path: DogOps stays mounted on the Rerun WebViewer and dashboard map/route buttons trigger the local `dogops rerun-sim` stream. Use `DOGOPS_RUNTIME_MODE=offline` only for static artifact checks where no Rerun or DimOS control server is running.
+## Architecture
 
-## Where To Build
+Live data flow:
 
-Primary target:
+1. `unitree-go2-dogops` runs inside the full DimOS checkout.
+2. DimOS Go2 modules publish robot data:
+   - `GO2Connection` publishes `/odom` and `/lidar`.
+   - `VoxelGridMapper` accumulates lidar into `/global_map`.
+   - `CostMapper` converts the global point cloud into `/global_costmap`.
+   - `ReplanningAStarPlanner` can publish `/path`, `/target`, and `/navigation_costmap`.
+   - DogOps `go_to` publishes `/clicked_point` targets.
+3. `DogOpsLiveMapAdapter` subscribes to those DimOS LCM topics directly.
+4. `/api/map` merges the semantic facility map with the live DimOS overlay payload.
+5. `dashboard_static.py` renders heatmap, robot pose, path, and target as SVG layers on the same DogOps map.
+
+The top map keeps semantic/click projection separate from live overlay projection, so live costmap extents do not break map-click `go_to` coordinates. Live topic snapshots also expire stale data, so disconnected streams do not stay displayed as current.
+
+## Features
+
+Current live map and dashboard capabilities:
+
+- Same-map heatmap layer from DimOS `OccupancyGrid` costmap data.
+- Robot pose layer from live Go2 odom.
+- Path, route, clicked-point, and planner target overlays from DimOS navigation topics.
+- Layer buttons for showing and hiding `Semantic`, `Heatmap`, `Path`, and `Robot`.
+- Demo/offline mode for dashboard smoke tests without hardware.
+- Live Go2 mode for real odom and costmap data from the dog.
+- Optional Rerun Web panel for DimOS visualization without making Rerun the DogOps map renderer.
+- Robot Control panel with conservative posture and motion commands.
+- Dashboard shutdown closes DogOps-owned Go2 WebRTC sessions so direct Robot Control does not keep stealing the mapping stream.
+- DogOps worker modules tolerate full DimOS runtime injection and expose docstrings for MCP skill discovery.
+
+Broader SiteOps capabilities already present or being built toward:
+
+- Site and manifest modeling for zones, packages, assets, policies, incidents, work orders, and navigation events.
+- DimOS-backed mapping and route overlays using `global_costmap`, planner `path`, and `odom` streams.
+- Operator route planning with waypoints and points of interest for photos or readings.
+- AprilTag 36h11 package, zone, and asset identity.
+- Deterministic mission engine for receiving, inspection, remediation, verification, and final reporting.
+- Dashboard views for map, route, packages, incidents, work orders, POI evidence, readings, and navigation metrics.
+- MCP skills for running missions, scanning zones, verifying work orders, mapping open space, executing route plans, and reporting navigation/POI results.
+- Real-Go2 path with conservative motion, explicit stop commands, and honest recording of retries, guided interventions, and safety stops.
+
+DogOps does not implement its own SLAM stack. It uses the existing DimOS Go2 map/navigation pipeline and adds the SiteOps product layer on top: semantic zones, policy state, package placement, incident evidence, route progress, and run reports. Rerun remains useful for raw robot telemetry; the DogOps dashboard is the operator-facing workflow.
+
+## Repository Layout
+
+- `dimos/experimental/dogops/` - DogOps models, mission engine, live map adapter, dashboard, CLI, reports, and skills.
+- `dimos/experimental/dogops/live_map.py` - DimOS LCM topic adapter for `/api/map`.
+- `dimos/experimental/dogops/dashboard.py` - dashboard server, JSON endpoints, and Go2 control endpoints.
+- `dimos/experimental/dogops/dashboard_static.py` - static dashboard HTML, SVG map, layer rendering, and client polling.
+- `dimos/robot/unitree/go2/blueprints/agentic/unitree_go2_dogops.py` - Go2 DogOps blueprint.
+- `docs/RUNBOOK_MAC_GO2.md` - Mac/Go2 runbook.
+- `docs/dogops/HARDWARE_HANDOFF.md` - arena, tags, evidence, and hardware checklist.
+- `SPEC.md` - canonical product behavior.
+- `STATUS.md` - current implementation and validation ledger.
+
+## Demo / Offline Mode
+
+Demo mode runs without the dog. It creates a deterministic DogOps run and serves the dashboard with the semantic map and simulated mission data.
+
+```bash
+cd $DOGOPS_REPO
+uv run python -m dimos.experimental.dogops.cli simulate --out .dogops/runs/latest
+uv run python -m dimos.experimental.dogops.cli serve --run .dogops/runs/latest --host 127.0.0.1 --port 18769
+```
+
+Open:
+
+```text
+http://127.0.0.1:18769/
+```
+
+## Live Go2 Mode
+
+Live Go2 map mode must run from the full local DimOS checkout/environment, not only an isolated DogOps checkout, because the Unitree WebRTC, LCM, mapping, and navigation stack live in DimOS.
 
 ```bash
 cd $DIMOS_ROOT
-```
 
-Copy these project files into the DimOS repo root before starting `/goal`. The final submission must validate against the full DimOS CLI, blueprint registry, and MCP tooling.
+# If macOS multicast routing is pointed at the dog Wi-Fi, route DimOS/LCM multicast locally.
+sudo route delete -net 224.0.0.0/4
+sudo route add -net 224.0.0.0/4 -interface lo0
 
-UTM/Ubuntu is optional for offline development only. With the real Go2 available, the Mac/full-DimOS path is the source of truth.
-
-## Start Command
-
-In Codex, open a worktree/thread rooted at the full DimOS checkout and paste [codex_goal.txt](codex_goal.txt) into `/goal`.
-
-Before coding, Codex should verify:
-
-```bash
-git status -sb
-git branch --show-current
-uv run dimos list | rg 'unitree-go2'
-```
-
-If the Go2 IP is known:
-
-```bash
-GO2_IP=<GO2_IP> ./scripts/verify_env.sh
-```
-
-To install this pack into a full local DimOS checkout for registry/MCP validation:
-
-```bash
-export DIMOS_ROOT=/path/to/dimos
-./scripts/sync_into_dimos.sh
-cd "$DIMOS_ROOT"
-uv run pytest dimos/robot/test_all_blueprints_generation.py
-uv run dimos list | rg dogops
-```
-
-The sync script copies only DogOps-owned code/config paths and refuses non-DimOS targets.
-
-For a local no-robot dashboard demo, publish the lightweight 2D fallback into Rerun in one terminal and serve the dashboard in another:
-
-```bash
+# Prepare a run directory for the dashboard.
 uv run python -m dimos.experimental.dogops.cli simulate --out .dogops/runs/latest
-uv run python -m dimos.experimental.dogops.cli rerun-sim --run .dogops/runs/latest
-DOGOPS_RUNTIME_MODE=rerun-sim \
-DOGOPS_RERUN_SOURCE_URL=rerun+http://127.0.0.1:9877/proxy \
-  uv run python -m dimos.experimental.dogops.cli serve --run .dogops/runs/latest --port 8765
+
+# Start the DogOps dashboard.
+uv run python -m dimos.experimental.dogops.cli serve --run .dogops/runs/latest --host 127.0.0.1 --port 18769
+
+# In another terminal, start DimOS live mapping against the dog.
+DOGOPS_SKIP_GO2_STARTUP_POSTURE=1 uv run dimos --robot-ip 192.168.12.1 --viewer none --rerun-open none --no-rerun-web run unitree-go2-dogops
 ```
 
-`rerun-sim` needs `rerun-sdk`; use the full DimOS environment or install this repo with the optional `rerun` extra. For the real 3D mapping look, run the native Go2 Air simulator (`uv run dimos --simulation --viewer rerun --rerun-open none run unitree-go2`) and publish DogOps overlays with `rerun-sim --view-mode native-3d` to the same local Rerun source. Native 3D mode refuses to start if no DimOS Rerun source is already listening, so it cannot silently fall back to the simple DogOps map. The dashboard’s primary path is option 2: the pinned `@rerun-io/web-viewer` component mounted directly inside DogOps. `DOGOPS_RERUN_EMBED_URL=http://127.0.0.1:9878` remains available only as an option-1 diagnostic fallback when testing DimOS’ own served viewer page.
+Open:
 
-For the full no-robot simulation flow, start DimOS simulation first, then serve DogOps in simulation mode:
-
-```bash
-cd /path/to/dimos
-NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
-  uv run dimos --simulation --viewer rerun --rerun-open none run unitree-go2
-
-cd /path/to/dimos-unitree-go2
-DOGOPS_RUNTIME_MODE=simulation \
-DOGOPS_DIMOS_CONTROL_URL=http://127.0.0.1:7779 \
-DOGOPS_RERUN_SOURCE_URL=rerun+http://127.0.0.1:9877/proxy \
-DOGOPS_RERUN_VIEW_MODE=native-3d \
-  uv run python -m dimos.experimental.dogops.cli serve --run .dogops/runs/latest --port 8765
+```text
+http://127.0.0.1:18769/
 ```
 
-## Starter Files
-
-| Path | Purpose |
-|---|---|
-| [AGENTS.md](AGENTS.md) | Agent behavior, safety, and Git rules |
-| [SPEC.md](SPEC.md) | Canonical product and acceptance criteria |
-| [STATUS.md](STATUS.md) | Build phase ledger |
-| [codex_goal.txt](codex_goal.txt) | Prompt to paste into `/goal` |
-| [CODEX_GOAL.md](CODEX_GOAL.md) | Markdown duplicate of the goal prompt |
-| [config/](config) | Demo site, manifest, mission, and policy inputs |
-| [docs/RUNBOOK_MAC_GO2.md](docs/RUNBOOK_MAC_GO2.md) | Primary real-Go2 runbook |
-| [docs/TEST_LOOPS.md](docs/TEST_LOOPS.md) | Required local, DimOS, and hardware checks |
-| [docs/SAFETY.md](docs/SAFETY.md) | Robot safety and stop commands |
-| [docs/dogops/HARDWARE_HANDOFF.md](docs/dogops/HARDWARE_HANDOFF.md) | Video/evidence checklist |
-| [scripts/verify_env.sh](scripts/verify_env.sh) | Full-DimOS and optional Go2 preflight |
-
-## Required Final Checks
-
-The build is not complete until these are true in `$DIMOS_ROOT`:
+Useful verification:
 
 ```bash
-uv run pytest -q dimos/experimental/dogops
-uv run python -m dimos.experimental.dogops.cli simulate --out .dogops/runs/latest
-uv run python -m dimos.experimental.dogops.cli map --run .dogops/runs/latest
-uv run python -m dimos.experimental.dogops.cli plan --run .dogops/runs/latest --add-waypoint TEMP_1 --add-poi TEMP_1
-uv run python -m dimos.experimental.dogops.cli run-plan --run .dogops/runs/latest
-uv run ruff check dimos/experimental/dogops dimos/robot || true
-uv run dimos list | rg dogops
-uv run dimos mcp list-tools | rg 'run_mission|map_open_space|run_route_plan|poi_report|nav_eval_report'
+curl -s http://127.0.0.1:18769/api/map
 ```
 
-And with the real Go2:
+Expected live indicators:
+
+- `live.status` is `receiving`
+- `live.topics.odom.received` is `true`
+- `live.topics.global_costmap.received` is `true`
+- `layers.heatmap` is `true`
+- `layers.robot` is `true`
+
+Stop command:
 
 ```bash
-uv run dimos stop --force || true
-uv run dimos run unitree-go2 --robot-ip <GO2_IP> --viewer none --daemon
-uv run dimos status
 uv run dimos stop --force
 ```
 
-Then run the DogOps blueprint or an explicitly documented guided fallback and capture the 90-second demo video.
+## Hardware Note
+
+Robot Control opens its own direct Go2 WebRTC session. For heatmap validation, avoid clicking Robot Control while DimOS is running, or restart the dashboard server to close that direct session. Otherwise DimOS can be starved of odom/lidar and `/api/map` may remain `waiting_for_topics`.
+
+## Validation
+
+Run the focused DogOps checks:
+
+```bash
+uv run ruff check dimos/experimental/dogops
+uv run pytest -q dimos/experimental/dogops
+```
+
+Useful full-check commands:
+
+```bash
+uv run python -m dimos.experimental.dogops.cli simulate --out .dogops/runs/latest
+uv run dimos list | rg dogops
+uv run dimos mcp list-tools | rg 'run_mission|go_to|scan_zone|read_gauge|check_clearance|detect_blocked_aisle|scan_receiving_manifest|verify_work_order|nav_eval_report'
+```
+
+Local hardware smoke during development confirmed:
+
+- DimOS `unitree-go2-dogops` started from a full DimOS checkout.
+- `/api/map` reported `status=receiving`.
+- `/api/map` received `odom=True` and `global_costmap=True`.
+- Live costmap payload reported `48 x 32` with `1536` cells.
+- Top-map layers reported `heatmap=True` and `robot=True`.

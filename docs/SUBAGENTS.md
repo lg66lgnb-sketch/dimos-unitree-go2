@@ -69,7 +69,7 @@ Success:
 ```bash
 uv run dimos list | rg dogops
 uv run pytest dimos/robot/test_all_blueprints_generation.py
-uv run dimos mcp list-tools | rg 'run_mission|scan_zone|verify_work_order|nav_eval_report'
+uv run dimos mcp list-tools | rg 'run_mission|go_to|scan_zone|read_gauge|check_clearance|detect_blocked_aisle|scan_receiving_manifest|verify_work_order|nav_eval_report'
 ```
 
 ### Perception subagent
@@ -135,7 +135,7 @@ Success:
 
 ```bash
 uv run dimos list | rg 'unitree-go2'
-uv run dimos run unitree-go2 --robot-ip "$GO2_IP" --viewer none --daemon
+uv run dimos --viewer none run unitree-go2 -o "go2connection.ip=${GO2_IP}" --daemon
 uv run dimos status
 uv run dimos stop --force
 ```

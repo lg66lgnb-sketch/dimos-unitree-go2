@@ -5,7 +5,6 @@
 *.private.yaml
 
 # DogOps generated outputs
-.worktrees/
 .dogops/
 dogops-tags-*.pdf
 artifacts/dogops/
@@ -19,7 +18,6 @@ __pycache__/
 .ruff_cache/
 .mypy_cache/
 .venv/
-node_modules/
 
 # Logs and OS noise
 *.log

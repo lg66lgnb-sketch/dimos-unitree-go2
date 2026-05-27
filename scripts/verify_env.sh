@@ -19,7 +19,7 @@ ls -lh /tmp/dogops-tags.pdf
 if [[ -n "${GO2_IP:-}" ]]; then
   ping -c 3 "$GO2_IP"
   uv run dimos stop --force || true
-  uv run dimos run unitree-go2 --robot-ip "$GO2_IP" --viewer none --daemon
+  uv run dimos --viewer none run unitree-go2 -o "go2connection.ip=${GO2_IP}" --daemon
   uv run dimos status
   uv run dimos log -n 100
   uv run dimos stop --force

@@ -10,8 +10,6 @@ from dimos.robot.unitree.go2.blueprints.agentic.unitree_go2_dogops import (
 def test_unitree_go2_dogops_blueprint_fallback_is_no_key() -> None:
     blueprint_text = repr(exported_unitree_go2_dogops)
     assert "DogOpsSkillContainer" in blueprint_text
-    assert "DogOpsLiveMapModule" in blueprint_text
-    assert "DogOpsRouteExecutorModule" in blueprint_text
     assert "DogOpsObservationModule" in blueprint_text
     assert "DogOpsDashboardModule" in blueprint_text
     assert "DogOpsNavEvalModule" in blueprint_text
