@@ -62,6 +62,10 @@ Commands:
 Symptom:
 Replay logs show DogOps modules and `McpServer` deploying, but `dimos status` reports no running instance or `dimos mcp list-tools` reports no running MCP server.
 
+Observed on 2026-05-27 in the full DimOS checkout:
+normal replay was blocked by non-interactive sudo for `route add -net 224.0.0.0/4 -interface lo0`.
+Using `PYTEST_VERSION=8.3.5` skipped the configurator and deployed the DogOps modules plus `McpServer`, but daemon discovery still returned no running instance.
+
 Fallback:
 Do not claim MCP validation. Try a different documented DimOS launch mode or real hardware run, check for lingering replay processes, stop with `uv run dimos stop --force`, and ask before killing OS processes directly. Use direct DogOps CLI/skill tests and dashboard/report output as fallback evidence.
 
@@ -116,7 +120,7 @@ Generate static `dashboard.html`, `state.json`, and `report.json`; skip live ser
 ### Real Go2 base smoke fails
 
 Command:
-`uv run dimos run unitree-go2 --robot-ip <GO2_IP> --viewer none --daemon`
+`uv run dimos --viewer none run unitree-go2 -o go2connection.ip=<GO2_IP> --daemon`
 
 Fallback:
 Stop with `uv run dimos stop --force`, save `dimos log -n 200`, ask DimOS/event staff for network/WebRTC help, and continue offline/MCP work. Do not run `unitree-go2-dogops` until base `unitree-go2` is healthy.
@@ -125,3 +129,16 @@ Stop with `uv run dimos stop --force`, save `dimos log -n 200`, ask DimOS/event 
 
 Fallback:
 Keep direct generated-image detector tests. Add guided `simulated_tag_ids` argument to `scan_zone`. Continue with product demo and return to real stream later.
+
+### Full DimOS venv has empty dist-info packages
+
+Commands:
+`uv sync`
+`uv pip install click==8.3.1`
+`uv run --no-sync dimos list`
+
+Symptom:
+The full checkout `.venv` can contain empty `*.dist-info` directories after a failed or partial install. `dimos list` then fails on missing imports such as `click` or `pydantic`, even though `uv tree` resolves them.
+
+Fallback:
+Do not keep patching one dependency at a time. Create a clean temporary run environment, for example with `UV_PROJECT_ENVIRONMENT=/private/tmp/dimos-go2-venv`, and run hardware commands through that venv. Rebuild the full checkout `.venv` later when the robot run is not time-sensitive.

@@ -62,7 +62,7 @@ Do not accept a standalone-pack pass as final. The command must be run in the fu
 First test base blueprint:
 
 ```bash
-uv run dimos run unitree-go2 --robot-ip <GO2_IP> --viewer none --daemon
+uv run dimos --viewer none run unitree-go2 -o go2connection.ip=<GO2_IP> --daemon
 uv run dimos status
 uv run dimos log -n 200
 uv run dimos stop --force

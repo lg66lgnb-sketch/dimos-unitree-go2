@@ -83,7 +83,10 @@ Install dependencies and run the local checks:
 ```bash
 uv sync --group dev
 uv run pytest -q dimos/experimental/dogops
+uv run python -m dimos.experimental.dogops.cli simulate --out .dogops/runs/latest
 uv run ruff check dimos/experimental/dogops dimos/robot
+uv run dimos list | rg dogops
+uv run dimos mcp list-tools | rg 'run_mission|scan_zone|read_gauge|check_clearance|detect_blocked_aisle|scan_receiving_manifest|verify_work_order|nav_eval_report'
 ```
 
 Validate the demo configuration:
@@ -160,7 +163,7 @@ Smoke-test the base Go2 path before a DogOps run:
 
 ```bash
 uv run dimos stop --force
-uv run dimos run unitree-go2 --robot-ip <GO2_IP> --viewer none --daemon
+uv run dimos --viewer none run unitree-go2 -o go2connection.ip=<GO2_IP> --daemon
 uv run dimos status
 uv run dimos stop --force
 ```

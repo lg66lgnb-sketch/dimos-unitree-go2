@@ -57,7 +57,8 @@ def summarize_nav_events(run_id: str, events: list[NavEvent]) -> NavSummary:
 
 class DogOpsNavEvalModule(Module):
     def __init__(self, **_: object) -> None:
-        pass
+        if _:
+            super().__init__(**_)
 
     def summarize_run(self, run_dir: str | Path = ".dogops/runs/latest") -> str:
         store = DogOpsStore.load_existing(run_dir)

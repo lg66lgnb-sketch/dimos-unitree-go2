@@ -19,6 +19,8 @@ except ModuleNotFoundError:
 
 class DogOpsObservationModule(Module):
     def __init__(self, *, site_path: str | Path = DEFAULT_SITE, **_: object) -> None:
+        if _:
+            super().__init__(**_)
         self.site_path = Path(site_path)
         self.site = load_site_config(self.site_path)
         self.detector = DogOpsTagDetector(self.site)

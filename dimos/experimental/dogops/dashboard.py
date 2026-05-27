@@ -1,21 +1,31 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from concurrent.futures import TimeoutError as FutureTimeoutError
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import ipaddress
 import json
 import math
 import os
-import secrets
-from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import secrets
+import shlex
+import shutil
+import subprocess
 import threading
 import time
 from typing import Any
 from urllib.parse import urlparse
 
-from dimos.experimental.dogops.dashboard_static import write_dashboard_html
+from dimos.experimental.dogops.dashboard_static import (
+    build_map_data,
+    build_poi_data,
+    build_route_data,
+    write_dashboard_html,
+)
+from dimos.experimental.dogops.live_map import DogOpsLiveMapAdapter
 from dimos.experimental.dogops.store import DogOpsStore
 
 try:  # pragma: no cover - exercised only inside a full DimOS checkout.
@@ -29,17 +39,19 @@ except ModuleNotFoundError:
 
 
 DEFAULT_JOG_DURATION_S = 0.35
-MAX_JOG_DURATION_S = 1.20
-MAX_LINEAR_SPEED = 0.22
-MAX_ANGULAR_SPEED = 0.45
+MAX_JOG_DURATION_S = 2.00
+MAX_LINEAR_SPEED = 0.65
+MAX_ANGULAR_SPEED = 1.10
 ROBOT_CALL_TIMEOUT_S = 8.0
+DIMOS_MCP_CALL_TIMEOUT_S = 12.0
 WEBRTC_COMMAND_TIMEOUT_S = 2.0
 HARD_STOP_REPEATS = 6
 HARD_STOP_INTERVAL_S = 0.05
+ROBOT_POSE_HISTORY_LIMIT = 240
 MOTION_PROFILES: dict[str, tuple[float, float, float]] = {
     "nudge": (0.35, 1.0, 1.0),
-    "step": (0.80, 1.2, 1.15),
-    "walk": (1.20, 1.35, 1.35),
+    "step": (1.00, 2.3, 2.0),
+    "walk": (2.00, 4.0, 3.0),
 }
 DEFAULT_MOTION_PROFILE = "nudge"
 ROBOT_JOG_COMMANDS: dict[str, tuple[float, float, float]] = {
@@ -47,8 +59,8 @@ ROBOT_JOG_COMMANDS: dict[str, tuple[float, float, float]] = {
     "backward": (-0.15, 0.0, 0.0),
     "left": (0.0, 0.15, 0.0),
     "right": (0.0, -0.15, 0.0),
-    "yaw_left": (0.0, 0.0, 0.30),
-    "yaw_right": (0.0, 0.0, -0.30),
+    "yaw_left": (0.0, 0.0, 0.35),
+    "yaw_right": (0.0, 0.0, -0.35),
     "hard_stop": (0.0, 0.0, 0.0),
     "stop": (0.0, 0.0, 0.0),
 }
@@ -61,8 +73,32 @@ DEFAULT_ROBOT_IP = (
     or os.environ.get("ROBOT_IP")
     or "192.168.12.1"
 )
-_ROBOT_SESSIONS: dict[str, "_RobotMotionSession"] = {}
+_ROBOT_SESSIONS: dict[str, _RobotMotionSession] = {}
 _ROBOT_SESSIONS_LOCK = threading.Lock()
+_LIVE_MAP_ADAPTER = DogOpsLiveMapAdapter()
+
+
+class DogOpsDashboardServer(ThreadingHTTPServer):
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        handler_class: type[BaseHTTPRequestHandler],
+        *,
+        live_map_adapter: DogOpsLiveMapAdapter,
+    ) -> None:
+        super().__init__(server_address, handler_class)
+        self.live_map_adapter = live_map_adapter
+
+    def server_close(self) -> None:
+        stop = getattr(self.live_map_adapter, "stop", None)
+        if stop is not None:
+            stop()
+        with _ROBOT_SESSIONS_LOCK:
+            sessions = list(_ROBOT_SESSIONS.values())
+            _ROBOT_SESSIONS.clear()
+        for session in sessions:
+            session.close()
+        super().server_close()
 
 
 def make_dashboard_server(run_dir: str | Path, host: str, port: int) -> ThreadingHTTPServer:
@@ -76,7 +112,7 @@ def make_dashboard_server(run_dir: str | Path, host: str, port: int) -> Threadin
         robot_control_token = token
         robot_ip = DEFAULT_ROBOT_IP
 
-    return ThreadingHTTPServer((host, port), Handler)
+    return DogOpsDashboardServer((host, port), Handler, live_map_adapter=_LIVE_MAP_ADAPTER)
 
 
 def serve_dashboard(run_dir: str | Path, host: str = "127.0.0.1", port: int = 8765) -> None:
@@ -98,6 +134,8 @@ class DogOpsDashboardModule(Module):
         port: int = 8765,
         **_: object,
     ) -> None:
+        if _:
+            super().__init__(**_)
         self.run_dir = Path(run_dir)
         self.host = host
         self.port = port
@@ -123,7 +161,7 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
     robot_control_token: str
     robot_ip: str
 
-    def do_GET(self) -> None:  # noqa: N802
+    def do_GET(self) -> None:
         path = urlparse(self.path).path
         if path in {"/", "/dashboard.html"}:
             self._send_file(self.run_dir / "dashboard.html", "text/html; charset=utf-8")
@@ -134,10 +172,25 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/nav":
             report = self._read_json(self.run_dir / "report.json")
             self._send_json(report.get("nav_summary") or {})
+        elif path == "/api/map":
+            state = self._read_json(self.run_dir / "state.json")
+            report = self._read_json(self.run_dir / "report.json")
+            self._send_json(build_map_data(state, report, live_overlay=_LIVE_MAP_ADAPTER.snapshot()))
+        elif path == "/api/robot/pose":
+            if self._authorize_local_read():
+                self._send_json(_robot_pose_snapshot(self.robot_ip))
+        elif path == "/api/route":
+            state = self._read_json(self.run_dir / "state.json")
+            report = self._read_json(self.run_dir / "report.json")
+            self._send_json(build_route_data(state, report))
+        elif path == "/api/poi":
+            state = self._read_json(self.run_dir / "state.json")
+            report = self._read_json(self.run_dir / "report.json")
+            self._send_json(build_poi_data(state, report))
         else:
             self._send_json({"error": "not_found", "path": path}, HTTPStatus.NOT_FOUND)
 
-    def do_POST(self) -> None:  # noqa: N802
+    def do_POST(self) -> None:
         path = urlparse(self.path).path
         if path.startswith("/api/work_orders/") and path.endswith("/ready_to_verify"):
             work_order_id = path.split("/")[3]
@@ -150,6 +203,15 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/robot/posture":
             if self._authorize_robot_control():
                 self._robot_posture()
+        elif path == "/api/robot/go_to":
+            if self._authorize_robot_control():
+                self._robot_go_to()
+        elif path == "/api/robot/map_start":
+            if self._authorize_robot_control():
+                self._robot_map_start()
+        elif path == "/api/robot/map_origin":
+            if self._authorize_robot_control():
+                self._robot_map_origin()
         else:
             self._send_json({"error": "not_found", "path": path}, HTTPStatus.NOT_FOUND)
 
@@ -277,6 +339,109 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
 
         self._send_json({"ok": bool(ok), "command": command})
 
+    def _robot_go_to(self) -> None:
+        payload = self._read_body_json()
+        try:
+            x, y = _go_to_target(payload)
+        except ValueError as exc:
+            self._send_json(
+                {"ok": False, "error": "invalid_go_to_target", "message": str(exc)},
+                HTTPStatus.BAD_REQUEST,
+            )
+            return
+
+        source = str(payload.get("source") or "dashboard")
+        try:
+            result = _run_robot_call(lambda: _run_robot_go_to(x, y))
+        except ModuleNotFoundError as exc:
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": "dimos_mcp_unavailable",
+                    "message": str(exc),
+                },
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            return
+        except TimeoutError as exc:
+            self._send_json(
+                {"ok": False, "error": "go_to_timeout", "message": str(exc)},
+                HTTPStatus.GATEWAY_TIMEOUT,
+            )
+            return
+        except Exception as exc:
+            self._send_json(
+                {"ok": False, "error": "go_to_failed", "message": str(exc)},
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            return
+
+        self._send_json(
+            {
+                "ok": True,
+                "command": "go_to",
+                "x": x,
+                "y": y,
+                "source": source,
+                **(result or {}),
+            }
+        )
+
+    def _robot_map_start(self) -> None:
+        robot_ip = self.robot_ip
+        try:
+            result = _run_robot_call(lambda: _start_robot_map(robot_ip))
+        except ModuleNotFoundError as exc:
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": "dimos_motion_unavailable",
+                    "message": str(exc),
+                },
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            return
+        except TimeoutError as exc:
+            self._send_json(
+                {"ok": False, "error": "map_start_timeout", "message": str(exc)},
+                HTTPStatus.GATEWAY_TIMEOUT,
+            )
+            return
+        except Exception as exc:
+            self._send_json(
+                {"ok": False, "error": "map_start_failed", "message": str(exc)},
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            return
+
+        self._send_json({"ok": True, "command": "map_start", **result})
+
+    def _robot_map_origin(self) -> None:
+        robot_ip = self.robot_ip
+        try:
+            result = _run_robot_call(lambda: _reset_robot_map_origin(robot_ip))
+        except TimeoutError as exc:
+            self._send_json(
+                {"ok": False, "error": "map_origin_timeout", "message": str(exc)},
+                HTTPStatus.GATEWAY_TIMEOUT,
+            )
+            return
+        except Exception as exc:
+            self._send_json(
+                {"ok": False, "error": "map_origin_failed", "message": str(exc)},
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            return
+
+        self._send_json({"ok": bool(result), "command": "map_origin"})
+
+    def _authorize_local_read(self) -> bool:
+        host = self.headers.get("Host", "")
+        if not _is_loopback_host(_host_name(host)):
+            self._send_json({"ok": False, "error": "local_read_only"}, HTTPStatus.FORBIDDEN)
+            return False
+        return True
+
     def _authorize_robot_control(self) -> bool:
         host = self.headers.get("Host", "")
         if not _is_loopback_host(_host_name(host)):
@@ -332,7 +497,7 @@ def _run_robot_call(fn: Any) -> Any:
     def target() -> None:
         try:
             result["value"] = fn()
-        except BaseException as exc:  # noqa: BLE001 - re-raised on the request thread.
+        except BaseException as exc:
             result["error"] = exc
 
     thread = threading.Thread(target=target, daemon=True)
@@ -368,6 +533,17 @@ def _resolve_motion_request(
 
 def _cap(value: float, limit: float) -> float:
     return max(-limit, min(value, limit))
+
+
+def _go_to_target(payload: dict[str, Any]) -> tuple[float, float]:
+    try:
+        x = float(payload["x"])
+        y = float(payload["y"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("go_to requires numeric x and y") from exc
+    if not math.isfinite(x) or not math.isfinite(y):
+        raise ValueError("go_to target must be finite")
+    return x, y
 
 
 def _host_parts(host_header: str) -> tuple[str, int | None]:
@@ -431,13 +607,100 @@ def _run_robot_posture(command: str, robot_ip: str) -> bool:
             _close_robot_session(robot_ip)
 
 
-def _get_robot_session(robot_ip: str) -> "_RobotMotionSession":
+def _run_robot_go_to(x: float, y: float) -> dict[str, Any]:
+    return _call_dimos_mcp_skill("go_to", {"x": x, "y": y})
+
+
+def _call_dimos_mcp_skill(skill_name: str, args: dict[str, Any]) -> dict[str, Any]:
+    command = _dimos_mcp_call_command(skill_name, args)
+    try:
+        result = subprocess.run(
+            command,
+            cwd=_dimos_command_cwd(),
+            env=_dimos_command_env(),
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=DIMOS_MCP_CALL_TIMEOUT_S,
+        )
+    except FileNotFoundError as exc:
+        raise ModuleNotFoundError(
+            f"DimOS MCP command is unavailable: {command[0]}"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(
+            f"dimos mcp call {skill_name} timed out after {DIMOS_MCP_CALL_TIMEOUT_S:.1f}s"
+        ) from exc
+
+    stdout = result.stdout.strip()
+    stderr = result.stderr.strip()
+    if result.returncode != 0:
+        detail = stderr or stdout or "no output"
+        raise RuntimeError(f"dimos mcp call {skill_name} failed: {detail}")
+    payload: dict[str, Any] = {
+        "transport": "dimos_mcp",
+        "skill": skill_name,
+    }
+    if stdout:
+        try:
+            decoded = json.loads(stdout)
+        except json.JSONDecodeError:
+            payload["stdout"] = stdout
+        else:
+            if isinstance(decoded, dict):
+                if decoded.get("ok") is False:
+                    detail = decoded.get("error") or decoded.get("message") or decoded
+                    raise RuntimeError(f"dimos mcp call {skill_name} returned error: {detail}")
+                payload["mcp_result"] = decoded
+            else:
+                payload["mcp_result"] = {"value": decoded}
+    return payload
+
+
+def _dimos_mcp_call_command(skill_name: str, args: dict[str, Any]) -> list[str]:
+    encoded_args = json.dumps(args, separators=(",", ":"))
+    raw_prefix = os.environ.get("DOGOPS_DIMOS_MCP_CALL")
+    if raw_prefix:
+        return [*shlex.split(raw_prefix), skill_name, "--json-args", encoded_args]
+    if shutil.which("uv") is not None:
+        return ["uv", "run", "dimos", "mcp", "call", skill_name, "--json-args", encoded_args]
+    return ["dimos", "mcp", "call", skill_name, "--json-args", encoded_args]
+
+
+def _dimos_command_cwd() -> str | None:
+    for name in ("DOGOPS_DIMOS_ROOT", "DIMOS_ROOT"):
+        root = os.environ.get(name)
+        if root and Path(root).exists():
+            return root
+    return None
+
+
+def _dimos_command_env() -> dict[str, str]:
+    env = dict(os.environ)
+    for key in ("NO_PROXY", "no_proxy"):
+        existing = env.get(key, "")
+        entries = [item.strip() for item in existing.split(",") if item.strip()]
+        for host in ("127.0.0.1", "localhost"):
+            if host not in entries:
+                entries.append(host)
+        env[key] = ",".join(entries)
+    return env
+
+
+def _get_robot_session(robot_ip: str) -> _RobotMotionSession:
     with _ROBOT_SESSIONS_LOCK:
         session = _ROBOT_SESSIONS.get(robot_ip)
-        if session is None or session.closed:
-            session = _RobotMotionSession(robot_ip)
-            _ROBOT_SESSIONS[robot_ip] = session
-        return session
+        if session is not None and not session.closed:
+            return session
+
+    new_session = _RobotMotionSession(robot_ip)
+    with _ROBOT_SESSIONS_LOCK:
+        session = _ROBOT_SESSIONS.get(robot_ip)
+        if session is not None and not session.closed:
+            new_session.close()
+            return session
+        _ROBOT_SESSIONS[robot_ip] = new_session
+        return new_session
 
 
 def _close_robot_session(robot_ip: str) -> None:
@@ -445,6 +708,32 @@ def _close_robot_session(robot_ip: str) -> None:
         session = _ROBOT_SESSIONS.pop(robot_ip, None)
     if session is not None:
         session.close()
+
+
+def _robot_pose_snapshot(robot_ip: str) -> dict[str, Any]:
+    with _ROBOT_SESSIONS_LOCK:
+        session = _ROBOT_SESSIONS.get(robot_ip)
+    if session is None or session.closed:
+        return {
+            "ok": False,
+            "connected": False,
+            "source": "unitree_go2_odom",
+            "robot_ip": robot_ip,
+            "error": "robot_session_not_started",
+        }
+    return session.pose_snapshot()
+
+
+def _start_robot_map(robot_ip: str) -> dict[str, Any]:
+    return _get_robot_session(robot_ip).pose_snapshot()
+
+
+def _reset_robot_map_origin(robot_ip: str) -> bool:
+    with _ROBOT_SESSIONS_LOCK:
+        session = _ROBOT_SESSIONS.get(robot_ip)
+    if session is None or session.closed:
+        return False
+    return session.reset_map_origin()
 
 
 class _RobotMotionSession:
@@ -456,9 +745,15 @@ class _RobotMotionSession:
         self.sport_cmd = SPORT_CMD
         self.connection = self._make_connection(robot_ip)
         self.lock = threading.RLock()
+        self.pose_lock = threading.RLock()
         self.closed = False
         self.mode = "connected"
         self._latest_pose: tuple[float, float, float] | None = None
+        self._latest_pose_ts: float | None = None
+        self._map_origin_pose: tuple[float, float, float] | None = None
+        self._pose_history: deque[tuple[float, float, float, float]] = deque(
+            maxlen=ROBOT_POSE_HISTORY_LIMIT
+        )
         self._odom_subscription = self.connection.raw_odom_stream().subscribe(self._set_pose)
 
     def _make_connection(self, robot_ip: str) -> Any:
@@ -529,6 +824,47 @@ class _RobotMotionSession:
         except Exception:
             pass
 
+    def pose_snapshot(self) -> dict[str, Any]:
+        with self.pose_lock:
+            latest = self._latest_pose
+            latest_ts = self._latest_pose_ts
+            origin = self._map_origin_pose
+            history = list(self._pose_history)
+        if latest is None or latest_ts is None or origin is None:
+            return {
+                "ok": False,
+                "connected": not self.closed,
+                "source": "unitree_go2_odom",
+                "robot_ip": self.robot_ip,
+                "error": "waiting_for_odom",
+            }
+        x, y, yaw = _relative_map_pose(latest, origin)
+        return {
+            "ok": True,
+            "connected": not self.closed,
+            "source": "unitree_go2_odom",
+            "robot_ip": self.robot_ip,
+            "ts": latest_ts,
+            "pose": {"x": x, "y": y, "yaw_rad": yaw},
+            "raw_pose": {"x": latest[0], "y": latest[1], "yaw_rad": latest[2]},
+            "origin_raw_pose": {"x": origin[0], "y": origin[1], "yaw_rad": origin[2]},
+            "trajectory": [
+                {"x": item[0], "y": item[1], "yaw_rad": item[2], "ts": item[3]}
+                for item in history
+            ],
+        }
+
+    def reset_map_origin(self) -> bool:
+        with self.pose_lock:
+            if self._latest_pose is None:
+                return False
+            now = self._latest_pose_ts or time.time()
+            self._map_origin_pose = self._latest_pose
+            x, y, yaw = _relative_map_pose(self._latest_pose, self._map_origin_pose)
+            self._pose_history.clear()
+            self._pose_history.append((x, y, yaw, now))
+            return True
+
     def _ensure_balance(self) -> None:
         if self.mode != "balance":
             self._sport("BalanceStand")
@@ -584,7 +920,15 @@ class _RobotMotionSession:
             raise TimeoutError(f"WebRTC joystick timed out after {WEBRTC_COMMAND_TIMEOUT_S:.1f}s") from exc
 
     def _set_pose(self, msg: Any) -> None:
-        self._latest_pose = _pose_xy_yaw(msg)
+        pose = _pose_xy_yaw(msg)
+        now = time.time()
+        with self.pose_lock:
+            if self._map_origin_pose is None:
+                self._map_origin_pose = pose
+            self._latest_pose = pose
+            self._latest_pose_ts = now
+            x, y, yaw = _relative_map_pose(pose, self._map_origin_pose)
+            self._pose_history.append((x, y, yaw, now))
 
     def _wait_pose(self) -> tuple[float, float, float] | None:
         deadline = time.time() + 1.0
@@ -618,6 +962,25 @@ def _pose_xy_yaw(msg: Any) -> tuple[float, float, float]:
     return x, y, yaw
 
 
+def _relative_map_pose(
+    pose: tuple[float, float, float],
+    origin: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    dx = pose[0] - origin[0]
+    dy = pose[1] - origin[1]
+    heading = -origin[2]
+    cos_h = math.cos(heading)
+    sin_h = math.sin(heading)
+    x = (dx * cos_h) - (dy * sin_h)
+    y = (dx * sin_h) + (dy * cos_h)
+    yaw = _wrap_angle(pose[2] - origin[2])
+    return x, y, yaw
+
+
+def _wrap_angle(value: float) -> float:
+    return math.atan2(math.sin(value), math.cos(value))
+
+
 def _pose_delta(
     before: tuple[float, float, float] | None,
     after: tuple[float, float, float] | None,
@@ -626,7 +989,7 @@ def _pose_delta(
         return {"observed": False}
     dx = after[0] - before[0]
     dy = after[1] - before[1]
-    dyaw = after[2] - before[2]
+    dyaw = _wrap_angle(after[2] - before[2])
     return {
         "observed": True,
         "observed_dx_m": dx,

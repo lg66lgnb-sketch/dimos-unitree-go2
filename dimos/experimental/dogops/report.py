@@ -4,13 +4,48 @@ from dimos.experimental.dogops.models import (
     DogOpsState,
     IncidentState,
     IncidentType,
+    NavAction,
+    Observation,
     PackageState,
+    SiteEntity,
     WorkOrderState,
 )
 
 
 def _value(value: object) -> object:
     return getattr(value, "value", value)
+
+
+def build_checkpoint_verifications(state: DogOpsState) -> list[dict[str, object]]:
+    entities_by_id: dict[str, SiteEntity] = {
+        **state.site.zone_by_id(),
+        **state.site.asset_by_id(),
+        **state.site.package_by_id(),
+    }
+    entities_by_id.update(state.site.special_entities)
+    checkpoints: list[dict[str, object]] = []
+    seen_targets: set[str] = set()
+
+    for event in state.nav_events:
+        if event.action != NavAction.goto or not event.target_id:
+            continue
+        target_id = event.target_id
+        if target_id in seen_targets:
+            continue
+        seen_targets.add(target_id)
+        entity = entities_by_id.get(target_id)
+        expected_tag_id = entity.tag_id if entity is not None else None
+        matching_observation = _first_observation_with_tag(state.observations, expected_tag_id)
+        checkpoints.append(
+            {
+                "target_id": target_id,
+                "expected_tag_id": expected_tag_id,
+                "verified": matching_observation is not None,
+                "observation_id": matching_observation.id if matching_observation else None,
+            }
+        )
+
+    return checkpoints
 
 
 def build_report_data(state: DogOpsState) -> dict[str, object]:
@@ -46,6 +81,7 @@ def build_report_data(state: DogOpsState) -> dict[str, object]:
         incident for incident in state.incidents if incident.state == IncidentState.resolved
     ]
     nav = state.nav_summary
+    checkpoints = build_checkpoint_verifications(state)
     return {
         "run_id": state.run.id,
         "mission_id": state.run.mission_id,
@@ -71,6 +107,9 @@ def build_report_data(state: DogOpsState) -> dict[str, object]:
         ],
         "what_changed": state.what_changed,
         "nav_summary": nav.model_dump(mode="json") if nav else None,
+        "checkpoints_total": len(checkpoints),
+        "checkpoints_verified": len([checkpoint for checkpoint in checkpoints if checkpoint["verified"]]),
+        "checkpoint_verifications": checkpoints,
         "packages": [status.model_dump(mode="json") for status in package_statuses],
         "incidents": [incident.model_dump(mode="json") for incident in state.incidents],
         "work_orders": [
@@ -111,6 +150,10 @@ def render_report_markdown(state: DogOpsState) -> str:
             f"{nav.tag_reacquisition_successes} tag-search recovery, "
             f"{nav.safety_stops} safety stops"
         )
+    lines.append(
+        "Checkpoints: "
+        f"{data['checkpoints_verified']}/{data['checkpoints_total']} tag sign-ins verified"
+    )
 
     for changed in state.what_changed:
         lines.append(f"What changed: {changed}")
@@ -133,6 +176,37 @@ def render_report_markdown(state: DogOpsState) -> str:
         )
 
     return "\n".join(lines) + "\n"
+
+
+def _first_observation_with_tag(
+    observations: list[Observation],
+    tag_id: int | None,
+) -> Observation | None:
+    if tag_id is None:
+        return None
+    for observation in observations:
+        if tag_id in _observation_tag_ids(observation):
+            return observation
+    return None
+
+
+def _observation_tag_ids(observation: Observation) -> set[int]:
+    tag_ids = set()
+    if observation.tag_id is not None:
+        tag_ids.add(observation.tag_id)
+    raw_visible = observation.facts.get("visible_tag_ids")
+    if isinstance(raw_visible, str):
+        for item in raw_visible.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            try:
+                tag_ids.add(int(item))
+            except ValueError:
+                continue
+    elif isinstance(raw_visible, int):
+        tag_ids.add(raw_visible)
+    return tag_ids
 
 
 def assert_report_has_closed_loop(state: DogOpsState) -> None:

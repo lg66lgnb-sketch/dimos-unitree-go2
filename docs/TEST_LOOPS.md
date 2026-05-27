@@ -20,7 +20,7 @@ Optional when `GO2_IP` is known:
 
 ```bash
 uv run dimos stop --force || true
-uv run dimos run unitree-go2 --robot-ip "$GO2_IP" --viewer none --daemon
+uv run dimos --viewer none run unitree-go2 -o "go2connection.ip=${GO2_IP}" --daemon
 uv run dimos status
 uv run dimos log -n 100
 uv run dimos stop --force
@@ -89,7 +89,7 @@ CI=1 uv run pytest -q -o addopts='' dimos/robot/test_all_blueprints_generation.p
 uv run dimos list | rg dogops
 uv run dimos --replay --viewer none run unitree-go2-dogops --daemon || true
 uv run dimos status || true
-uv run dimos mcp list-tools | rg 'run_mission|scan_zone|verify_work_order|nav_eval_report'
+uv run dimos mcp list-tools | rg 'run_mission|go_to|scan_zone|read_gauge|check_clearance|detect_blocked_aisle|scan_receiving_manifest|verify_work_order|nav_eval_report'
 uv run dimos stop --force || true
 ```
 
@@ -111,11 +111,15 @@ Only run after the route is physically clear and the stop command is known.
 
 ```bash
 uv run dimos stop --force || true
-uv run dimos run unitree-go2-dogops --robot-ip "$GO2_IP" --viewer none --daemon
+uv run dimos --viewer none run unitree-go2-dogops -o "go2connection.ip=${GO2_IP}" --daemon
 uv run dimos status
-uv run dimos mcp list-tools | rg 'run_mission|scan_zone|verify_work_order|nav_eval_report'
+uv run dimos mcp list-tools | rg 'run_mission|go_to|scan_zone|read_gauge|check_clearance|detect_blocked_aisle|scan_receiving_manifest|verify_work_order|nav_eval_report'
 uv run dimos mcp call run_mission --json-args '{"mission_id":"receiving_sre_demo"}'
 uv run dimos mcp call scan_zone --json-args '{"zone_id":"INBOUND_DOCK"}'
+uv run dimos mcp call scan_receiving_manifest --json-args '{"zone_id":"INBOUND_DOCK"}'
+uv run dimos mcp call read_gauge --json-args '{"asset_id":"TEMP_1"}'
+uv run dimos mcp call check_clearance --json-args '{"asset_id":"COOLING_1"}'
+uv run dimos mcp call detect_blocked_aisle --json-args '{"zone_id":"AISLE_1"}'
 uv run dimos mcp call nav_eval_report
 uv run dimos log -n 200
 uv run dimos stop --force
