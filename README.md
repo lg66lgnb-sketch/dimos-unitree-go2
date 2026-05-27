@@ -112,17 +112,41 @@ Live Go2 map mode must run from the full local DimOS checkout/environment, not o
 cd $DIMOS_ROOT
 
 # If macOS multicast routing is pointed at the dog Wi-Fi, route DimOS/LCM multicast locally.
-sudo route delete -net 224.0.0.0/4
+sudo route delete -net 224.0.0.0/4 2>/dev/null || true
 sudo route add -net 224.0.0.0/4 -interface lo0
+route -n get 224.0.0.1
+```
 
+The final command should show `interface: lo0`.
+
+Start the dashboard from a simulated run directory:
+
+```bash
 # Prepare a run directory for the dashboard.
 uv run python -m dimos.experimental.dogops.cli simulate --out .dogops/runs/latest
 
 # Start the DogOps dashboard.
-uv run python -m dimos.experimental.dogops.cli serve --run .dogops/runs/latest --host 127.0.0.1 --port 18769
+DOGOPS_ROBOT_IP=192.168.12.1 \
+  uv run --no-sync python -m dimos.experimental.dogops.cli serve \
+  --run .dogops/runs/latest \
+  --host 127.0.0.1 \
+  --port 18769
+```
 
-# In another terminal, start DimOS live mapping against the dog.
-DOGOPS_SKIP_GO2_STARTUP_POSTURE=1 uv run dimos --robot-ip 192.168.12.1 --viewer none --rerun-open none --no-rerun-web run unitree-go2-dogops
+In another terminal, start the live DogOps runtime against the dog. For MCP route testing on macOS, prefer foreground mode; in local testing `--daemon` registered in `dimos status` but left the MCP HTTP server unreachable on `127.0.0.1:9990`.
+
+```bash
+GO2_IP=192.168.12.1 \
+DOGOPS_ROBOT_IP=192.168.12.1 \
+DOGOPS_SKIP_GO2_STARTUP_POSTURE=1 \
+NO_PROXY=127.0.0.1,localhost \
+no_proxy=127.0.0.1,localhost \
+  uv run --no-sync dimos \
+  --viewer none \
+  --rerun-open none \
+  --no-rerun-web \
+  run unitree-go2-dogops \
+  -o "go2connection.ip=192.168.12.1"
 ```
 
 Open:
@@ -134,6 +158,14 @@ http://127.0.0.1:18769/
 Useful verification:
 
 ```bash
+uv run --no-sync dimos status
+
+NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
+  uv run --no-sync dimos mcp list-tools | rg 'go_to|follow_route|stop_route|route_status'
+
+NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
+  uv run --no-sync dimos mcp call route_status
+
 curl -s http://127.0.0.1:18769/api/map
 ```
 
@@ -142,13 +174,22 @@ Expected live indicators:
 - `live.status` is `receiving`
 - `live.topics.odom.received` is `true`
 - `live.topics.global_costmap.received` is `true`
+- `live.robot_pose` is not `null`
 - `layers.heatmap` is `true`
 - `layers.robot` is `true`
+
+Before live route movement, author/select a tiny route in clear line of sight and run a dry-run first:
+
+```bash
+NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
+  uv run --no-sync dimos mcp call follow_route \
+  --json-args '{"route_id":"TEST_STATIONARY","dry_run":true}'
+```
 
 Stop command:
 
 ```bash
-uv run dimos stop --force
+uv run --no-sync dimos stop --force
 ```
 
 ## Hardware Note
