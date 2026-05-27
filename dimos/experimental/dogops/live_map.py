@@ -16,6 +16,7 @@ LIVE_TOPICS = {
     "path": "/path",
     "target": "/target",
     "goal_request": "/goal_request",
+    "clicked_point": "/clicked_point",
 }
 
 
@@ -47,7 +48,7 @@ class DogOpsLiveMapAdapter:
         costmap_msg = _latest_first(latest, "navigation_costmap", "global_costmap")
         path_msg = _latest_value(latest, "path")
         odom_msg = _latest_value(latest, "odom")
-        target_msg = _latest_first(latest, "target", "goal_request")
+        target_msg = _latest_first(latest, "target", "goal_request", "clicked_point")
         path = _path_to_points(path_msg) if path_msg is not None else []
         ok = any(item["received"] for item in topics.values())
         return {
@@ -69,7 +70,7 @@ class DogOpsLiveMapAdapter:
                 return
             self._started = True
         try:
-            LCMTransport, OccupancyGrid, Path, PoseStamped = _import_dimos_topic_types()
+            LCMTransport, OccupancyGrid, Path, PoseStamped, PointStamped = _import_dimos_topic_types()
         except Exception as exc:
             with self._lock:
                 self._error = (
@@ -85,6 +86,7 @@ class DogOpsLiveMapAdapter:
             "path": (LIVE_TOPICS["path"], Path),
             "target": (LIVE_TOPICS["target"], PoseStamped),
             "goal_request": (LIVE_TOPICS["goal_request"], PoseStamped),
+            "clicked_point": (LIVE_TOPICS["clicked_point"], PointStamped),
         }
         for name, (topic, msg_type) in specs.items():
             try:
@@ -120,19 +122,21 @@ class DogOpsLiveMapAdapter:
             self._latest[name] = (time.time(), msg)
 
 
-def _import_dimos_topic_types() -> tuple[Any, Any, Any, Any]:
+def _import_dimos_topic_types() -> tuple[Any, Any, Any, Any, Any]:
     try:
         from dimos.core.transport import LCMTransport
+        from dimos.msgs.geometry_msgs.PointStamped import PointStamped
         from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
         from dimos.msgs.nav_msgs.OccupancyGrid import OccupancyGrid
         from dimos.msgs.nav_msgs.Path import Path
     except ModuleNotFoundError:
         _extend_dimos_package_path()
         from dimos.core.transport import LCMTransport
+        from dimos.msgs.geometry_msgs.PointStamped import PointStamped
         from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
         from dimos.msgs.nav_msgs.OccupancyGrid import OccupancyGrid
         from dimos.msgs.nav_msgs.Path import Path
-    return LCMTransport, OccupancyGrid, Path, PoseStamped
+    return LCMTransport, OccupancyGrid, Path, PoseStamped, PointStamped
 
 
 def _extend_dimos_package_path() -> None:
@@ -181,15 +185,13 @@ def _grid_to_costmap(msg: Any, *, max_columns: int = 48, max_rows: int = 32) -> 
     if grid is None or width <= 0 or height <= 0 or columns <= 0 or rows <= 0:
         return {"source": "DimOS live costmap", "columns": 0, "rows": 0, "cells": []}
 
-    block_w = max(1, math.ceil(width / columns))
-    block_h = max(1, math.ceil(height / rows))
     cells: list[dict[str, float]] = []
     for row in range(rows):
-        y0 = row * block_h
-        y1 = min(height, y0 + block_h)
+        y0 = math.floor(row * height / rows)
+        y1 = math.floor((row + 1) * height / rows)
         for column in range(columns):
-            x0 = column * block_w
-            x1 = min(width, x0 + block_w)
+            x0 = math.floor(column * width / columns)
+            x1 = math.floor((column + 1) * width / columns)
             cells.append(
                 {
                     "x": origin_x + x0 * resolution,

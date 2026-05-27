@@ -178,12 +178,6 @@ def build_map_data(
             }
         )
 
-    points = [
-        (item["x"], item["y"])
-        for group in (map_zones, map_assets, map_packages, map_route, map_observations)
-        for item in group
-    ]
-    bounds = _map_bounds(points)
     live = live_overlay or {
         "ok": False,
         "source": "DimOS live LCM topics",
@@ -196,6 +190,13 @@ def build_map_data(
         "robot_pose": None,
         "target": None,
     }
+    points = [
+        (item["x"], item["y"])
+        for group in (map_zones, map_assets, map_packages, map_route, map_observations)
+        for item in group
+    ]
+    points.extend(_live_overlay_points(live))
+    bounds = _map_bounds(points)
     return {
         "site_id": site.get("site_id"),
         "site_name": site.get("site_name"),
@@ -214,6 +215,51 @@ def build_map_data(
             "robot": bool(live.get("robot_pose")) if isinstance(live, dict) else False,
         },
     }
+
+
+def _live_overlay_points(live: dict[str, Any]) -> list[tuple[float, float]]:
+    points: list[tuple[float, float]] = []
+    for point in [*(live.get("path") or []), *(live.get("route") or [])]:
+        maybe_point = _xy_point(point)
+        if maybe_point is not None:
+            points.append(maybe_point)
+    for point in (live.get("robot_pose"), live.get("target")):
+        maybe_point = _xy_point(point)
+        if maybe_point is not None:
+            points.append(maybe_point)
+    costmap = live.get("costmap") or {}
+    cells = costmap.get("cells") if isinstance(costmap, dict) else None
+    if isinstance(cells, list):
+        for cell in cells:
+            maybe_point = _xy_point(cell)
+            if maybe_point is None:
+                continue
+            x, y = maybe_point
+            width = _float_or_none(cell.get("width") if isinstance(cell, dict) else None) or 0.0
+            height = _float_or_none(cell.get("height") if isinstance(cell, dict) else None) or 0.0
+            points.append((x, y))
+            points.append((x + width, y + height))
+    return points
+
+
+def _xy_point(item: Any) -> tuple[float, float] | None:
+    if not isinstance(item, dict):
+        return None
+    x = _float_or_none(item.get("x"))
+    y = _float_or_none(item.get("y"))
+    if x is None or y is None:
+        return None
+    return x, y
+
+
+def _float_or_none(value: Any) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(result):
+        return None
+    return result
 
 
 def build_route_data(state: dict[str, Any], report: dict[str, Any]) -> dict[str, Any]:
@@ -1119,6 +1165,7 @@ def render_dashboard_html(
       let robotBusy = false;
       let liveMapPolling = false;
       let dimosMapPolling = false;
+      let dimosRobotPoseActive = false;
       let goToArmed = false;
       let liveMapBounds = null;
       try {{
@@ -1217,9 +1264,9 @@ def render_dashboard_html(
           `translate(${{projected.x.toFixed(1)}} ${{projected.y.toFixed(1)}})`
         );
       }};
-      const setLiveMapUnavailable = (text) => {{
+      const setLiveMapUnavailable = (text, keepRobot = false) => {{
         if (liveMapStatus) liveMapStatus.textContent = text;
-        if (liveRobot) liveRobot.style.display = "none";
+        if (liveRobot && !keepRobot) liveRobot.style.display = "none";
       }};
       const heatColor = (cost) => {{
         if (cost >= 0.75) return "#dc2626";
@@ -1277,9 +1324,11 @@ def render_dashboard_html(
       const updateDimOSMapLayers = (data) => {{
         const live = data && data.live ? data.live : null;
         if (!live) return;
+        if (data.bounds) liveMapBounds = data.bounds;
         const heatmapCells = renderLiveHeatmap(live.costmap);
         const pathPoints = renderDimOSPath(live.path || live.route || []);
         renderDimOSTarget(live.target);
+        dimosRobotPoseActive = Boolean(live.robot_pose);
         if (live.robot_pose) {{
           const yawRad = Number.isFinite(live.robot_pose.theta_deg)
             ? live.robot_pose.theta_deg * Math.PI / 180
@@ -1297,6 +1346,7 @@ def render_dashboard_html(
       const updateLiveMap = (data) => {{
         if (!liveMapSvg || !liveTrace || !liveRobot || !liveMapStatus) return;
         if (!data || !data.ok || !data.pose) {{
+          if (dimosRobotPoseActive) return;
           const error = data && data.error ? data.error : "offline";
           setLiveMapUnavailable(`Live odom: ${{error}}`);
           return;
@@ -1309,7 +1359,7 @@ def render_dashboard_html(
         liveTrace.setAttribute("points", points.join(" "));
         const projected = projectLivePose(data.pose);
         if (!projected) {{
-          setLiveMapUnavailable("Live odom: map projection unavailable");
+          if (!dimosRobotPoseActive) setLiveMapUnavailable("Live odom: map projection unavailable");
           return;
         }}
         const yawDeg = (data.pose.yaw_rad || 0) * 180 / Math.PI;
@@ -1334,7 +1384,7 @@ def render_dashboard_html(
           const result = await response.json();
           updateLiveMap(result);
         }} catch (error) {{
-          setLiveMapUnavailable(`Live odom: ${{error.message}}`);
+          if (!dimosRobotPoseActive) setLiveMapUnavailable(`Live odom: ${{error.message}}`);
         }} finally {{
           window.clearTimeout(timeout);
           liveMapPolling = false;
