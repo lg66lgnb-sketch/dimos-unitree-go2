@@ -360,8 +360,12 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
     def _persist_authoring_mutation(self, mutate: Any) -> MapAuthoringState:
         with _AUTHORING_LOCK:
             authoring = mutate(self._load_authoring())
-            save_map_authoring(self.run_dir, authoring)
+            self._save_authoring(authoring)
             return authoring
+
+    def _save_authoring(self, authoring: MapAuthoringState) -> None:
+        save_map_authoring(self.run_dir, authoring)
+        write_dashboard_html(self.run_dir, robot_control_token=self.robot_control_token)
 
     def _replace_map_authoring(self) -> None:
         state = self._read_json(self.run_dir / "state.json")
@@ -370,7 +374,7 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         try:
             authoring = MapAuthoringState.model_validate(payload)
             with _AUTHORING_LOCK:
-                save_map_authoring(self.run_dir, authoring)
+                self._save_authoring(authoring)
         except (ValidationError, ValueError) as exc:
             self._handle_authoring_error(exc)
             return
@@ -529,7 +533,7 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         try:
             with _AUTHORING_LOCK:
                 authoring = publish_no_go_constraints(self._load_authoring())
-                save_map_authoring(self.run_dir, authoring)
+                self._save_authoring(authoring)
         except (ValidationError, ValueError) as exc:
             self._handle_authoring_error(exc)
             return

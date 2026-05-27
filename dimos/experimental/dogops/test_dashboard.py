@@ -386,6 +386,8 @@ def test_dashboard_map_authoring_endpoints_persist_and_compose(tmp_path) -> None
             headers=_robot_headers(server),
         )
         map_data = _get_json(f"{base_url}/api/map")
+        with urllib.request.urlopen(f"{base_url}/dashboard.html", timeout=5) as response:
+            html = response.read().decode("utf-8")
     finally:
         server.shutdown()
         server.server_close()
@@ -401,6 +403,11 @@ def test_dashboard_map_authoring_endpoints_persist_and_compose(tmp_path) -> None
     assert any(zone["id"] == "CHECKPOINT_X" for zone in map_data["zones"])
     assert map_data["route"][0]["target_id"] == "CHECKPOINT_X"  # type: ignore[index]
     assert map_data["no_go_shapes"][0]["id"] == "NO_GO_EDIT"  # type: ignore[index]
+    match = re.search(r'data-map-authoring="([^"]+)"', html)
+    assert match is not None
+    embedded_authoring = json.loads(unescape(match.group(1)))
+    assert embedded_authoring["entities"][0]["id"] == "CHECKPOINT_X"
+    assert embedded_authoring["routes"][0]["id"] == "ROUTE_EDIT"
 
 
 def test_dashboard_map_authoring_rejects_duplicate_tag_binding(tmp_path) -> None:
