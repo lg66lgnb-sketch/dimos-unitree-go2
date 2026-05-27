@@ -75,7 +75,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="dogops-2d",
         help=(
             "dogops-2d publishes the lightweight fallback map; native-3d overlays "
-            "DogOps route/POI labels onto an existing DimOS Go2 Rerun stream"
+            "DogOps route/POI labels onto an existing DimOS Go2 Rerun stream and "
+            "fails if that native stream is not running"
         ),
     )
 

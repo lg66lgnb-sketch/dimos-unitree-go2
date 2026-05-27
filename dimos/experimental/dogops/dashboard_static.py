@@ -324,11 +324,15 @@ def render_dashboard_html(
       background: #070b12;
       overflow: hidden;
     }}
-    .rerun-canvas {{
+    .rerun-canvas,
+    .rerun-frame {{
       width: 100%;
       height: 100%;
       display: block;
       background: #070b12;
+    }}
+    .rerun-frame {{
+      border: 0;
     }}
     .rerun-canvas[hidden] {{ display: none; }}
     .rerun-canvas canvas {{
@@ -640,7 +644,7 @@ def render_dashboard_html(
       .metric-row {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       .map-workspace {{ grid-template-columns: 1fr; }}
       .ops-panel {{ height: auto; max-height: none; }}
-      .map-viewer, .rerun-canvas {{ min-height: 420px; height: 420px; }}
+      .map-viewer, .rerun-canvas, .rerun-frame {{ min-height: 420px; height: 420px; }}
       .viewer-hint {{ flex-direction: column; }}
       .map-route-overlay,
       .robot-dock {{
@@ -742,14 +746,23 @@ def render_dashboard_html(
         const canvasHost = mapViewer.querySelector("[data-rerun-canvas]");
         const offline = mapViewer.querySelector("[data-viewer-offline]");
         const statusText = mapViewer.querySelector("[data-rerun-status]");
+        const frameHost = mapViewer.querySelector("[data-rerun-frame]");
         const showFallback = (message) => {{
           if (canvasHost) canvasHost.hidden = true;
+          if (frameHost) frameHost.hidden = true;
           if (offline) offline.hidden = false;
           if (statusText) {{
             statusText.textContent = message;
             statusText.dataset.state = "error";
           }}
         }};
+        if (frameHost) {{
+          if (offline) offline.hidden = true;
+          if (statusText) {{
+            statusText.textContent = "Native DimOS Rerun viewer embedded.";
+            statusText.dataset.state = "ok";
+          }}
+        }} else {{
         const moduleUrl = mapViewer.getAttribute("data-rerun-module-url");
         if (moduleUrl) {{
           import(moduleUrl).then((module) => {{
@@ -764,6 +777,7 @@ def render_dashboard_html(
           }});
         }} else {{
           showFallback("Rerun WebViewer module is not configured.");
+        }}
         }}
       }}
       if (!controls || !status) return;
@@ -1098,14 +1112,27 @@ def map_viewer_panel(
     web_viewer_module_url = escape(urls["web_viewer_module"], quote=True)
     web_viewer_asset_base_url = escape(urls["web_viewer_asset_base"], quote=True)
     command_center_url = escape(urls["command_center"], quote=True)
+    rerun_view_mode = escape(urls["rerun_view_mode"], quote=True)
+    rerun_embed_url = escape(urls["rerun_embed"], quote=True)
+    rerun_mode_label = (
+        "DimOS native 3D Rerun" if urls["rerun_view_mode"] == "native-3d" else "DogOps fallback Rerun"
+    )
+    rerun_surface = (
+        f'<iframe class="rerun-frame" data-rerun-frame src="{rerun_embed_url}" '
+        'title="DimOS Rerun viewer"></iframe>'
+        if rerun_embed_url
+        else '<div class="rerun-canvas" data-rerun-canvas></div>'
+    )
     return (
         "<div>"
         '<div class="map-viewer" data-map-viewer '
         f'data-rerun-source-url="{rerun_source_url}" '
+        f'data-rerun-view-mode="{rerun_view_mode}" '
+        f'data-rerun-embed-url="{rerun_embed_url}" '
         f'data-rerun-module-url="{web_viewer_module_url}" '
         f'data-rerun-asset-base-url="{web_viewer_asset_base_url}">'
         '<div class="map-toolbar">'
-        '<div class="viewer-chip"><span>Rerun WebViewer</span></div>'
+        f'<div class="viewer-chip"><span>{escape(rerun_mode_label)}</span></div>'
         '<div class="viewer-links">'
         f'<a href="{command_center_url}" target="_blank" rel="noreferrer">Open Command Center</a>'
         "</div>"
@@ -1157,8 +1184,8 @@ def map_viewer_panel(
         "</div>"
         "</details>"
         "</div>"
-        '<div class="rerun-canvas" data-rerun-canvas></div>'
-        f'<div class="map-target-overlay" data-route-map>{map_target_overlay(site_map, route_plan)}</div>'
+        + rerun_surface
+        + f'<div class="map-target-overlay" data-route-map>{map_target_overlay(site_map, route_plan)}</div>'
         '<div class="viewer-offline" data-viewer-offline hidden>'
         f'<div class="map-viz">{map_svg(site_map, route_plan)}</div>'
         "</div>"
@@ -1227,13 +1254,29 @@ def dimos_viewer_urls() -> dict[str, str]:
             os.environ.get("DOGOPS_COMMAND_CENTER_URL") or "http://127.0.0.1:7779/command-center",
             "http://127.0.0.1:7779/command-center",
         ),
+        "rerun_view_mode": _trusted_rerun_view_mode(
+            os.environ.get("DOGOPS_RERUN_VIEW_MODE") or "dogops-2d",
+        ),
+        "rerun_embed": _trusted_optional_local_viewer_url(
+            os.environ.get("DOGOPS_RERUN_EMBED_URL") or "",
+        ),
     }
+
+
+def _trusted_rerun_view_mode(raw_mode: str) -> str:
+    return raw_mode if raw_mode in {"dogops-2d", "native-3d"} else "dogops-2d"
 
 
 def _trusted_asset_url(raw_url: str, fallback: str) -> str:
     if raw_url.startswith("/"):
         return raw_url
     return _trusted_local_viewer_url(raw_url, fallback)
+
+
+def _trusted_optional_local_viewer_url(raw_url: str) -> str:
+    if not raw_url:
+        return ""
+    return _trusted_local_viewer_url(raw_url, "")
 
 
 def _trusted_rerun_source_url(raw_url: str) -> str:

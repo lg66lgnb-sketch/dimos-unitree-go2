@@ -76,7 +76,7 @@ uv run python -m dimos.experimental.dogops.cli rerun-sim --run .dogops/runs/late
 uv run python -m dimos.experimental.dogops.cli serve --run .dogops/runs/latest --port 8765
 ```
 
-`rerun-sim` needs `rerun-sdk`; use the full DimOS environment or install this repo with the optional `rerun` extra. For the real 3D mapping look, run the native Go2 Air simulator (`uv run dimos --simulation run unitree-go2`) and publish DogOps overlays with `rerun-sim --view-mode native-3d` to the same local Rerun source.
+`rerun-sim` needs `rerun-sdk`; use the full DimOS environment or install this repo with the optional `rerun` extra. For the real 3D mapping look, run the native Go2 Air simulator (`uv run dimos --simulation --viewer rerun --rerun-open none --rerun-web run unitree-go2`) and publish DogOps overlays with `rerun-sim --view-mode native-3d` to the same local Rerun source. Native 3D mode refuses to start if no DimOS Rerun source is already listening, so it cannot silently fall back to the simple DogOps map. If DimOS serves its Rerun web viewer on `http://127.0.0.1:9878`, set `DOGOPS_RERUN_EMBED_URL=http://127.0.0.1:9878` when serving the DogOps dashboard to embed that native viewer directly.
 
 ## Starter Files
 

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import pytest
 
+import dimos.experimental.dogops.rerun_sim as rerun_sim
 from dimos.experimental.dogops.mission_engine import run_offline_simulation
 from dimos.experimental.dogops.rerun_sim import (
     IMAGE_HEIGHT_PX,
     IMAGE_WIDTH_PX,
     _parse_local_rerun_source,
+    _start_rerun_stream,
     _poi_camera_image,
     build_mapping_frames,
     build_rerun_scene,
@@ -75,6 +77,8 @@ class _FakeRerun:
     def __init__(self) -> None:
         self.logs: list[tuple[str, object]] = []
         self.blueprints: list[object] = []
+        self.connected: list[str] = []
+        self.served: list[int] = []
 
     class Clear:
         def __init__(self, *args: object, **kwargs: object) -> None:
@@ -97,6 +101,16 @@ class _FakeRerun:
     def send_blueprint(self, blueprint: object) -> None:
         self.blueprints.append(blueprint)
 
+    def init(self, _name: str) -> None:
+        return
+
+    def connect_grpc(self, *, url: str) -> None:
+        self.connected.append(url)
+
+    def serve_grpc(self, *, grpc_port: int, **_kwargs: object) -> str:
+        self.served.append(grpc_port)
+        return f"rerun+http://127.0.0.1:{grpc_port}/proxy"
+
 
 def test_native_3d_mode_logs_world_overlays_without_forcing_2d_blueprint(tmp_path) -> None:
     state = run_offline_simulation(out=tmp_path / "latest")
@@ -114,3 +128,28 @@ def test_native_3d_mode_logs_world_overlays_without_forcing_2d_blueprint(tmp_pat
     assert "world/dogops/sim/objects" in paths
     assert "dogops/map/costmap" not in paths
     assert rr.blueprints == []
+
+
+def test_native_3d_stream_requires_existing_dimos_rerun_source(monkeypatch) -> None:
+    monkeypatch.setattr(rerun_sim, "_port_open", lambda _host, _port: False)
+    source_url = "rerun+http://127.0.0.1:65530/proxy"
+    rr = _FakeRerun()
+
+    with pytest.raises(RuntimeError, match="native-3d mode requires an existing DimOS Go2 Rerun stream"):
+        _start_rerun_stream(rr, source_url, require_existing=True)
+
+    assert rr.connected == []
+    assert rr.served == []
+
+
+def test_dogops_2d_stream_can_start_local_rerun_source(monkeypatch) -> None:
+    monkeypatch.setattr(rerun_sim, "_port_open", lambda _host, _port: False)
+    port = 65531
+    source_url = f"rerun+http://127.0.0.1:{port}/proxy"
+    rr = _FakeRerun()
+
+    active_url = _start_rerun_stream(rr, source_url)
+
+    assert active_url == source_url
+    assert rr.connected == []
+    assert rr.served == [port]

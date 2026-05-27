@@ -57,7 +57,7 @@ The dashboard standard map panel embeds the real Rerun WebViewer from local npm 
 - Bridge: `DogOpsLiveMapModule` consumes shared DimOS streams `global_costmap`, planner `path`, and `odom`, then writes `dimos_costmap`, `dimos_path`, robot pose, and coverage stats for the dashboard.
 - Offline artifact: `map.json` remains available as a fallback snapshot for reports/tests, but it is not the standard operator map view.
 - Simulator bridge: when the real Go2 Air is unavailable, `dogops rerun-sim` publishes incremental 2D lidar-style mapping, odom/path, route/POI overlays, demo cones/boxes, and simulated POI camera frames into the same local Rerun source URL.
-- Native 3D simulation: for real DimOS/MuJoCo-style 3D mapping visuals, run the existing DimOS Go2 Air simulator path, for example `uv run dimos --simulation run unitree-go2`, and bridge DogOps overlays with `dogops rerun-sim --view-mode native-3d`. The lightweight `dogops rerun-sim` fallback is not a replacement for the native 3D simulator.
+- Native 3D simulation: for real DimOS/MuJoCo-style 3D mapping visuals, run the existing DimOS Go2 Air simulator path, for example `uv run dimos --simulation --viewer rerun --rerun-open none --rerun-web run unitree-go2`, and bridge DogOps overlays with `dogops rerun-sim --view-mode native-3d`. Native 3D mode now requires that DimOS Rerun stream to already exist; the lightweight `dogops rerun-sim` fallback is not a replacement for the native 3D simulator.
 
 Live Go2 Air mapping should swap in real `global_costmap`/`Path`/`PoseStamped` source messages without changing the dashboard workflow contract. Route execution should send DogOps waypoints as planner goals through DimOS, wait for `goal_reached`, record `NavEvent`, then run scan/inspect/photo actions.
 
@@ -79,7 +79,7 @@ Open <http://127.0.0.1:8765/> to view the dashboard.
 
 `rerun-sim` needs `rerun-sdk`; use the full DimOS environment or install the optional DogOps `rerun` extra.
 
-For the native 3D mapping view, start `uv run dimos --simulation run unitree-go2` first and run Terminal A with `--view-mode native-3d` so DogOps does not replace the DimOS 3D Rerun blueprint.
+For the native 3D mapping view, start `uv run dimos --simulation --viewer rerun --rerun-open none --rerun-web run unitree-go2` first and run Terminal A with `--view-mode native-3d` so DogOps attaches overlays to the DimOS 3D Rerun stream instead of replacing the native simulator view. When DimOS serves its own Rerun web viewer, start the dashboard with `DOGOPS_RERUN_EMBED_URL=http://127.0.0.1:9878` to embed that native viewer page directly while keeping DogOps route/POI controls over it.
 
 API checks:
 

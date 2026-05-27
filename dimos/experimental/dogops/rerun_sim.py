@@ -13,6 +13,11 @@ from dimos.experimental.dogops.mapping import decode_dimos_costmap_full
 from dimos.experimental.dogops.store import DogOpsStore
 
 DEFAULT_RERUN_SOURCE_URL = "rerun+http://127.0.0.1:9877/proxy"
+NATIVE_3D_START_HINT = (
+    "native-3d mode requires an existing DimOS Go2 Rerun stream. Start the native "
+    "simulator first, for example from the full DimOS checkout: "
+    "uv run dimos --simulation --viewer rerun --rerun-open none --rerun-web run unitree-go2"
+)
 IMAGE_WIDTH_PX = 720
 IMAGE_HEIGHT_PX = 420
 IMAGE_PAD_PX = 34
@@ -385,7 +390,11 @@ def publish_rerun_once(
     view_mode: RerunViewMode = "dogops-2d",
 ) -> str:
     rr = _load_rerun()
-    active_url = _start_rerun_stream(rr, source_url)
+    active_url = _start_rerun_stream(
+        rr,
+        source_url,
+        require_existing=view_mode == "native-3d",
+    )
     store = DogOpsStore.load_existing(run_dir)
     assert store.state is not None
     log_state_to_rerun(rr, store.state, view_mode=view_mode)
@@ -401,8 +410,16 @@ def serve_rerun_sim(
     view_mode: RerunViewMode = "dogops-2d",
 ) -> None:
     rr = _load_rerun()
-    active_url = _start_rerun_stream(rr, source_url, server_memory_limit=server_memory_limit)
-    print(f"DogOps Rerun stream ready at {active_url}", flush=True)
+    active_url = _start_rerun_stream(
+        rr,
+        source_url,
+        server_memory_limit=server_memory_limit,
+        require_existing=view_mode == "native-3d",
+    )
+    if view_mode == "native-3d":
+        print(f"DogOps Rerun overlays attached to native DimOS stream at {active_url}", flush=True)
+    else:
+        print(f"DogOps Rerun stream ready at {active_url}", flush=True)
     last_signature: tuple[tuple[str, int], ...] | None = None
     last_command_id: str | None = None
     run_path = Path(run_dir)
@@ -535,12 +552,15 @@ def _start_rerun_stream(
     source_url: str,
     *,
     server_memory_limit: str = "1GB",
+    require_existing: bool = False,
 ) -> str:
     host, port = _parse_local_rerun_source(source_url)
     rr.init("dogops_siteops_agent")
     if _port_open(host, port):
         rr.connect_grpc(url=source_url)
         return source_url
+    if require_existing:
+        raise RuntimeError(f"{NATIVE_3D_START_HINT}. Could not connect to {source_url}.")
     served = rr.serve_grpc(
         grpc_port=port,
         server_memory_limit=server_memory_limit,

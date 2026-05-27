@@ -63,6 +63,9 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert "Route and inspection points" in content
     assert 'data-map-viewer' in content
     assert 'data-rerun-source-url="rerun+http://127.0.0.1:9877/proxy"' in content
+    assert 'data-rerun-view-mode="dogops-2d"' in content
+    assert 'data-rerun-embed-url=""' in content
+    assert "DogOps fallback Rerun" in content
     assert 'data-rerun-module-url="/assets/rerun-web-viewer.js"' in content
     assert 'data-rerun-asset-base-url="/assets/vendor/@rerun-io/web-viewer/"' in content
     assert 'data-rerun-canvas' in content
@@ -118,20 +121,26 @@ def test_dashboard_viewer_urls_default_local_and_remote_gated(monkeypatch) -> No
     monkeypatch.setenv("DOGOPS_RERUN_WEB_VIEWER_MODULE_URL", "https://cdn.example/viewer.js")
     monkeypatch.setenv("DOGOPS_RERUN_WEB_VIEWER_ASSET_BASE_URL", "https://cdn.example/assets/")
     monkeypatch.setenv("DOGOPS_COMMAND_CENTER_URL", "http://10.0.0.5:7779/command-center")
+    monkeypatch.setenv("DOGOPS_RERUN_EMBED_URL", "http://10.0.0.5:9878")
 
     assert dimos_viewer_urls() == {
         "rerun_source": "rerun+http://127.0.0.1:9877/proxy",
         "web_viewer_module": "/assets/rerun-web-viewer.js",
         "web_viewer_asset_base": "/assets/vendor/@rerun-io/web-viewer/",
         "command_center": "http://127.0.0.1:7779/command-center",
+        "rerun_view_mode": "dogops-2d",
+        "rerun_embed": "",
     }
 
     monkeypatch.setenv("DOGOPS_ALLOW_REMOTE_VIEWER", "1")
+    monkeypatch.setenv("DOGOPS_RERUN_VIEW_MODE", "native-3d")
     assert dimos_viewer_urls() == {
         "rerun_source": "rerun+http://10.0.0.5:9877/proxy",
         "web_viewer_module": "https://cdn.example/viewer.js",
         "web_viewer_asset_base": "https://cdn.example/assets/",
         "command_center": "http://10.0.0.5:7779/command-center",
+        "rerun_view_mode": "native-3d",
+        "rerun_embed": "http://10.0.0.5:9878",
     }
 
 

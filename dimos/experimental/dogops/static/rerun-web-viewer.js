@@ -47,6 +47,11 @@ async function focusMap(root, { replay = false, retries = 18 } = {}) {
   const viewer = mounted.get(root);
   if (!viewer) return false;
   configureOperatorMap(viewer);
+  const viewMode = root.dataset.rerunViewMode || "dogops-2d";
+  if (viewMode === "native-3d") {
+    setStatus(root, "Native DimOS 3D Rerun connected.", "ok");
+    return true;
+  }
   for (let attempt = 0; attempt < retries; attempt += 1) {
     if (setMapTimeline(viewer, replay)) {
       setStatus(root, replay ? "Rerun map replaying." : "Rerun WebViewer connected.", "ok");
@@ -98,6 +103,7 @@ export async function mountDogOpsRerunViewer(root) {
   const canvasHost = root.querySelector("[data-rerun-canvas]");
   const fallback = root.querySelector("[data-viewer-offline]");
   const sourceUrl = root.dataset.rerunSourceUrl;
+  const viewMode = root.dataset.rerunViewMode || "dogops-2d";
   const assetBaseUrl = new URL(
     root.dataset.rerunAssetBaseUrl || "/assets/vendor/@rerun-io/web-viewer/",
     window.location.href,
@@ -111,6 +117,9 @@ export async function mountDogOpsRerunViewer(root) {
   canvasHost.hidden = false;
   if (fallback) fallback.hidden = true;
   setStatus(root, "Connecting to Rerun...", "");
+  if (viewMode === "native-3d") {
+    setStatus(root, "Connecting to native DimOS 3D Rerun...", "");
+  }
 
   const probeUrl = sourceProbeUrl(sourceUrl);
   if (!(await canReachLocalSource(probeUrl))) {
@@ -122,7 +131,13 @@ export async function mountDogOpsRerunViewer(root) {
   mounted.set(root, viewer);
   viewer.once("ready", () => {
     configureOperatorMap(viewer);
-    setStatus(root, "Rerun WebViewer connected.", "ok");
+    setStatus(
+      root,
+      viewMode === "native-3d"
+        ? "Native DimOS 3D Rerun connected."
+        : "Rerun WebViewer connected.",
+      "ok",
+    );
     const replay = window.sessionStorage.getItem("dogops:rerun-replay");
     if (replay) {
       window.sessionStorage.removeItem("dogops:rerun-replay");
