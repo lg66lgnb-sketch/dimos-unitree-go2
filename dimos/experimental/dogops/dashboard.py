@@ -51,6 +51,7 @@ from dimos.experimental.dogops.map_authoring import (
     publish_no_go_constraints,
     validation_error_message,
 )
+from dimos.experimental.dogops.route_executor import load_route_execution, request_route_stop
 from dimos.experimental.dogops.store import DogOpsStore
 
 try:  # pragma: no cover - exercised only inside a full DimOS checkout.
@@ -69,6 +70,7 @@ MAX_LINEAR_SPEED = 0.65
 MAX_ANGULAR_SPEED = 1.10
 ROBOT_CALL_TIMEOUT_S = 8.0
 DIMOS_MCP_CALL_TIMEOUT_S = 12.0
+DIMOS_ROUTE_CALL_TIMEOUT_S = 180.0
 WEBRTC_COMMAND_TIMEOUT_S = 2.0
 HARD_STOP_REPEATS = 6
 HARD_STOP_INTERVAL_S = 0.05
@@ -213,6 +215,9 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/map/authoring":
             state = self._read_json(self.run_dir / "state.json")
             self._send_json(self._load_authoring(state).model_dump(mode="json"))
+        elif path == "/api/map/routes/status":
+            if self._authorize_map_authoring_write():
+                self._route_execution_status()
         elif path == "/api/robot/pose":
             if self._authorize_local_read():
                 self._send_json(_robot_pose_snapshot(self.robot_ip))
@@ -259,6 +264,12 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/map/routes":
             if self._authorize_map_authoring_write():
                 self._upsert_map_route()
+        elif path == "/api/map/routes/follow":
+            if self._authorize_map_authoring_write():
+                self._follow_map_route()
+        elif path == "/api/map/routes/stop":
+            if self._authorize_map_authoring_write():
+                self._stop_map_route()
         elif path.startswith("/api/map/incidents/") and path.endswith("/location"):
             if self._authorize_map_authoring_write():
                 parts = path.split("/")
@@ -480,6 +491,136 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
             self._handle_authoring_error(exc)
             return
         self._send_authoring(authoring)
+
+    def _follow_map_route(self) -> None:
+        payload = self._read_body_json()
+        route_id = payload.get("route_id")
+        route_id_arg = str(route_id).strip() if route_id is not None else None
+        dry_run = bool(payload.get("dry_run", False))
+        try:
+            result = _run_robot_call(
+                lambda: _run_robot_follow_route(route_id_arg, dry_run),
+                timeout_s=DIMOS_ROUTE_CALL_TIMEOUT_S,
+            )
+        except ModuleNotFoundError as exc:
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": "dimos_mcp_unavailable",
+                    "message": str(exc),
+                    **self._route_execution_payload(),
+                },
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            return
+        except TimeoutError as exc:
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": "follow_route_timeout",
+                    "message": str(exc),
+                    **self._route_execution_payload(),
+                },
+                HTTPStatus.GATEWAY_TIMEOUT,
+            )
+            return
+        except Exception as exc:
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": "follow_route_failed",
+                    "message": str(exc),
+                    **self._route_execution_payload(),
+                },
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            return
+
+        route_execution = _mcp_route_execution(result)
+        self._send_json(
+            {
+                "ok": True,
+                "command": "follow_route",
+                **(result or {}),
+                **self._route_execution_payload(route_execution=route_execution),
+            }
+        )
+
+    def _stop_map_route(self) -> None:
+        request_route_stop(self.run_dir)
+        hard_stop: dict[str, Any] = {"attempted": True, "ok": False}
+        try:
+            hard_stop_result = _run_robot_call(lambda: _run_route_hard_stop(self.robot_ip))
+        except Exception as exc:
+            hard_stop["error"] = str(exc)
+        else:
+            hard_stop.update({"ok": True, **(hard_stop_result or {})})
+        try:
+            result = _run_robot_call(_run_robot_stop_route)
+        except ModuleNotFoundError as exc:
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": "dimos_mcp_unavailable",
+                    "message": str(exc),
+                    "hard_stop": hard_stop,
+                    **self._route_execution_payload(),
+                },
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            return
+        except TimeoutError as exc:
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": "stop_route_timeout",
+                    "message": str(exc),
+                    "hard_stop": hard_stop,
+                    **self._route_execution_payload(),
+                },
+                HTTPStatus.GATEWAY_TIMEOUT,
+            )
+            return
+        except Exception as exc:
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": "stop_route_failed",
+                    "message": str(exc),
+                    "hard_stop": hard_stop,
+                    **self._route_execution_payload(),
+                },
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            return
+
+        route_execution = _mcp_route_execution(result)
+        self._send_json(
+            {
+                "ok": True,
+                "command": "stop_route",
+                "hard_stop": hard_stop,
+                **(result or {}),
+                **self._route_execution_payload(route_execution=route_execution),
+            }
+        )
+
+    def _route_execution_status(self) -> None:
+        self._send_json({"ok": True, **self._route_execution_payload()})
+
+    def _route_execution_payload(
+        self,
+        *,
+        route_execution: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        state = self._read_json(self.run_dir / "state.json")
+        authoring = self._load_authoring(state)
+        return {
+            "route_execution": route_execution
+            or load_route_execution(self.run_dir).model_dump(mode="json"),
+            "authoring": authoring.model_dump(mode="json"),
+            "live": _LIVE_MAP_ADAPTER.snapshot(),
+        }
 
     def _upsert_incident_location(self, incident_id: str) -> None:
         payload = self._read_body_json()
@@ -831,7 +972,7 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         return json.loads(raw.decode("utf-8"))
 
 
-def _run_robot_call(fn: Any) -> Any:
+def _run_robot_call(fn: Any, *, timeout_s: float = ROBOT_CALL_TIMEOUT_S) -> Any:
     result: dict[str, Any] = {}
 
     def target() -> None:
@@ -842,9 +983,9 @@ def _run_robot_call(fn: Any) -> Any:
 
     thread = threading.Thread(target=target, daemon=True)
     thread.start()
-    thread.join(timeout=ROBOT_CALL_TIMEOUT_S)
+    thread.join(timeout=timeout_s)
     if thread.is_alive():
-        raise TimeoutError(f"robot command exceeded {ROBOT_CALL_TIMEOUT_S:.1f}s")
+        raise TimeoutError(f"robot command exceeded {timeout_s:.1f}s")
     if "error" in result:
         raise result["error"]
     return result.get("value")
@@ -1032,7 +1173,42 @@ def _run_robot_go_to(x: float, y: float) -> dict[str, Any]:
     return _call_dimos_mcp_skill("go_to", {"x": x, "y": y})
 
 
-def _call_dimos_mcp_skill(skill_name: str, args: dict[str, Any]) -> dict[str, Any]:
+def _run_route_hard_stop(robot_ip: str) -> dict[str, Any]:
+    return _publish_robot_hard_stop(robot_ip)
+
+
+def _run_robot_follow_route(route_id: str | None, dry_run: bool) -> dict[str, Any]:
+    args: dict[str, Any] = {"dry_run": dry_run}
+    if route_id:
+        args["route_id"] = route_id
+    return _call_dimos_mcp_skill("follow_route", args, timeout_s=DIMOS_ROUTE_CALL_TIMEOUT_S)
+
+
+def _run_robot_stop_route() -> dict[str, Any]:
+    return _call_dimos_mcp_skill("stop_route", {})
+
+
+def _run_robot_route_status() -> dict[str, Any]:
+    return _call_dimos_mcp_skill("route_status", {})
+
+
+def _mcp_route_execution(result: Any) -> dict[str, Any] | None:
+    if not isinstance(result, dict):
+        return None
+    mcp_result = result.get("mcp_result")
+    if isinstance(mcp_result, dict) and isinstance(mcp_result.get("route_execution"), dict):
+        return mcp_result["route_execution"]
+    if isinstance(result.get("route_execution"), dict):
+        return result["route_execution"]
+    return None
+
+
+def _call_dimos_mcp_skill(
+    skill_name: str,
+    args: dict[str, Any],
+    *,
+    timeout_s: float = DIMOS_MCP_CALL_TIMEOUT_S,
+) -> dict[str, Any]:
     command = _dimos_mcp_call_command(skill_name, args)
     try:
         result = subprocess.run(
@@ -1042,7 +1218,7 @@ def _call_dimos_mcp_skill(skill_name: str, args: dict[str, Any]) -> dict[str, An
             capture_output=True,
             check=False,
             text=True,
-            timeout=DIMOS_MCP_CALL_TIMEOUT_S,
+            timeout=timeout_s,
         )
     except FileNotFoundError as exc:
         raise ModuleNotFoundError(
@@ -1050,7 +1226,7 @@ def _call_dimos_mcp_skill(skill_name: str, args: dict[str, Any]) -> dict[str, An
         ) from exc
     except subprocess.TimeoutExpired as exc:
         raise TimeoutError(
-            f"dimos mcp call {skill_name} timed out after {DIMOS_MCP_CALL_TIMEOUT_S:.1f}s"
+            f"dimos mcp call {skill_name} timed out after {timeout_s:.1f}s"
         ) from exc
 
     stdout = result.stdout.strip()
