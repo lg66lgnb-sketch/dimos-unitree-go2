@@ -18,6 +18,7 @@ LIVE_TOPICS = {
     "goal_request": "/goal_request",
     "clicked_point": "/clicked_point",
 }
+LIVE_TOPIC_MAX_AGE_S = 5.0
 
 
 class DogOpsLiveMapAdapter:
@@ -34,14 +35,20 @@ class DogOpsLiveMapAdapter:
     def snapshot(self) -> dict[str, Any]:
         self.start()
         with self._lock:
-            latest = dict(self._latest)
+            recorded = dict(self._latest)
             error = self._error
         now = time.time()
+        latest = {
+            name: item
+            for name, item in recorded.items()
+            if now - item[0] <= LIVE_TOPIC_MAX_AGE_S
+        }
         topics = {
             name: {
                 "topic": topic,
                 "received": name in latest,
-                "age_s": round(now - latest[name][0], 3) if name in latest else None,
+                "age_s": round(now - recorded[name][0], 3) if name in recorded else None,
+                "stale": name in recorded and name not in latest,
             }
             for name, topic in LIVE_TOPICS.items()
         }

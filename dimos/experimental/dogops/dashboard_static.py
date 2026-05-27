@@ -1168,11 +1168,13 @@ def render_dashboard_html(
       let dimosRobotPoseActive = false;
       let goToArmed = false;
       let liveMapBounds = null;
+      let liveOverlayBounds = null;
       try {{
         liveMapBounds = liveMapSvg ? JSON.parse(liveMapSvg.dataset.mapBounds || "{{}}") : null;
       }} catch (_) {{
         liveMapBounds = null;
       }}
+      liveOverlayBounds = liveMapBounds;
       const liveMapSize = {{width: {MAP_WIDTH}, height: {MAP_HEIGHT}}};
       const motionLabels = {{
         nudge: "Nudge",
@@ -1220,16 +1222,19 @@ def render_dashboard_html(
         if (rerunStandby) rerunStandby.hidden = true;
         setRerunStatus("Rerun visualization connected");
       }};
-      const projectLivePose = (pose) => {{
-        if (!liveMapBounds || !pose) return null;
-        const spanX = Math.max(0.1, liveMapBounds.x_max - liveMapBounds.x_min);
-        const spanY = Math.max(0.1, liveMapBounds.y_max - liveMapBounds.y_min);
+      const projectPoseWithBounds = (pose, bounds) => {{
+        if (!bounds || !pose) return null;
+        const spanX = Math.max(0.1, bounds.x_max - bounds.x_min);
+        const spanY = Math.max(0.1, bounds.y_max - bounds.y_min);
         return {{
-          x: ((pose.x - liveMapBounds.x_min) / spanX) * liveMapSize.width,
-          y: liveMapSize.height - (((pose.y - liveMapBounds.y_min) / spanY) * liveMapSize.height),
+          x: ((pose.x - bounds.x_min) / spanX) * liveMapSize.width,
+          y: liveMapSize.height - (((pose.y - bounds.y_min) / spanY) * liveMapSize.height),
         }};
       }};
+      const projectLivePose = (pose) => projectPoseWithBounds(pose, liveMapBounds);
+      const projectLiveOverlayPose = (pose) => projectPoseWithBounds(pose, liveOverlayBounds);
       const projectWorldPoint = (x, y) => projectLivePose({{x, y}});
+      const projectLiveOverlayPoint = (x, y) => projectLiveOverlayPose({{x, y}});
       const worldFromSvgEvent = (event) => {{
         if (!liveMapSvg || !liveMapBounds) return null;
         const matrix = liveMapSvg.getScreenCTM();
@@ -1282,8 +1287,8 @@ def render_dashboard_html(
         for (const cell of cells) {{
           const cost = Math.max(0, Math.min(1, Number(cell.cost || 0)));
           if (cost < 0.12) continue;
-          const p1 = projectWorldPoint(Number(cell.x), Number(cell.y));
-          const p2 = projectWorldPoint(Number(cell.x) + Number(cell.width || 0), Number(cell.y) + Number(cell.height || 0));
+          const p1 = projectLiveOverlayPoint(Number(cell.x), Number(cell.y));
+          const p2 = projectLiveOverlayPoint(Number(cell.x) + Number(cell.width || 0), Number(cell.y) + Number(cell.height || 0));
           if (!p1 || !p2) continue;
           const rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
           rect.setAttribute("class", "map-live-cost-cell");
@@ -1302,7 +1307,7 @@ def render_dashboard_html(
         if (!livePath) return 0;
         const points = Array.isArray(path) ? path : [];
         const projected = points
-          .map((point) => projectWorldPoint(point.x, point.y))
+          .map((point) => projectLiveOverlayPoint(point.x, point.y))
           .filter(Boolean)
           .map((point) => `${{point.x.toFixed(1)}},${{point.y.toFixed(1)}}`);
         livePath.setAttribute("points", projected.join(" "));
@@ -1310,7 +1315,7 @@ def render_dashboard_html(
       }};
       const renderDimOSTarget = (target) => {{
         if (!liveTarget) return;
-        const projected = target ? projectWorldPoint(target.x, target.y) : null;
+        const projected = target ? projectLiveOverlayPoint(target.x, target.y) : null;
         if (!projected) {{
           liveTarget.style.display = "none";
           return;
@@ -1324,7 +1329,7 @@ def render_dashboard_html(
       const updateDimOSMapLayers = (data) => {{
         const live = data && data.live ? data.live : null;
         if (!live) return;
-        if (data.bounds) liveMapBounds = data.bounds;
+        if (data.bounds) liveOverlayBounds = data.bounds;
         const heatmapCells = renderLiveHeatmap(live.costmap);
         const pathPoints = renderDimOSPath(live.path || live.route || []);
         renderDimOSTarget(live.target);
@@ -1333,7 +1338,10 @@ def render_dashboard_html(
           const yawRad = Number.isFinite(live.robot_pose.theta_deg)
             ? live.robot_pose.theta_deg * Math.PI / 180
             : 0;
-          updateLiveMap({{ok: true, pose: {{x: live.robot_pose.x, y: live.robot_pose.y, yaw_rad: yawRad}}, trajectory: [], ts: Date.now() / 1000}});
+          updateLiveMap(
+            {{ok: true, pose: {{x: live.robot_pose.x, y: live.robot_pose.y, yaw_rad: yawRad}}, trajectory: [], ts: Date.now() / 1000}},
+            liveOverlayBounds
+          );
         }}
         if (liveMapStatus) {{
           if (live.ok) {{
@@ -1343,7 +1351,7 @@ def render_dashboard_html(
           }}
         }}
       }};
-      const updateLiveMap = (data) => {{
+      const updateLiveMap = (data, bounds = liveMapBounds) => {{
         if (!liveMapSvg || !liveTrace || !liveRobot || !liveMapStatus) return;
         if (!data || !data.ok || !data.pose) {{
           if (dimosRobotPoseActive) return;
@@ -1353,11 +1361,11 @@ def render_dashboard_html(
         }}
         const trajectory = Array.isArray(data.trajectory) ? data.trajectory : [];
         const points = trajectory
-          .map((pose) => projectLivePose(pose))
+          .map((pose) => projectPoseWithBounds(pose, bounds))
           .filter(Boolean)
           .map((point) => `${{point.x.toFixed(1)}},${{point.y.toFixed(1)}}`);
         liveTrace.setAttribute("points", points.join(" "));
-        const projected = projectLivePose(data.pose);
+        const projected = projectPoseWithBounds(data.pose, bounds);
         if (!projected) {{
           if (!dimosRobotPoseActive) setLiveMapUnavailable("Live odom: map projection unavailable");
           return;

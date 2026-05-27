@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import sys
 import threading
+import time
 from typing import Any
 import urllib.request
 
@@ -21,6 +22,7 @@ from dimos.experimental.dogops.dashboard_static import (
 )
 from dimos.experimental.dogops.live_map import (
     DogOpsLiveMapAdapter,
+    LIVE_TOPIC_MAX_AGE_S,
     _extend_dimos_package_path,
     _grid_to_costmap,
 )
@@ -143,7 +145,10 @@ def test_dashboard_map_layer_controls_match_svg_layers(tmp_path) -> None:
     assert 'item.toggleAttribute("hidden", !pressed)' in content
     assert "let dimosRobotPoseActive = false" in content
     assert "if (dimosRobotPoseActive) return" in content
-    assert "if (data.bounds) liveMapBounds = data.bounds" in content
+    assert "let liveOverlayBounds = null" in content
+    assert "if (data.bounds) liveOverlayBounds = data.bounds" in content
+    assert "const projectWorldPoint = (x, y) => projectLivePose({x, y})" in content
+    assert "const projectLiveOverlayPoint = (x, y) => projectLiveOverlayPose({x, y})" in content
 
 
 def test_dashboard_rerun_web_url_stays_loopback_only() -> None:
@@ -395,6 +400,24 @@ def test_live_map_adapter_snapshot_reports_waiting_without_topics() -> None:
     assert snapshot["status"] == "waiting_for_topics"
     assert snapshot["costmap"] is None
     assert snapshot["path"] == []
+    assert snapshot["robot_pose"] is None
+
+
+def test_live_map_adapter_snapshot_expires_stale_topics() -> None:
+    class Pose:
+        x = 1.0
+        y = 2.0
+        yaw = 0.0
+
+    adapter = DogOpsLiveMapAdapter()
+    adapter._started = True
+    adapter._latest["odom"] = (time.time() - LIVE_TOPIC_MAX_AGE_S - 1.0, Pose())
+
+    snapshot = adapter.snapshot()
+
+    assert snapshot["ok"] is False
+    assert snapshot["topics"]["odom"]["received"] is False
+    assert snapshot["topics"]["odom"]["stale"] is True
     assert snapshot["robot_pose"] is None
 
 
