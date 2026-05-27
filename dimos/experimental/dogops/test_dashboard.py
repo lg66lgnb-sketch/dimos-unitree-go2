@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import threading
 from typing import Any
 import urllib.request
@@ -15,6 +16,7 @@ from dimos.experimental.dogops.dashboard_static import (
     build_route_data,
     write_dashboard_html,
 )
+from dimos.experimental.dogops.live_map import _extend_dimos_package_path
 from dimos.experimental.dogops.mission_engine import run_offline_simulation
 
 
@@ -260,6 +262,15 @@ def test_dashboard_map_data_includes_dimos_live_layers(tmp_path, monkeypatch) ->
     assert map_data["live"]["target"]["source"] == "target"  # type: ignore[index]
     assert map_data["layers"]["heatmap"] is True  # type: ignore[index]
     assert map_data["layers"]["path"] is True  # type: ignore[index]
+
+
+def test_live_map_adapter_does_not_assume_local_dimos_checkout(monkeypatch) -> None:
+    before = list(sys.path)
+    monkeypatch.delenv("DIMOS_ROOT", raising=False)
+
+    _extend_dimos_package_path()
+
+    assert sys.path == before
 
 
 def test_dashboard_route_and_poi_data_project_evidence(tmp_path) -> None:

@@ -9,7 +9,6 @@ import time
 from typing import Any
 
 
-DEFAULT_DIMOS_ROOT = "/Users/chris/Documents/Workspace/dimos"
 LIVE_TOPICS = {
     "global_costmap": "/global_costmap",
     "navigation_costmap": "/navigation_costmap",
@@ -137,7 +136,10 @@ def _import_dimos_topic_types() -> tuple[Any, Any, Any, Any]:
 
 
 def _extend_dimos_package_path() -> None:
-    dimos_root = Path(os.environ.get("DIMOS_ROOT", DEFAULT_DIMOS_ROOT)).expanduser()
+    root = os.environ.get("DIMOS_ROOT")
+    if not root:
+        return
+    dimos_root = Path(root).expanduser()
     package_root = dimos_root / "dimos"
     if not package_root.exists():
         return
