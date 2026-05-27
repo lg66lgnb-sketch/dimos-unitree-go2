@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from html import escape
 import json
 import math
+import os
+from html import escape
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 
 MAP_WIDTH = 920
@@ -307,8 +309,8 @@ def render_site_map(state: dict[str, Any], report: dict[str, Any]) -> str:
         return '<div class="map-empty">Map data unavailable</div>'
 
     bounds = map_data["bounds"]
+    bounds_attr = escape(json.dumps(bounds, separators=(",", ":")), quote=True)
     projector = _MapProjector(bounds)
-    route_positions = [(float(point["x"]), float(point["y"])) for point in map_data["route"]]
     route_points = " ".join(
         f"{projector.x(point['x']):.1f},{projector.y(point['y']):.1f}"
         for point in map_data["route"]
@@ -332,12 +334,15 @@ def render_site_map(state: dict[str, Any], report: dict[str, Any]) -> str:
             f'<polyline class="map-route" points="{route_points}" />'
             + "".join(_render_route_stop(projector, stop, index) for index, stop in enumerate(map_data["route"], 1))
         )
-    robot = _render_robot_pose(projector, route_positions[-1]) if route_positions else ""
+    robot = _render_live_robot_pose()
     scan_items = "".join(_render_scan_item(observation) for observation in map_data["observations"])
+    rerun_web_url = _trusted_rerun_web_url(os.environ.get("DOGOPS_RERUN_WEB_URL"))
+    rerun_web_url_attr = escape(rerun_web_url, quote=True)
     legend = (
         '<div class="map-legend">'
         '<span><i class="legend-free"></i>free grid</span>'
         '<span><i class="legend-route"></i>trajectory</span>'
+        '<span><i class="legend-live"></i>live odom</span>'
         '<span><i class="legend-tag"></i>tag return</span>'
         '<span><i class="legend-no-go"></i>no-go cost</span>'
         '<span><i class="legend-incident"></i>P1/P2 event</span>'
@@ -345,7 +350,9 @@ def render_site_map(state: dict[str, Any], report: dict[str, Any]) -> str:
     )
     return f"""
       <div class="map-shell" data-map-surface>
+        {_render_rerun_surface(rerun_web_url)}
         <svg class="site-map" role="img" aria-label="DogOps mission map"
+          data-live-map-svg data-map-bounds="{bounds_attr}"
           viewBox="0 0 {MAP_WIDTH} {MAP_HEIGHT}">
           <defs>
             <filter id="dogops-map-glow" x="-50%" y="-50%" width="200%" height="200%">
@@ -373,6 +380,11 @@ def render_site_map(state: dict[str, Any], report: dict[str, Any]) -> str:
           {incidents}
         </svg>
         {legend}
+        <div class="map-workflow">
+          <a href="{rerun_web_url_attr}" target="_blank" rel="noreferrer" data-rerun-web-link>Open Rerun Web</a>
+          <span class="map-command-status" data-map-command-status>Map command idle</span>
+        </div>
+        <div class="map-live-status" data-live-map-status>Live odom: waiting for Go2</div>
         <ol class="scan-strip">{scan_items}</ol>
       </div>
     """
@@ -505,6 +517,71 @@ def render_dashboard_html(
     }}
     .map-panel h2 {{ color: #eef2f8; }}
     .map-shell {{ display: grid; gap: 10px; }}
+    .rerun-surface {{
+      background: #03060b;
+      border: 1px solid #1d2430;
+      border-radius: 8px;
+      display: grid;
+      min-height: 220px;
+      overflow: hidden;
+      position: relative;
+    }}
+    .rerun-surface iframe {{
+      background: #03060b;
+      border: 0;
+      display: block;
+      height: 100%;
+      min-height: 220px;
+      width: 100%;
+    }}
+    .rerun-standby {{
+      align-items: center;
+      background:
+        linear-gradient(135deg, rgba(82, 224, 196, 0.12), rgba(125, 211, 252, 0.08)),
+        repeating-linear-gradient(90deg, rgba(148, 163, 184, 0.08) 0 1px, transparent 1px 34px),
+        repeating-linear-gradient(0deg, rgba(148, 163, 184, 0.08) 0 1px, transparent 1px 34px),
+        #05070c;
+      display: grid;
+      gap: 10px;
+      inset: 0;
+      justify-items: center;
+      padding: 18px;
+      position: absolute;
+      text-align: center;
+      z-index: 1;
+    }}
+    .rerun-standby[hidden] {{ display: none; }}
+    .rerun-chip {{
+      border: 1px solid #2d3a4f;
+      border-radius: 999px;
+      color: #d8fff6;
+      font-size: 12px;
+      font-weight: 700;
+      padding: 5px 10px;
+    }}
+    .rerun-status {{
+      color: #a9b4c4;
+      font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace;
+      min-height: 16px;
+    }}
+    .rerun-controls {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      justify-content: center;
+    }}
+    .rerun-controls button, .rerun-controls a {{
+      border: 1px solid #334155;
+      border-radius: 6px;
+      background: #0d1119;
+      color: #e5edf5;
+      cursor: pointer;
+      font: inherit;
+      min-height: 34px;
+      padding: 6px 10px;
+      text-decoration: none;
+    }}
+    .rerun-controls button:hover, .rerun-controls a:hover {{ border-color: #52e0c4; }}
     .site-map {{
       aspect-ratio: 23 / 14;
       background: #03060b;
@@ -591,7 +668,20 @@ def render_dashboard_html(
     }}
     .map-robot {{ fill: rgba(82, 224, 196, 0.12); stroke: #52e0c4; stroke-width: 1.5; }}
     .map-robot-core {{ fill: #52e0c4; stroke: #d8fff6; stroke-width: 1.2; }}
+    .map-live-trace {{
+      fill: none;
+      filter: url(#dogops-map-glow);
+      stroke: #facc15;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      stroke-width: 3.5;
+    }}
+    .map-live-robot-halo {{ fill: rgba(250, 204, 21, 0.16); stroke: #facc15; stroke-width: 1.5; }}
+    .map-live-robot-core {{ fill: #facc15; stroke: #fff7cc; stroke-width: 1.2; }}
+    .map-go-to-ring {{ fill: rgba(248, 113, 113, 0.14); stroke: #f87171; stroke-width: 2; }}
+    .map-go-to-cross {{ stroke: #fecaca; stroke-linecap: round; stroke-width: 2; }}
     .map-axis-label {{ fill: #657184; font-size: 10px; }}
+    .site-map.go-to-armed {{ cursor: crosshair; }}
     .map-legend {{
       color: #a9b4c4;
       display: flex;
@@ -608,9 +698,35 @@ def render_dashboard_html(
     }}
     .legend-free {{ background: #484981; }}
     .legend-route {{ background: #52e0c4; }}
+    .legend-live {{ background: #facc15; }}
     .legend-tag {{ background: #a78bfa; }}
     .legend-no-go {{ background: #ef4444; }}
     .legend-incident {{ background: #fb7185; }}
+    .map-workflow {{
+      align-items: center;
+      color: #a9b4c4;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      font-size: 12px;
+    }}
+    .map-workflow a {{
+      color: #bfdbfe;
+      font-weight: 700;
+      text-decoration: none;
+    }}
+    .map-workflow a:hover {{ text-decoration: underline; }}
+    .map-command-status {{
+      color: #fecaca;
+      font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace;
+    }}
+    .map-command-status.ok {{ color: #86efac; }}
+    .map-command-status.error {{ color: #fca5a5; }}
+    .map-live-status {{
+      color: #f7d75d;
+      font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace;
+      min-height: 18px;
+    }}
     .scan-strip {{
       color: #b8c4d4;
       display: grid;
@@ -674,6 +790,12 @@ def render_dashboard_html(
       gap: 8px;
       margin-bottom: 8px;
     }}
+    .map-controls {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 8px;
+    }}
     .posture-controls button {{
       border: 1px solid var(--line);
       border-radius: 6px;
@@ -684,8 +806,26 @@ def render_dashboard_html(
       min-height: 34px;
       padding: 6px 10px;
     }}
+    .map-controls button {{
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #f8fafc;
+      color: var(--ink);
+      cursor: pointer;
+      font: inherit;
+      min-height: 34px;
+      padding: 6px 10px;
+    }}
     .posture-controls button:hover {{ border-color: var(--accent); }}
+    .map-controls button:hover {{ border-color: var(--accent); }}
+    .map-controls button[aria-pressed="true"] {{
+      background: #fef2f2;
+      border-color: var(--danger);
+      color: var(--danger);
+      font-weight: 700;
+    }}
     .posture-controls button:disabled {{ cursor: wait; opacity: 0.65; }}
+    .map-controls button:disabled {{ cursor: wait; opacity: 0.65; }}
     .motion-controls {{
       display: flex;
       flex-wrap: wrap;
@@ -788,6 +928,11 @@ def render_dashboard_html(
           <button type="button" data-posture="balance">Balance</button>
           <button type="button" data-posture="sleep">Sleep</button>
         </div>
+        <div class="map-controls" data-map-controls>
+          <button type="button" data-map-action="start">Start Live Map</button>
+          <button type="button" data-map-action="origin">Set Map Origin</button>
+          <button type="button" data-map-action="arm_go_to" aria-pressed="false">Arm Go To</button>
+        </div>
         <div class="motion-controls" data-motion-controls>
           <button type="button" data-motion="nudge" aria-pressed="true">Nudge</button>
           <button type="button" data-motion="step" aria-pressed="false">Step</button>
@@ -800,15 +945,17 @@ def render_dashboard_html(
           <button type="button" data-command="left" data-key-hint="A / Left">Left</button>
           <button type="button" class="hard-stop" data-command="hard_stop" data-key-hint="Space / Esc">HARD STOP</button>
           <button type="button" data-command="right" data-key-hint="D / Right">Right</button>
-          <button type="button" data-command="yaw_left">Yaw L</button>
+          <button type="button" data-command="yaw_left" data-key-hint="Q">Yaw L</button>
           <button type="button" data-command="backward" data-key-hint="S / Down">Back</button>
-          <button type="button" data-command="yaw_right">Yaw R</button>
+          <button type="button" data-command="yaw_right" data-key-hint="E">Yaw R</button>
         </div>
         <div class="keyboard-map" data-keyboard-map aria-label="Keyboard controls">
           <span><kbd>W</kbd><kbd>Up</kbd>Forward</span>
           <span><kbd>S</kbd><kbd>Down</kbd>Back</span>
           <span><kbd>A</kbd><kbd>Left</kbd>Left</span>
           <span><kbd>D</kbd><kbd>Right</kbd>Right</span>
+          <span><kbd>Q</kbd>Yaw L</span>
+          <span><kbd>E</kbd>Yaw R</span>
           <span><kbd>Space</kbd><kbd>Esc</kbd>Hard stop</span>
         </div>
         <div class="robot-status" data-robot-status>Idle</div>
@@ -874,10 +1021,31 @@ def render_dashboard_html(
       const controls = document.querySelector("[data-robot-controls]");
       const postureControls = document.querySelector("[data-posture-controls]");
       const motionControls = document.querySelector("[data-motion-controls]");
+      const mapControls = document.querySelector("[data-map-controls]");
+      const rerunSurface = document.querySelector("[data-rerun-surface]");
+      const rerunConnect = document.querySelector("[data-rerun-connect]");
+      const rerunFrame = document.querySelector("[data-rerun-frame]");
+      const rerunStandby = document.querySelector("[data-rerun-standby]");
+      const rerunStatus = document.querySelector("[data-rerun-status]");
+      const liveMapSvg = document.querySelector("[data-live-map-svg]");
+      const liveMapStatus = document.querySelector("[data-live-map-status]");
+      const mapCommandStatus = document.querySelector("[data-map-command-status]");
+      const liveTrace = liveMapSvg ? liveMapSvg.querySelector("[data-live-trace]") : null;
+      const liveRobot = liveMapSvg ? liveMapSvg.querySelector("[data-live-robot]") : null;
+      const goToMarker = liveMapSvg ? liveMapSvg.querySelector("[data-go-to-marker]") : null;
       const status = document.querySelector("[data-robot-status]");
       if (!controls || !status) return;
       let motionProfile = "nudge";
       let robotBusy = false;
+      let liveMapPolling = false;
+      let goToArmed = false;
+      let liveMapBounds = null;
+      try {{
+        liveMapBounds = liveMapSvg ? JSON.parse(liveMapSvg.dataset.mapBounds || "{{}}") : null;
+      }} catch (_) {{
+        liveMapBounds = null;
+      }}
+      const liveMapSize = {{width: {MAP_WIDTH}, height: {MAP_HEIGHT}}};
       const motionLabels = {{
         nudge: "Nudge",
         step: "Step",
@@ -893,16 +1061,130 @@ def render_dashboard_html(
         ["ArrowLeft", "left"],
         ["KeyD", "right"],
         ["ArrowRight", "right"],
+        ["KeyQ", "yaw_left"],
+        ["KeyE", "yaw_right"],
         ["Space", "hard_stop"],
         ["Escape", "hard_stop"],
       ]);
-      const buttons = Array.from(document.querySelectorAll("[data-command], [data-posture], [data-motion]"));
+      const buttons = Array.from(document.querySelectorAll("[data-command], [data-posture], [data-motion], [data-map-action]"));
       const setBusy = (busy) => buttons.forEach((button) => {{
         button.disabled = busy && button.getAttribute("data-command") !== "hard_stop";
       }});
       const setStatus = (text, state) => {{
         status.textContent = text;
         status.className = `robot-status ${{state || ""}}`;
+      }};
+      const setMapCommandStatus = (text, state) => {{
+        if (!mapCommandStatus) return;
+        mapCommandStatus.textContent = text;
+        mapCommandStatus.className = `map-command-status ${{state || ""}}`;
+      }};
+      const setRerunStatus = (text) => {{
+        if (rerunStatus) rerunStatus.textContent = text;
+      }};
+      const connectRerunSurface = () => {{
+        if (!rerunSurface || !rerunFrame) return;
+        const url = rerunSurface.getAttribute("data-rerun-url") || "";
+        if (!url) return;
+        if (rerunFrame.getAttribute("src") !== url) {{
+          rerunFrame.setAttribute("src", url);
+        }}
+        if (rerunStandby) rerunStandby.hidden = true;
+        setRerunStatus("Rerun visualization connected");
+      }};
+      const projectLivePose = (pose) => {{
+        if (!liveMapBounds || !pose) return null;
+        const spanX = Math.max(0.1, liveMapBounds.x_max - liveMapBounds.x_min);
+        const spanY = Math.max(0.1, liveMapBounds.y_max - liveMapBounds.y_min);
+        return {{
+          x: ((pose.x - liveMapBounds.x_min) / spanX) * liveMapSize.width,
+          y: liveMapSize.height - (((pose.y - liveMapBounds.y_min) / spanY) * liveMapSize.height),
+        }};
+      }};
+      const projectWorldPoint = (x, y) => projectLivePose({{x, y}});
+      const worldFromSvgEvent = (event) => {{
+        if (!liveMapSvg || !liveMapBounds) return null;
+        const matrix = liveMapSvg.getScreenCTM();
+        if (!matrix) return null;
+        const point = liveMapSvg.createSVGPoint();
+        point.x = event.clientX;
+        point.y = event.clientY;
+        const svgPoint = point.matrixTransform(matrix.inverse());
+        const spanX = Math.max(0.1, liveMapBounds.x_max - liveMapBounds.x_min);
+        const spanY = Math.max(0.1, liveMapBounds.y_max - liveMapBounds.y_min);
+        return {{
+          x: liveMapBounds.x_min + (svgPoint.x / liveMapSize.width) * spanX,
+          y: liveMapBounds.y_min + ((liveMapSize.height - svgPoint.y) / liveMapSize.height) * spanY,
+        }};
+      }};
+      const setGoToArmed = (armed) => {{
+        goToArmed = armed;
+        if (liveMapSvg) liveMapSvg.classList.toggle("go-to-armed", armed);
+        if (mapControls) {{
+          const button = mapControls.querySelector('[data-map-action="arm_go_to"]');
+          if (button) button.setAttribute("aria-pressed", armed ? "true" : "false");
+        }}
+        setMapCommandStatus(armed ? "Map Go To armed" : "Map command idle", armed ? "ok" : "");
+      }};
+      const setGoToMarker = (target) => {{
+        if (!goToMarker || !target) return;
+        const projected = projectWorldPoint(target.x, target.y);
+        if (!projected) return;
+        goToMarker.style.display = "";
+        goToMarker.setAttribute(
+          "transform",
+          `translate(${{projected.x.toFixed(1)}} ${{projected.y.toFixed(1)}})`
+        );
+      }};
+      const setLiveMapUnavailable = (text) => {{
+        if (liveMapStatus) liveMapStatus.textContent = text;
+        if (liveRobot) liveRobot.style.display = "none";
+      }};
+      const updateLiveMap = (data) => {{
+        if (!liveMapSvg || !liveTrace || !liveRobot || !liveMapStatus) return;
+        if (!data || !data.ok || !data.pose) {{
+          const error = data && data.error ? data.error : "offline";
+          setLiveMapUnavailable(`Live odom: ${{error}}`);
+          return;
+        }}
+        const trajectory = Array.isArray(data.trajectory) ? data.trajectory : [];
+        const points = trajectory
+          .map((pose) => projectLivePose(pose))
+          .filter(Boolean)
+          .map((point) => `${{point.x.toFixed(1)}},${{point.y.toFixed(1)}}`);
+        liveTrace.setAttribute("points", points.join(" "));
+        const projected = projectLivePose(data.pose);
+        if (!projected) {{
+          setLiveMapUnavailable("Live odom: map projection unavailable");
+          return;
+        }}
+        const yawDeg = (data.pose.yaw_rad || 0) * 180 / Math.PI;
+        liveRobot.style.display = "";
+        liveRobot.setAttribute(
+          "transform",
+          `translate(${{projected.x.toFixed(1)}} ${{projected.y.toFixed(1)}}) rotate(${{(-yawDeg).toFixed(1)}})`
+        );
+        const ageS = Math.max(0, Date.now() / 1000 - (data.ts || 0));
+        liveMapStatus.textContent = `Live odom: x=${{data.pose.x.toFixed(2)}}m y=${{data.pose.y.toFixed(2)}}m yaw=${{yawDeg.toFixed(0)}}deg age=${{ageS.toFixed(1)}}s`;
+      }};
+      const refreshLiveMap = async () => {{
+        if (liveMapPolling || !liveMapSvg) return;
+        liveMapPolling = true;
+        const controller = new AbortController();
+        const timeout = window.setTimeout(() => controller.abort(), 1500);
+        try {{
+          const response = await fetch("/api/robot/pose", {{
+            cache: "no-store",
+            signal: controller.signal,
+          }});
+          const result = await response.json();
+          updateLiveMap(result);
+        }} catch (error) {{
+          setLiveMapUnavailable(`Live odom: ${{error.message}}`);
+        }} finally {{
+          window.clearTimeout(timeout);
+          liveMapPolling = false;
+        }}
       }};
       const shouldIgnoreKeyboardEvent = (event) => {{
         if (event.defaultPrevented || event.repeat) return true;
@@ -935,6 +1217,22 @@ def render_dashboard_html(
           {{command, profile: motionProfile, source}},
           motionTextForCommand(command)
         );
+        await refreshLiveMap();
+      }};
+      const sendGoToTarget = async (target) => {{
+        if (!target || robotBusy) return;
+        setGoToMarker(target);
+        setMapCommandStatus(`Sending Go To x=${{target.x.toFixed(2)}} y=${{target.y.toFixed(2)}}...`, "");
+        const result = await sendRobotAction(
+          "/api/robot/go_to",
+          {{command: "go_to", x: target.x, y: target.y, source: "map_click"}},
+          () => `Go To sent x=${{target.x.toFixed(2)}} y=${{target.y.toFixed(2)}}`
+        );
+        setMapCommandStatus(
+          result ? `Go To sent x=${{target.x.toFixed(2)}} y=${{target.y.toFixed(2)}}` : "Go To failed",
+          result ? "ok" : "error"
+        );
+        await refreshLiveMap();
       }};
       const sendRobotAction = async (url, body, successText) => {{
         robotBusy = true;
@@ -953,8 +1251,10 @@ def render_dashboard_html(
             throw new Error(result.error || "command_failed");
           }}
           setStatus(successText(result), "ok");
+          return result;
         }} catch (error) {{
           setStatus(`Robot command failed: ${{error.message}}`, "error");
+          return null;
         }} finally {{
           robotBusy = false;
           setBusy(false);
@@ -967,6 +1267,24 @@ def render_dashboard_html(
         button.blur();
         await sendJogCommand(command);
       }});
+      if (rerunConnect) {{
+        rerunConnect.addEventListener("click", () => {{
+          connectRerunSurface();
+        }});
+      }}
+      if (liveMapSvg) {{
+        liveMapSvg.addEventListener("click", async (event) => {{
+          if (!goToArmed) return;
+          event.preventDefault();
+          const target = worldFromSvgEvent(event);
+          setGoToArmed(false);
+          if (!target) {{
+            setMapCommandStatus("Go To target unavailable", "error");
+            return;
+          }}
+          await sendGoToTarget(target);
+        }});
+      }}
       window.addEventListener("keydown", async (event) => {{
         if (shouldIgnoreKeyboardEvent(event)) return;
         const command = keyboardCommands.get(event.code);
@@ -997,8 +1315,35 @@ def render_dashboard_html(
             {{command}},
             () => command === "wake" ? "Wake / stand complete" : `Sent ${{command}}`
           );
+          await refreshLiveMap();
         }});
       }}
+      if (mapControls) {{
+        mapControls.addEventListener("click", async (event) => {{
+          const button = event.target.closest("button[data-map-action]");
+          if (!button) return;
+          const action = button.getAttribute("data-map-action");
+          button.blur();
+          if (action === "start") {{
+            await sendRobotAction(
+              "/api/robot/map_start",
+              {{command: "map_start"}},
+              () => "Live map connected"
+            );
+          }} else if (action === "origin") {{
+            await sendRobotAction(
+              "/api/robot/map_origin",
+              {{command: "map_origin"}},
+              () => "Map origin set"
+            );
+          }} else if (action === "arm_go_to") {{
+            setGoToArmed(!goToArmed);
+          }}
+          await refreshLiveMap();
+        }});
+      }}
+      refreshLiveMap();
+      window.setInterval(refreshLiveMap, 1000);
     }})();
   </script>
 </body>
@@ -1069,6 +1414,39 @@ def _visible_tag_ids(observation: dict[str, Any]) -> list[int]:
         return [int(item) for item in raw if isinstance(item, int | str)]
     tag_id = observation.get("tag_id")
     return [int(tag_id)] if isinstance(tag_id, int) else []
+
+
+def _trusted_rerun_web_url(raw_url: str | None) -> str:
+    fallback = "http://127.0.0.1:9877"
+    if not raw_url:
+        return fallback
+    try:
+        parsed = urlparse(raw_url)
+    except ValueError:
+        return fallback
+    if parsed.scheme not in {"http", "https"}:
+        return fallback
+    host = (parsed.hostname or "").lower()
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        return fallback
+    return raw_url
+
+
+def _render_rerun_surface(rerun_web_url: str) -> str:
+    rerun_web_url_attr = escape(rerun_web_url, quote=True)
+    return (
+        f'<div class="rerun-surface" data-rerun-surface data-rerun-url="{rerun_web_url_attr}">'
+        '<iframe data-rerun-frame title="Rerun Web visualization" loading="lazy"></iframe>'
+        '<div class="rerun-standby" data-rerun-standby>'
+        '<span class="rerun-chip">Rerun Web Visualization</span>'
+        '<div class="rerun-status" data-rerun-status>Rerun visualization standby</div>'
+        '<div class="rerun-controls">'
+        '<button type="button" data-rerun-connect>Connect Rerun</button>'
+        f'<a href="{rerun_web_url_attr}" target="_blank" rel="noreferrer">Open</a>'
+        "</div>"
+        "</div>"
+        "</div>"
+    )
 
 
 def _map_bounds(points: list[tuple[float, float]]) -> dict[str, float]:
@@ -1332,15 +1710,21 @@ def _render_route_stop(projector: _MapProjector, stop: dict[str, Any], index: in
     )
 
 
-def _render_robot_pose(projector: _MapProjector, pose: tuple[float, float]) -> str:
-    x = projector.x(pose[0])
-    y = projector.y(pose[1])
+def _render_live_robot_pose() -> str:
     return (
-        "<g><title>Robot estimated pose</title>"
-        f'<circle class="map-robot" cx="{x:.1f}" cy="{y:.1f}" r="18" />'
-        f'<path class="map-robot-core" d="M {x + 14:.1f} {y:.1f} '
-        f'L {x - 9:.1f} {y - 8:.1f} L {x - 5:.1f} {y:.1f} '
-        f'L {x - 9:.1f} {y + 8:.1f} Z" />'
+        '<polyline class="map-live-trace" data-live-trace points="" />'
+        '<g data-live-robot style="display:none" transform="translate(0 0)">'
+        "<title>Live Go2 odometry pose</title>"
+        '<circle class="map-live-robot-halo" cx="0" cy="0" r="18" />'
+        '<path class="map-live-robot-core" d="M 14 0 L -9 -8 L -5 0 L -9 8 Z" />'
+        "</g>"
+        '<g data-go-to-marker style="display:none" transform="translate(0 0)">'
+        "<title>DimOS go_to target</title>"
+        '<circle class="map-go-to-ring" cx="0" cy="0" r="13" />'
+        '<line class="map-go-to-cross" x1="-17" y1="0" x2="-6" y2="0" />'
+        '<line class="map-go-to-cross" x1="6" y1="0" x2="17" y2="0" />'
+        '<line class="map-go-to-cross" x1="0" y1="-17" x2="0" y2="-6" />'
+        '<line class="map-go-to-cross" x1="0" y1="6" x2="0" y2="17" />'
         "</g>"
     )
 

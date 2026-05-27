@@ -7,7 +7,7 @@ import urllib.request
 
 import pytest
 
-from dimos.experimental.dogops import dashboard
+from dimos.experimental.dogops import dashboard, dashboard_static
 from dimos.experimental.dogops.dashboard import DogOpsDashboardModule, make_dashboard_server
 from dimos.experimental.dogops.dashboard_static import (
     build_map_data,
@@ -66,6 +66,18 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert "free grid" in content
     assert "tag return" in content
     assert "no-go cost" in content
+    assert 'data-rerun-surface' in content
+    assert 'data-rerun-connect' in content
+    assert 'data-rerun-frame' in content
+    assert 'data-rerun-url=' in content
+    assert 'data-rerun-web-link' in content
+    assert "Rerun Web Visualization" in content
+    assert "connectRerunSurface" in content
+    assert 'data-map-command-status' in content
+    assert 'data-map-action="arm_go_to"' in content
+    assert 'data-go-to-marker' in content
+    assert "/api/robot/go_to" in content
+    assert "worldFromSvgEvent" in content
     assert "map-zone no-go" not in content
     assert "OBS-003" in content
     assert "PKG-104" in content
@@ -80,10 +92,14 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert "OBS-005" in content
     assert 'data-command="forward"' in content
     assert 'data-command="hard_stop"' in content
+    assert 'data-command="yaw_left" data-key-hint="Q"' in content
+    assert 'data-command="yaw_right" data-key-hint="E"' in content
     assert 'data-key-hint="W / Up"' in content
     assert 'data-key-hint="Space / Esc"' in content
     assert 'data-keyboard-map' in content
     assert '["KeyW", "forward"]' in content
+    assert '["KeyQ", "yaw_left"]' in content
+    assert '["KeyE", "yaw_right"]' in content
     assert '["ArrowDown", "backward"]' in content
     assert '["Space", "hard_stop"]' in content
     assert '["Escape", "hard_stop"]' in content
@@ -94,6 +110,23 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert 'data-motion="step"' in content
     assert 'data-motion="walk"' in content
     assert "X-DogOps-Control-Token" in content
+
+
+def test_dashboard_rerun_web_url_stays_loopback_only() -> None:
+    fallback = "http://127.0.0.1:9877"
+
+    assert dashboard_static._trusted_rerun_web_url(None) == fallback
+    assert dashboard_static._trusted_rerun_web_url("http://127.0.0.1:9877") == fallback
+    assert (
+        dashboard_static._trusted_rerun_web_url("http://localhost:9877/?dataset=dogops")
+        == "http://localhost:9877/?dataset=dogops"
+    )
+    assert (
+        dashboard_static._trusted_rerun_web_url("https://[::1]:9877")
+        == "https://[::1]:9877"
+    )
+    assert dashboard_static._trusted_rerun_web_url("https://rerun.example.com") == fallback
+    assert dashboard_static._trusted_rerun_web_url("javascript:alert(1)") == fallback
 
 
 def test_dashboard_module_writes_dashboard_and_reports_status(tmp_path) -> None:
@@ -542,6 +575,99 @@ def test_dashboard_robot_posture_rejects_unknown_command(tmp_path, monkeypatch) 
     assert status == 400
     assert result["ok"] is False
     assert result["error"] == "unknown_posture_command"
+
+
+def test_dashboard_robot_go_to_calls_dimos_bridge(tmp_path, monkeypatch) -> None:
+    calls: list[tuple[float, float]] = []
+
+    def fake_go_to(x: float, y: float) -> dict[str, object]:
+        calls.append((x, y))
+        return {"transport": "dimos_mcp", "skill": "go_to"}
+
+    monkeypatch.setattr(dashboard, "_run_robot_go_to", fake_go_to)
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        status, result = _post_json(
+            f"{base_url}/api/robot/go_to",
+            {"command": "go_to", "x": 1.25, "y": -0.5, "source": "map_click"},
+            headers=_robot_headers(server),
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 200
+    assert result["ok"] is True
+    assert result["command"] == "go_to"
+    assert result["source"] == "map_click"
+    assert result["transport"] == "dimos_mcp"
+    assert result["skill"] == "go_to"
+    assert calls == [(1.25, -0.5)]
+
+
+def test_dashboard_robot_go_to_rejects_bad_target(tmp_path, monkeypatch) -> None:
+    def fail_go_to(*_: object) -> dict[str, object]:
+        raise AssertionError("bad go_to targets must not run")
+
+    monkeypatch.setattr(dashboard, "_run_robot_go_to", fail_go_to)
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        status, result = _post_json(
+            f"{base_url}/api/robot/go_to",
+            {"command": "go_to", "x": "nan", "y": 0.0},
+            headers=_robot_headers(server),
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 400
+    assert result["ok"] is False
+    assert result["error"] == "invalid_go_to_target"
+
+
+def test_dimos_mcp_call_command_prefers_configured_prefix(monkeypatch) -> None:
+    monkeypatch.setenv("DOGOPS_DIMOS_MCP_CALL", "python -m dimos mcp call")
+
+    command = dashboard._dimos_mcp_call_command("go_to", {"x": 1.0, "y": 2.0})
+
+    assert command == [
+        "python",
+        "-m",
+        "dimos",
+        "mcp",
+        "call",
+        "go_to",
+        "--json-args",
+        '{"x":1.0,"y":2.0}',
+    ]
+
+
+def test_dimos_mcp_call_skill_treats_tool_error_as_failure(monkeypatch) -> None:
+    class _Result:
+        returncode = 0
+        stdout = '{"ok":false,"error":"navigation_stream_unavailable"}'
+        stderr = ""
+
+    monkeypatch.setattr(dashboard.subprocess, "run", lambda *_, **__: _Result())
+    monkeypatch.setattr(dashboard, "_dimos_mcp_call_command", lambda *_: ["dimos", "mcp"])
+
+    with pytest.raises(RuntimeError, match="navigation_stream_unavailable"):
+        dashboard._call_dimos_mcp_skill("go_to", {"x": 1.0, "y": 2.0})
 
 
 @pytest.mark.parametrize(
