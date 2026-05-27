@@ -49,7 +49,11 @@ def render_dashboard_html(
     runtime = (runtime_mode or os.environ.get("DOGOPS_RUNTIME_MODE") or "real").strip().lower()
     if runtime in {"sim", "demo"}:
         runtime = "simulation"
+    if runtime in {"rerun_sim", "replay-sim", "replay_sim"}:
+        runtime = "rerun-sim"
     runtime_label = "Simulation dog" if runtime == "simulation" else "Real dog"
+    if runtime == "rerun-sim":
+        runtime_label = "Rerun sim"
     if runtime == "offline":
         runtime_label = "Offline artifact"
     return f"""<!doctype html>
@@ -1012,19 +1016,28 @@ def render_dashboard_html(
           setRouteStatus(`Running ${{action}}...`, "");
           try {{
             if (action === "explore") {{
-              setRouteStatus("DimOS exploration command sent", "ok");
-              const result = await routePost("/api/map/explore", {{}});
-              if (result.mode === "offline") replayRerunMap();
               setRouteStatus(
-                result.mode === "offline" ? "Offline map populated" : "DimOS exploration started",
+                dogopsRuntimeMode === "rerun-sim" ? "Rerun LiDAR replay command sent" : "DimOS exploration command sent",
                 "ok",
               );
-              if (result.mode !== "offline") return;
+              const result = await routePost("/api/map/explore", {{}});
+              if (result.rerun) replayRerunMap();
+              setRouteStatus(
+                result.rerun ? "Rerun LiDAR mapping replay started" : "DimOS exploration started",
+                "ok",
+              );
+              if (!result.rerun) return;
             }}
             if (action === "stop-explore") {{
-              setRouteStatus("DimOS stop command sent", "ok");
+              setRouteStatus(
+                dogopsRuntimeMode === "rerun-sim" ? "Rerun mapping replay stopped" : "DimOS stop command sent",
+                "ok",
+              );
               await routePost("/api/map/stop_explore", {{}});
-              setRouteStatus("DimOS exploration stopped", "ok");
+              setRouteStatus(
+                dogopsRuntimeMode === "rerun-sim" ? "Rerun mapping replay stopped" : "DimOS exploration stopped",
+                "ok",
+              );
               window.setTimeout(() => window.location.reload(), 450);
               return;
             }}
@@ -1035,9 +1048,12 @@ def render_dashboard_html(
               return;
             }}
             if (action === "run") {{
-              setRouteStatus("Route goals sent to DimOS", "ok");
+              setRouteStatus(
+                dogopsRuntimeMode === "rerun-sim" ? "Route replay sent to Rerun" : "Route goals sent to DimOS",
+                "ok",
+              );
               const result = await routePost("/api/route/run", {{}});
-              if (result.mode === "offline") replayRerunMap();
+              if (result.rerun) replayRerunMap();
             }}
             if (action === "add-inspection") await routeTargetAction("inspection", targetId);
             if (action === "clear-inspection") {{
@@ -1215,7 +1231,7 @@ def map_viewer_panel(
     inspection_limit = 3
     motion_panel = (
         '<div class="sim-motion-note">Manual motion is skipped for simulation setup. Use DimOS mapping, target selection, and route run controls here.</div>'
-        if runtime == "simulation"
+        if runtime in {"simulation", "rerun-sim"}
         else (
             '<details>'
             "<summary>Manual motion</summary>"

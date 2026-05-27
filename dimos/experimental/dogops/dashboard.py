@@ -59,6 +59,7 @@ MOTION_PROFILES: dict[str, tuple[float, float, float]] = {
 DEFAULT_MOTION_PROFILE = "nudge"
 DEFAULT_DOGOPS_RUNTIME_MODE = "real"
 SIMULATION_RUNTIME_MODES = {"sim", "simulation", "demo"}
+RERUN_SIM_RUNTIME_MODES = {"rerun-sim", "rerun_sim", "replay-sim", "replay_sim"}
 OFFLINE_RUNTIME_MODES = {"offline", "static", "artifact"}
 DIMOS_CONTROL_TIMEOUT_S = 3.0
 ROBOT_JOG_COMMANDS: dict[str, tuple[float, float, float]] = {
@@ -312,6 +313,7 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         self._send_json(
             {
                 "ok": True,
+                "mode": self.runtime_mode,
                 "rerun": command,
                 "map": {
                     "status": site_map.status,
@@ -323,10 +325,7 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
 
     def _stop_explore_map(self) -> None:
         if not _uses_dimos_navigation_runtime(self.runtime_mode):
-            self._send_json(
-                {"ok": False, "error": "stop_explore_requires_dimos_runtime"},
-                HTTPStatus.BAD_REQUEST,
-            )
+            self._send_json({"ok": True, "mode": self.runtime_mode, "rerun": None})
             return
         try:
             control = _dimos_stop_explore()
@@ -771,6 +770,8 @@ def _dogops_runtime_mode() -> str:
     mode = (os.environ.get("DOGOPS_RUNTIME_MODE") or DEFAULT_DOGOPS_RUNTIME_MODE).strip().lower()
     if mode in SIMULATION_RUNTIME_MODES:
         return "simulation"
+    if mode in RERUN_SIM_RUNTIME_MODES:
+        return "rerun-sim"
     if mode in OFFLINE_RUNTIME_MODES:
         return "offline"
     return "real"
@@ -781,7 +782,7 @@ def _is_simulation_runtime(mode: str) -> bool:
 
 
 def _uses_dimos_navigation_runtime(mode: str) -> bool:
-    return mode.strip().lower() not in OFFLINE_RUNTIME_MODES
+    return mode.strip().lower() not in OFFLINE_RUNTIME_MODES | RERUN_SIM_RUNTIME_MODES
 
 
 def _dimos_control_url() -> str:

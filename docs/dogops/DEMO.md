@@ -69,6 +69,7 @@ DogOps defaults to real-dog operation:
 
 - `DOGOPS_RUNTIME_MODE=real` is the default. Map and route buttons send DimOS navigation commands; manual controls use the local Go2 WebRTC/Sport control path.
 - `DOGOPS_RUNTIME_MODE=simulation` is for `uv run dimos --simulation ... run unitree-go2`. Map and route controls send DimOS WebSocketVis events (`start_explore`, `stop_explore`, and click goals) to the simulated dog; manual movement is intentionally hidden from the main simulation setup flow.
+- `DOGOPS_RUNTIME_MODE=rerun-sim` is the no-robot local Rerun/LiDAR replay path. The dashboard keeps the Rerun WebViewer as the primary map, while `Map Open Space`, `Replay Map`, and `Run Route` trigger the local `dogops rerun-sim` stream instead of DimOS socket controls.
 - `DOGOPS_RUNTIME_MODE=offline` is only for static artifacts and tests when no DimOS control server is running.
 
 The DimOS control URL defaults to `http://127.0.0.1:7779` and is loopback-only unless `DOGOPS_ALLOW_REMOTE_VIEWER=1` is set deliberately.
@@ -82,7 +83,9 @@ npm install
 # Terminal A
 uv run python -m dimos.experimental.dogops.cli rerun-sim --run .dogops/runs/latest
 # Terminal B
-uv run python -m dimos.experimental.dogops.cli serve --run .dogops/runs/latest --port 8765
+DOGOPS_RUNTIME_MODE=rerun-sim \
+DOGOPS_RERUN_SOURCE_URL=rerun+http://127.0.0.1:9877/proxy \
+  uv run python -m dimos.experimental.dogops.cli serve --run .dogops/runs/latest --port 8765
 ```
 
 Open <http://127.0.0.1:8765/> to view the dashboard.

@@ -26,7 +26,7 @@ manifest + site policy
 
 The map layer uses the existing DimOS Go2 map/navigation stack. DogOps does not implement SLAM: `DogOpsLiveMapModule` consumes DimOS `global_costmap`, planner `path`, and `odom`, then the dashboard overlays semantic labels, incidents, inspection points, and run reporting on the embedded Rerun WebViewer. One inspection point creates both the DimOS route waypoint and the photo/reading POI, with the demo UI capped at three points to keep the operator flow simple. `map.json` is still written for reports/tests and offline fallback, but the normal operator map is Rerun. The base demo requires no cloud API keys and no LLM. POI photo/readings analysis is deterministic in simulation; optional Gemini/OpenAI/VLM analysis is stretch only and must stay server-side.
 
-Dashboard runtime modes are explicit. The default is `DOGOPS_RUNTIME_MODE=real`: route/map buttons send DimOS navigation commands and manual motion controls command the real Go2 through the local WebRTC/Sport API. Use `DOGOPS_RUNTIME_MODE=simulation` when DimOS is running with `--simulation`; the dashboard map and route buttons send DimOS `start_explore`, `stop_explore`, and click-goal events to the simulator while manual movement is intentionally out of the main simulation setup flow. Use `DOGOPS_RUNTIME_MODE=offline` only for static artifact checks where no DimOS control server is running.
+Dashboard runtime modes are explicit. The default is `DOGOPS_RUNTIME_MODE=real`: route/map buttons send DimOS navigation commands and manual motion controls command the real Go2 through the local WebRTC/Sport API. Use `DOGOPS_RUNTIME_MODE=simulation` when DimOS is running with `--simulation`; the dashboard map and route buttons send DimOS `start_explore`, `stop_explore`, and click-goal events to the simulator while manual movement is intentionally out of the main simulation setup flow. Use `DOGOPS_RUNTIME_MODE=rerun-sim` for the no-robot local Rerun/LiDAR replay path: DogOps stays mounted on the Rerun WebViewer and dashboard map/route buttons trigger the local `dogops rerun-sim` stream. Use `DOGOPS_RUNTIME_MODE=offline` only for static artifact checks where no Rerun or DimOS control server is running.
 
 ## Where To Build
 
@@ -75,7 +75,9 @@ For a local no-robot dashboard demo, publish the lightweight 2D fallback into Re
 ```bash
 uv run python -m dimos.experimental.dogops.cli simulate --out .dogops/runs/latest
 uv run python -m dimos.experimental.dogops.cli rerun-sim --run .dogops/runs/latest
-uv run python -m dimos.experimental.dogops.cli serve --run .dogops/runs/latest --port 8765
+DOGOPS_RUNTIME_MODE=rerun-sim \
+DOGOPS_RERUN_SOURCE_URL=rerun+http://127.0.0.1:9877/proxy \
+  uv run python -m dimos.experimental.dogops.cli serve --run .dogops/runs/latest --port 8765
 ```
 
 `rerun-sim` needs `rerun-sdk`; use the full DimOS environment or install this repo with the optional `rerun` extra. For the real 3D mapping look, run the native Go2 Air simulator (`uv run dimos --simulation --viewer rerun --rerun-open none run unitree-go2`) and publish DogOps overlays with `rerun-sim --view-mode native-3d` to the same local Rerun source. Native 3D mode refuses to start if no DimOS Rerun source is already listening, so it cannot silently fall back to the simple DogOps map. The dashboard’s primary path is option 2: the pinned `@rerun-io/web-viewer` component mounted directly inside DogOps. `DOGOPS_RERUN_EMBED_URL=http://127.0.0.1:9878` remains available only as an option-1 diagnostic fallback when testing DimOS’ own served viewer page.

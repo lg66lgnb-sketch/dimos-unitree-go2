@@ -123,6 +123,20 @@ def test_dashboard_static_html_surfaces_planned_route_before_run(tmp_path) -> No
     assert "<span>Route</span><strong>6 planned</strong>" in content
 
 
+def test_dashboard_rerun_sim_mode_keeps_rerun_as_primary_map(tmp_path) -> None:
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+
+    html_path = write_dashboard_html(run_dir, runtime_mode="rerun-sim")
+    content = html_path.read_text(encoding="utf-8")
+
+    assert "<span>Mode</span><strong>Rerun sim</strong>" in content
+    assert "Offline map artifact." in content
+    assert 'if (dogopsRuntimeMode === "offline")' in content
+    assert 'data-rerun-canvas' in content
+    assert 'data-viewer-offline hidden' in content
+
+
 def test_dashboard_viewer_urls_default_local_and_remote_gated(monkeypatch) -> None:
     monkeypatch.setenv("DOGOPS_RERUN_SOURCE_URL", "rerun+http://10.0.0.5:9877/proxy")
     monkeypatch.setenv("DOGOPS_RERUN_WEB_VIEWER_MODULE_URL", "https://cdn.example/viewer.js")
@@ -314,6 +328,38 @@ def test_dashboard_simulation_runtime_dispatches_dimos_controls(tmp_path, monkey
     assert [event for event, _ in events].count("stop_explore") == 1
     assert [event for event, _ in events].count("move_command") >= 2
     assert [event for event, _ in events].count("click") >= 1
+
+
+def test_dashboard_rerun_sim_runtime_uses_replay_without_dimos_control(tmp_path, monkeypatch) -> None:
+    def fail_emit(event: str, data: dict[str, Any] | None = None) -> dict[str, object]:
+        raise AssertionError(f"rerun-sim mode must not emit DimOS socket event {event}: {data}")
+
+    monkeypatch.setenv("DOGOPS_RUNTIME_MODE", "rerun-sim")
+    monkeypatch.setattr(dashboard, "_emit_dimos_socket_event", fail_emit)
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        explore_status, explore_result = _post_json(f"{base_url}/api/map/explore", {})
+        stop_status, stop_result = _post_json(f"{base_url}/api/map/stop_explore", {})
+        run_status, run_result = _post_json(f"{base_url}/api/route/run", {})
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert explore_status == 200
+    assert explore_result["mode"] == "rerun-sim"
+    assert explore_result["rerun"]["action"] == "replay_mapping"  # type: ignore[index]
+    assert stop_status == 200
+    assert stop_result["mode"] == "rerun-sim"
+    assert run_status == 200
+    assert run_result["mode"] == "rerun-sim"
+    assert run_result["rerun"]["action"] == "replay_route"  # type: ignore[index]
 
 
 def test_dimos_control_url_rejects_remote_by_default(monkeypatch) -> None:
