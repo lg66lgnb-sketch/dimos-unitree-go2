@@ -54,6 +54,29 @@ def _post_json(
         return exc.status, json.loads(exc.read().decode("utf-8"))
 
 
+def _put_json(url: str, payload: dict[str, Any]) -> tuple[int, dict[str, object]]:
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="PUT",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return exc.status, json.loads(exc.read().decode("utf-8"))
+
+
+def _delete_json(url: str) -> tuple[int, dict[str, object]]:
+    request = urllib.request.Request(url, method="DELETE")
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return exc.status, json.loads(exc.read().decode("utf-8"))
+
+
 def _robot_headers(server) -> dict[str, str]:
     return {
         dashboard.ROBOT_CONTROL_TOKEN_HEADER: server.RequestHandlerClass.robot_control_token,
@@ -93,6 +116,22 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert "connectRerunSurface" in content
     assert 'data-map-command-status' in content
     assert 'data-map-action="arm_go_to"' in content
+    assert 'data-map-edit-mode="home"' in content
+    assert 'data-map-edit-mode="no_go"' in content
+    assert 'data-map-edit-action="use_observation"' in content
+    assert 'data-map-edit-action="delete_selected"' in content
+    assert 'data-map-edit-action="route_select"' in content
+    assert 'data-map-edit-action="route_up"' in content
+    assert 'data-map-edit-action="route_down"' in content
+    assert 'data-map-edit-action="publish_no_go"' in content
+    assert 'data-map-edit-action="export"' in content
+    assert 'data-map-authoring-status' in content
+    assert "/api/map/authoring" in content
+    assert "/api/map/entities" in content
+    assert "/api/map/no_go_shapes" in content
+    assert "/api/map/no_go_shapes/publish" in content
+    assert "/api/map/tag_bindings" in content
+    assert "/from_observation" in content
     assert 'data-go-to-marker' in content
     assert "/api/robot/go_to" in content
     assert "worldFromSvgEvent" in content
@@ -196,6 +235,7 @@ def test_dashboard_api_serves_state_report_and_nav(tmp_path) -> None:
         report = _get_json(f"{base_url}/api/report")
         nav = _get_json(f"{base_url}/api/nav")
         map_data = _get_json(f"{base_url}/api/map")
+        authoring = _get_json(f"{base_url}/api/map/authoring")
         route = _get_json(f"{base_url}/api/route")
         poi = _get_json(f"{base_url}/api/poi")
     finally:
@@ -228,6 +268,217 @@ def test_dashboard_api_serves_state_report_and_nav(tmp_path) -> None:
     assert any(package["id"] == "PKG-104" for package in map_data["packages"])
     assert map_data["live"]["source"] == "DimOS live LCM topics"  # type: ignore[index]
     assert "costmap" in map_data["live"]  # type: ignore[operator]
+    assert authoring["schema_version"] == 1
+    assert authoring["site_id"] == "dogops_demo_site"
+
+
+def test_dashboard_map_authoring_endpoints_persist_and_compose(tmp_path) -> None:
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        status, entity_result = _post_json(
+            f"{base_url}/api/map/entities",
+            {
+                "id": "CHECKPOINT_X",
+                "kind": "checkpoint",
+                "label": "Checkpoint X",
+                "pose": {"x": 7.0, "y": 8.0, "source": "dashboard_edit"},
+                "tag_id": 222,
+            },
+        )
+        status_shape, shape_result = _post_json(
+            f"{base_url}/api/map/no_go_shapes",
+            {
+                "id": "NO_GO_EDIT",
+                "label": "Edited No-Go",
+                "shape": "rectangle",
+                "points": [
+                    {"x": 6.0, "y": 6.0, "source": "dashboard_edit"},
+                    {"x": 7.0, "y": 7.0, "source": "dashboard_edit"},
+                ],
+                "enabled": True,
+            },
+        )
+        status_route, route_result = _post_json(
+            f"{base_url}/api/map/routes",
+            {
+                "id": "ROUTE_EDIT",
+                "label": "Edited Route",
+                "waypoints": [
+                    {
+                        "id": "WP1",
+                        "label": "Waypoint 1",
+                        "target_id": "CHECKPOINT_X",
+                        "pose": {"x": 7.0, "y": 8.0, "source": "dashboard_edit"},
+                    }
+                ],
+            },
+        )
+        map_data = _get_json(f"{base_url}/api/map")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 200
+    assert status_shape == 200
+    assert status_route == 200
+    assert entity_result["ok"] is True
+    assert shape_result["authoring"]["no_go_shapes"][0]["dimos_constraint_status"] == "not_supported"  # type: ignore[index]
+    assert route_result["authoring"]["routes"][0]["id"] == "ROUTE_EDIT"  # type: ignore[index]
+    assert (run_dir / "map_authoring.json").exists()
+    assert any(zone["id"] == "CHECKPOINT_X" for zone in map_data["zones"])
+    assert map_data["route"][0]["target_id"] == "CHECKPOINT_X"  # type: ignore[index]
+    assert map_data["no_go_shapes"][0]["id"] == "NO_GO_EDIT"  # type: ignore[index]
+
+
+def test_dashboard_map_authoring_rejects_duplicate_tag_binding(tmp_path) -> None:
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    payload = {
+        "tag_id": 222,
+        "entity_id": "CHECKPOINT_X",
+        "label": "Checkpoint X",
+        "binding_kind": "checkpoint",
+    }
+    try:
+        first_status, first = _post_json(f"{base_url}/api/map/tag_bindings", payload)
+        second_status, second = _post_json(f"{base_url}/api/map/tag_bindings", payload)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert first_status == 200
+    assert first["ok"] is True
+    assert second_status == 400
+    assert second["ok"] is False
+    assert second["error"] == "invalid_map_authoring"
+
+
+def test_dashboard_map_authoring_delete_and_export(tmp_path) -> None:
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        _post_json(
+            f"{base_url}/api/map/entities",
+            {
+                "id": "CHECKPOINT_DELETE",
+                "kind": "checkpoint",
+                "label": "Checkpoint Delete",
+                "pose": {"x": 2.0, "y": 3.0, "source": "dashboard_edit"},
+            },
+        )
+        delete_status, delete_result = _delete_json(
+            f"{base_url}/api/map/entities/CHECKPOINT_DELETE"
+        )
+        export_status, export_result = _post_json(f"{base_url}/api/map/export", {})
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert delete_status == 200
+    assert delete_result["ok"] is True
+    assert export_status == 200
+    assert export_result["ok"] is True
+    assert (run_dir / "exports" / "site_authoring.yaml").exists()
+
+
+def test_dashboard_map_authoring_observation_placement_and_route_select(tmp_path) -> None:
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        status_place, placed = _post_json(
+            f"{base_url}/api/map/entities/COOLING_1/from_observation",
+            {"observation_id": "OBS-003", "kind": "asset"},
+        )
+        status_route, route_result = _post_json(
+            f"{base_url}/api/map/routes",
+            {
+                "id": "ROUTE_SELECT",
+                "label": "Route Select",
+                "waypoints": [
+                    {
+                        "id": "WP_SELECT",
+                        "label": "Waypoint Select",
+                        "target_id": "COOLING_1",
+                        "pose": {"x": 8.0, "y": 9.0, "source": "dashboard_edit"},
+                    }
+                ],
+            },
+        )
+        status_select, selected = _post_json(
+            f"{base_url}/api/map/routes/ROUTE_SELECT/select",
+            {},
+        )
+        map_data = _get_json(f"{base_url}/api/map")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status_place == 200
+    assert status_route == 200
+    assert status_select == 200
+    assert placed["authoring"]["entities"][0]["id"] == "COOLING_1"  # type: ignore[index]
+    assert route_result["authoring"]["selected_route_id"] == "ROUTE_SELECT"  # type: ignore[index]
+    assert selected["authoring"]["selected_route_id"] == "ROUTE_SELECT"  # type: ignore[index]
+    assert map_data["authoring"]["selected_route_id"] == "ROUTE_SELECT"  # type: ignore[index]
+    assert map_data["route"][0]["target_id"] == "COOLING_1"  # type: ignore[index]
+
+
+def test_dashboard_no_go_publish_keeps_unsupported_without_publisher(tmp_path) -> None:
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        _post_json(
+            f"{base_url}/api/map/no_go_shapes",
+            {
+                "id": "NO_GO_PUBLISH",
+                "label": "Publish No-Go",
+                "shape": "rectangle",
+                "points": [
+                    {"x": 1.0, "y": 1.0, "source": "dashboard_edit"},
+                    {"x": 2.0, "y": 2.0, "source": "dashboard_edit"},
+                ],
+                "enabled": True,
+            },
+        )
+        status, result = _post_json(f"{base_url}/api/map/no_go_shapes/publish", {})
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 200
+    assert result["ok"] is True
+    assert result["authoring"]["no_go_shapes"][0]["dimos_constraint_status"] == "not_supported"  # type: ignore[index]
 
 
 def test_dashboard_map_data_projects_site_route_and_observations(tmp_path) -> None:

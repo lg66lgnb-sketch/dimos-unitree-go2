@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from dimos.experimental.dogops.map_authoring import load_map_authoring
+
 MAP_WIDTH = 920
 MAP_HEIGHT = 560
 MAP_PADDING_M = 0.55
@@ -36,8 +38,12 @@ def build_map_data(
     report: dict[str, Any],
     *,
     live_overlay: dict[str, Any] | None = None,
+    authoring: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     site = state.get("site") or {}
+    authoring = authoring or {}
+    authored_entities = _authoring_entities(authoring)
+    authored_incidents = _authoring_incidents(authoring)
     zones = site.get("zones") or []
     assets = site.get("assets") or []
     site_packages = site.get("packages") or []
@@ -50,20 +56,26 @@ def build_map_data(
     map_zones: list[dict[str, Any]] = []
     for zone in zones:
         pose = _zone_pose(zone)
+        zone_id = str(zone["id"])
+        authored = authored_entities.get(zone_id)
+        if authored is not None:
+            pose = _authoring_pose(authored)
+        elif zone_id == "HOME" and authoring.get("home"):
+            pose = _authoring_pose({"pose": authoring["home"]})
         if pose is None:
             continue
-        zone_id = str(zone["id"])
         zone_points[zone_id] = pose
         map_zones.append(
             {
                 "id": zone_id,
-                "display_name": zone.get("display_name") or zone_id,
+                "display_name": _authoring_label(authoring, zone_id, zone.get("display_name") or zone_id),
                 "zone_kind": zone.get("zone_kind", "zone"),
-                "tag_id": zone.get("tag_id"),
+                "tag_id": _authoring_tag_id(authoring, zone_id, zone.get("tag_id")),
                 "radius_m": float(zone.get("radius_m") or 0.8),
                 "no_go": bool(zone.get("no_go")),
                 "x": pose[0],
                 "y": pose[1],
+                "source": "dashboard_edit" if authored is not None or (zone_id == "HOME" and authoring.get("home")) else "site_config",
             }
         )
 
@@ -72,20 +84,23 @@ def build_map_data(
     for index, asset in enumerate(assets):
         zone_id = str(asset.get("zone_id") or "")
         base = zone_points.get(zone_id)
-        if base is None:
-            continue
-        pose = _offset_pose(base, index + 1)
         asset_id = str(asset["id"])
+        authored = authored_entities.get(asset_id)
+        authored_pose = _authoring_pose(authored) if authored is not None else None
+        if base is None and authored_pose is None:
+            continue
+        pose = authored_pose or _offset_pose(base, index + 1)  # type: ignore[arg-type]
         entity_points[asset_id] = pose
         map_assets.append(
             {
                 "id": asset_id,
-                "display_name": asset.get("display_name") or asset_id,
+                "display_name": _authoring_label(authoring, asset_id, asset.get("display_name") or asset_id),
                 "asset_kind": asset.get("asset_kind", "asset"),
-                "tag_id": asset.get("tag_id"),
-                "zone_id": zone_id,
+                "tag_id": _authoring_tag_id(authoring, asset_id, asset.get("tag_id")),
+                "zone_id": str((authored or {}).get("zone_id") or zone_id),
                 "x": pose[0],
                 "y": pose[1],
+                "source": "dashboard_edit" if authored_pose is not None else "site_config",
             }
         )
 
@@ -94,49 +109,131 @@ def build_map_data(
     map_packages: list[dict[str, Any]] = []
     for package in report_packages:
         package_id = str(package["package_id"])
+        authored = authored_entities.get(package_id)
         observed_zone = package.get("observed_zone_id")
         expected_zone = package.get("expected_zone_id")
         zone_id = str(observed_zone or expected_zone or "")
         base = zone_points.get(zone_id)
-        if base is None:
+        authored_pose = _authoring_pose(authored) if authored is not None else None
+        if base is None and authored_pose is None:
             continue
         count = package_counts_by_zone.get(zone_id, 0)
         package_counts_by_zone[zone_id] = count + 1
-        pose = _package_pose(base, count)
+        pose = authored_pose or _package_pose(base, count)  # type: ignore[arg-type]
         site_package = site_package_by_id.get(package_id) or {}
         entity_points[package_id] = pose
         map_packages.append(
             {
                 "id": package_id,
-                "tag_id": site_package.get("tag_id"),
+                "display_name": _authoring_label(authoring, package_id, site_package.get("display_name") or package_id),
+                "tag_id": _authoring_tag_id(authoring, package_id, site_package.get("tag_id")),
                 "expected_zone_id": expected_zone,
                 "observed_zone_id": observed_zone,
                 "state": package.get("state", "unknown"),
                 "blocks_asset_id": package.get("blocks_asset_id"),
                 "x": pose[0],
                 "y": pose[1],
+                "source": "dashboard_edit" if authored_pose is not None else "site_config",
             }
         )
 
-    map_route: list[dict[str, Any]] = []
-    for event in nav_events:
-        if event.get("action") != "goto":
+    for entity in (authoring.get("entities") or []):
+        if not isinstance(entity, dict):
             continue
-        target_id = str(event.get("target_id") or "")
-        pose = entity_points.get(target_id)
+        entity_id = str(entity.get("id") or "")
+        if not entity_id or entity_id in entity_points:
+            continue
+        pose = _authoring_pose(entity)
         if pose is None:
             continue
-        map_route.append(
-            {
-                "target_id": target_id,
-                "x": pose[0],
-                "y": pose[1],
-                "success": bool(event.get("success", True)),
-                "guided": bool(event.get("guided", False)),
-                "retries": int(event.get("retries") or 0),
-                "note": event.get("note", ""),
-            }
-        )
+        kind = str(entity.get("kind") or "checkpoint")
+        entity_points[entity_id] = pose
+        if kind in {"zone", "checkpoint"}:
+            zone_points[entity_id] = pose
+            map_zones.append(
+                {
+                    "id": entity_id,
+                    "display_name": entity.get("label") or entity_id,
+                    "zone_kind": kind,
+                    "tag_id": entity.get("tag_id"),
+                    "radius_m": 0.45,
+                    "no_go": False,
+                    "x": pose[0],
+                    "y": pose[1],
+                    "source": "dashboard_edit",
+                }
+            )
+        elif kind == "asset":
+            map_assets.append(
+                {
+                    "id": entity_id,
+                    "display_name": entity.get("label") or entity_id,
+                    "asset_kind": "authored",
+                    "tag_id": entity.get("tag_id"),
+                    "zone_id": entity.get("zone_id"),
+                    "x": pose[0],
+                    "y": pose[1],
+                    "source": "dashboard_edit",
+                }
+            )
+        elif kind == "package":
+            map_packages.append(
+                {
+                    "id": entity_id,
+                    "display_name": entity.get("label") or entity_id,
+                    "tag_id": entity.get("tag_id"),
+                    "expected_zone_id": entity.get("zone_id"),
+                    "observed_zone_id": entity.get("zone_id"),
+                    "state": "authored",
+                    "blocks_asset_id": None,
+                    "x": pose[0],
+                    "y": pose[1],
+                    "source": "dashboard_edit",
+                }
+            )
+
+    map_route: list[dict[str, Any]] = []
+    authored_route = _selected_authoring_route(authoring)
+    if authored_route is not None:
+        for waypoint in authored_route.get("waypoints") or []:
+            if not isinstance(waypoint, dict):
+                continue
+            pose = _authoring_pose(waypoint)
+            if pose is None:
+                continue
+            target_id = str(waypoint.get("target_id") or waypoint.get("id") or "waypoint")
+            map_route.append(
+                {
+                    "target_id": target_id,
+                    "x": pose[0],
+                    "y": pose[1],
+                    "success": True,
+                    "guided": False,
+                    "retries": 0,
+                    "note": "authored route",
+                    "source": "dashboard_edit",
+                }
+            )
+    else:
+        for event in nav_events:
+            if event.get("action") != "goto":
+                continue
+            target_id = str(event.get("target_id") or "")
+            pose = entity_points.get(target_id)
+            if pose is None:
+                continue
+            map_route.append(
+                {
+                    "target_id": target_id,
+                    "x": pose[0],
+                    "y": pose[1],
+                    "success": bool(event.get("success", True)),
+                    "guided": bool(event.get("guided", False)),
+                    "retries": int(event.get("retries") or 0),
+                    "note": event.get("note", ""),
+                    "source": "nav_event",
+                }
+            )
 
     map_observations: list[dict[str, Any]] = []
     for observation in observations:
@@ -161,7 +258,8 @@ def build_map_data(
     map_incidents: list[dict[str, Any]] = []
     for incident in incidents:
         entity_id = str(incident.get("entity_id") or "")
-        pose = entity_points.get(entity_id)
+        location = authored_incidents.get(str(incident.get("id") or ""))
+        pose = _authoring_pose(location) if location is not None else entity_points.get(entity_id)
         if pose is None and incident.get("related_package_id"):
             pose = entity_points.get(str(incident["related_package_id"]))
         if pose is None:
@@ -175,6 +273,7 @@ def build_map_data(
                 "state": incident.get("state", "unknown"),
                 "x": pose[0],
                 "y": pose[1],
+                "source": "dashboard_edit" if location is not None else "run_state",
             }
         )
 
@@ -195,6 +294,7 @@ def build_map_data(
         for group in (map_zones, map_assets, map_packages, map_route, map_observations)
         for item in group
     ]
+    points.extend(_no_go_shape_points(authoring))
     points.extend(_live_overlay_points(live))
     bounds = _map_bounds(points)
     return {
@@ -206,6 +306,17 @@ def build_map_data(
         "route": map_route,
         "observations": map_observations,
         "incidents": map_incidents,
+        "no_go_shapes": authoring.get("no_go_shapes") or [],
+        "tag_bindings": authoring.get("tag_bindings") or [],
+        "authoring": {
+            "schema_version": authoring.get("schema_version", 1),
+            "updated_at": authoring.get("updated_at"),
+            "selected_route_id": authoring.get("selected_route_id"),
+            "entities": len(authoring.get("entities") or []),
+            "no_go_shapes": len(authoring.get("no_go_shapes") or []),
+            "routes": len(authoring.get("routes") or []),
+            "tag_bindings": len(authoring.get("tag_bindings") or []),
+        },
         "bounds": bounds,
         "live": live,
         "layers": {
@@ -242,6 +353,81 @@ def _live_overlay_points(live: dict[str, Any]) -> list[tuple[float, float]]:
     return points
 
 
+def _authoring_entities(authoring: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        str(entity.get("id")): entity
+        for entity in authoring.get("entities") or []
+        if isinstance(entity, dict) and entity.get("id")
+    }
+
+
+def _authoring_incidents(authoring: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        str(location.get("incident_id")): location
+        for location in authoring.get("incident_locations") or []
+        if isinstance(location, dict) and location.get("incident_id")
+    }
+
+
+def _authoring_pose(item: dict[str, Any] | None) -> tuple[float, float] | None:
+    if not isinstance(item, dict):
+        return None
+    pose = item.get("pose") if isinstance(item.get("pose"), dict) else item
+    if not isinstance(pose, dict):
+        return None
+    x = _float_or_none(pose.get("x"))
+    y = _float_or_none(pose.get("y"))
+    if x is None or y is None:
+        return None
+    return x, y
+
+
+def _authoring_label(authoring: dict[str, Any], entity_id: str, fallback: object) -> str:
+    entity = _authoring_entities(authoring).get(entity_id)
+    if entity is None:
+        return str(fallback)
+    return str(entity.get("label") or fallback)
+
+
+def _authoring_tag_id(
+    authoring: dict[str, Any],
+    entity_id: str,
+    fallback: object | None,
+) -> object | None:
+    entity = _authoring_entities(authoring).get(entity_id)
+    if entity is not None and entity.get("tag_id") is not None:
+        return entity.get("tag_id")
+    for binding in authoring.get("tag_bindings") or []:
+        if isinstance(binding, dict) and binding.get("entity_id") == entity_id:
+            return binding.get("tag_id")
+    return fallback
+
+
+def _selected_authoring_route(authoring: dict[str, Any]) -> dict[str, Any] | None:
+    routes = [route for route in authoring.get("routes") or [] if isinstance(route, dict)]
+    if not routes:
+        return None
+    selected_route_id = authoring.get("selected_route_id")
+    if selected_route_id:
+        for route in routes:
+            if route.get("id") == selected_route_id and route.get("waypoints"):
+                return route
+    routes_with_points = [route for route in routes if route.get("waypoints")]
+    return routes_with_points[0] if routes_with_points else None
+
+
+def _no_go_shape_points(authoring: dict[str, Any]) -> list[tuple[float, float]]:
+    points: list[tuple[float, float]] = []
+    for shape in authoring.get("no_go_shapes") or []:
+        if not isinstance(shape, dict) or not shape.get("enabled", True):
+            continue
+        for point in shape.get("points") or []:
+            maybe_point = _authoring_pose(point)
+            if maybe_point is not None:
+                points.append(maybe_point)
+    return points
+
+
 def _xy_point(item: Any) -> tuple[float, float] | None:
     if not isinstance(item, dict):
         return None
@@ -262,8 +448,13 @@ def _float_or_none(value: Any) -> float | None:
     return result
 
 
-def build_route_data(state: dict[str, Any], report: dict[str, Any]) -> dict[str, Any]:
-    map_data = build_map_data(state, report)
+def build_route_data(
+    state: dict[str, Any],
+    report: dict[str, Any],
+    *,
+    authoring: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    map_data = build_map_data(state, report, authoring=authoring)
     checkpoints = {
         str(checkpoint.get("target_id")): checkpoint
         for checkpoint in report.get("checkpoint_verifications") or []
@@ -373,13 +564,22 @@ def build_poi_data(state: dict[str, Any], report: dict[str, Any]) -> dict[str, A
     }
 
 
-def render_site_map(state: dict[str, Any], report: dict[str, Any]) -> str:
-    map_data = build_map_data(state, report)
+def render_site_map(
+    state: dict[str, Any],
+    report: dict[str, Any],
+    *,
+    authoring: dict[str, Any] | None = None,
+) -> str:
+    map_data = build_map_data(state, report, authoring=authoring)
     if not map_data["zones"]:
         return '<div class="map-empty">Map data unavailable</div>'
 
     bounds = map_data["bounds"]
     bounds_attr = escape(json.dumps(bounds, separators=(",", ":")), quote=True)
+    authoring_attr = escape(
+        json.dumps(map_data["authoring"], separators=(",", ":")),
+        quote=True,
+    )
     projector = _MapProjector(bounds)
     route_points = " ".join(
         f"{projector.x(point['x']):.1f},{projector.y(point['y']):.1f}"
@@ -389,6 +589,9 @@ def render_site_map(state: dict[str, Any], report: dict[str, Any]) -> str:
     floor_cells = _render_floor_cells(projector, map_data)
     point_cloud = _render_point_cloud(projector, map_data)
     no_go = "".join(_render_no_go_zone(projector, zone) for zone in map_data["zones"])
+    no_go += "".join(
+        _render_no_go_shape(projector, shape) for shape in map_data["no_go_shapes"]
+    )
     zones = "".join(_render_zone(projector, zone) for zone in map_data["zones"])
     assets = "".join(_render_asset(projector, asset) for asset in map_data["assets"])
     packages = "".join(_render_package(projector, package) for package in map_data["packages"])
@@ -427,12 +630,35 @@ def render_site_map(state: dict[str, Any], report: dict[str, Any]) -> str:
         '<button type="button" data-map-layer="robot" aria-pressed="true">Robot</button>'
         "</div>"
     )
+    edit_controls = (
+        '<div class="map-edit-controls" data-map-edit-controls>'
+        '<button type="button" data-map-edit-mode="select" aria-pressed="true">Select</button>'
+        '<button type="button" data-map-edit-mode="home" aria-pressed="false">Set Home</button>'
+        '<button type="button" data-map-edit-mode="zone" aria-pressed="false">Label</button>'
+        '<button type="button" data-map-edit-mode="asset" aria-pressed="false">Asset</button>'
+        '<button type="button" data-map-edit-mode="package" aria-pressed="false">Package</button>'
+        '<button type="button" data-map-edit-mode="no_go" aria-pressed="false">No-Go</button>'
+        '<button type="button" data-map-edit-mode="route" aria-pressed="false">Route</button>'
+        '<button type="button" data-map-edit-mode="incident" aria-pressed="false">Incident</button>'
+        '<button type="button" data-map-edit-mode="tag" aria-pressed="false">Bind Tag</button>'
+        '<button type="button" data-map-edit-action="use_observation">Use Observation</button>'
+        '<button type="button" data-map-edit-action="delete_selected">Delete</button>'
+        '<button type="button" data-map-edit-action="route_select">Select Route</button>'
+        '<button type="button" data-map-edit-action="route_up">Route Up</button>'
+        '<button type="button" data-map-edit-action="route_down">Route Down</button>'
+        '<button type="button" data-map-edit-action="publish_no_go">Publish No-Go</button>'
+        '<button type="button" data-map-edit-action="save">Save</button>'
+        '<button type="button" data-map-edit-action="reset">Reset</button>'
+        '<button type="button" data-map-edit-action="export">Export</button>'
+        "</div>"
+    )
     return f"""
       <div class="map-shell" data-map-surface>
         {_render_rerun_surface(rerun_web_url)}
         {layer_controls}
+        {edit_controls}
         <svg class="site-map" role="img" aria-label="DogOps mission map"
-          data-live-map-svg data-map-bounds="{bounds_attr}"
+          data-live-map-svg data-map-bounds="{bounds_attr}" data-map-authoring="{authoring_attr}"
           viewBox="0 0 {MAP_WIDTH} {MAP_HEIGHT}">
           <defs>
             <filter id="dogops-map-glow" x="-50%" y="-50%" width="200%" height="200%">
@@ -472,6 +698,7 @@ def render_site_map(state: dict[str, Any], report: dict[str, Any]) -> str:
           <a href="{rerun_web_url_attr}" target="_blank" rel="noreferrer" data-rerun-web-link>Open Rerun Web</a>
           <span class="map-command-status" data-map-command-status>Map command idle</span>
         </div>
+        <div class="map-authoring-status" data-map-authoring-status>Map authoring idle</div>
         <div class="map-live-status" data-live-map-status>Live odom: waiting for Go2</div>
         <ol class="scan-strip">{scan_items}</ol>
       </div>
@@ -483,6 +710,7 @@ def render_dashboard_html(
     report: dict[str, Any],
     *,
     robot_control_token: str | None = None,
+    authoring: dict[str, Any] | None = None,
 ) -> str:
     run = state["run"]
     nav = report.get("nav_summary") or {}
@@ -500,8 +728,8 @@ def render_dashboard_html(
     )
     mean_target_time_metric = f"{nav.get('mean_elapsed_s', 0):.1f}s"
     route_coverage_metric = f"{float(nav.get('route_coverage', 0.0)) * 100:.0f}%"
-    map_html = render_site_map(state, report)
-    route_data = build_route_data(state, report)
+    map_html = render_site_map(state, report, authoring=authoring)
+    route_data = build_route_data(state, report, authoring=authoring)
     poi_data = build_poi_data(state, report)
     return f"""<!doctype html>
 <html lang="en">
@@ -828,7 +1056,12 @@ def render_dashboard_html(
       flex-wrap: wrap;
       gap: 8px;
     }}
-    .map-layer-controls button {{
+    .map-edit-controls {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }}
+    .map-layer-controls button, .map-edit-controls button {{
       background: #0d1119;
       border: 1px solid #334155;
       border-radius: 999px;
@@ -838,7 +1071,7 @@ def render_dashboard_html(
       min-height: 30px;
       padding: 5px 10px;
     }}
-    .map-layer-controls button[aria-pressed="true"] {{
+    .map-layer-controls button[aria-pressed="true"], .map-edit-controls button[aria-pressed="true"] {{
       background: #123b36;
       border-color: #52e0c4;
       color: #d8fff6;
@@ -849,6 +1082,13 @@ def render_dashboard_html(
       font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace;
       min-height: 18px;
     }}
+    .map-authoring-status {{
+      color: #c4b5fd;
+      font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace;
+      min-height: 18px;
+    }}
+    .map-authoring-status.ok {{ color: #86efac; }}
+    .map-authoring-status.error {{ color: #fca5a5; }}
     .scan-strip {{
       color: #b8c4d4;
       display: grid;
@@ -1145,6 +1385,7 @@ def render_dashboard_html(
       const motionControls = document.querySelector("[data-motion-controls]");
       const mapControls = document.querySelector("[data-map-controls]");
       const layerControls = document.querySelector("[data-map-layer-controls]");
+      const mapEditControls = document.querySelector("[data-map-edit-controls]");
       const rerunSurface = document.querySelector("[data-rerun-surface]");
       const rerunConnect = document.querySelector("[data-rerun-connect]");
       const rerunFrame = document.querySelector("[data-rerun-frame]");
@@ -1153,6 +1394,7 @@ def render_dashboard_html(
       const liveMapSvg = document.querySelector("[data-live-map-svg]");
       const liveMapStatus = document.querySelector("[data-live-map-status]");
       const mapCommandStatus = document.querySelector("[data-map-command-status]");
+      const mapAuthoringStatus = document.querySelector("[data-map-authoring-status]");
       const liveHeatmap = liveMapSvg ? liveMapSvg.querySelector("[data-live-heatmap]") : null;
       const livePath = liveMapSvg ? liveMapSvg.querySelector("[data-live-path]") : null;
       const liveTrace = liveMapSvg ? liveMapSvg.querySelector("[data-live-trace]") : null;
@@ -1167,12 +1409,21 @@ def render_dashboard_html(
       let dimosMapPolling = false;
       let dimosRobotPoseActive = false;
       let goToArmed = false;
+      let mapEditMode = "select";
+      let mapAuthoring = null;
+      let selectedMapObject = null;
+      let dragMapObject = null;
       let liveMapBounds = null;
       let liveOverlayBounds = null;
       try {{
         liveMapBounds = liveMapSvg ? JSON.parse(liveMapSvg.dataset.mapBounds || "{{}}") : null;
       }} catch (_) {{
         liveMapBounds = null;
+      }}
+      try {{
+        mapAuthoring = liveMapSvg ? JSON.parse(liveMapSvg.dataset.mapAuthoring || "{{}}") : null;
+      }} catch (_) {{
+        mapAuthoring = null;
       }}
       liveOverlayBounds = liveMapBounds;
       const liveMapSize = {{width: {MAP_WIDTH}, height: {MAP_HEIGHT}}};
@@ -1208,6 +1459,11 @@ def render_dashboard_html(
         if (!mapCommandStatus) return;
         mapCommandStatus.textContent = text;
         mapCommandStatus.className = `map-command-status ${{state || ""}}`;
+      }};
+      const setMapAuthoringStatus = (text, state) => {{
+        if (!mapAuthoringStatus) return;
+        mapAuthoringStatus.textContent = text;
+        mapAuthoringStatus.className = `map-authoring-status ${{state || ""}}`;
       }};
       const setRerunStatus = (text) => {{
         if (rerunStatus) rerunStatus.textContent = text;
@@ -1268,6 +1524,223 @@ def render_dashboard_html(
           "transform",
           `translate(${{projected.x.toFixed(1)}} ${{projected.y.toFixed(1)}})`
         );
+      }};
+      const authoringPoint = (target) => ({{
+        x: Math.round(target.x * 1000) / 1000,
+        y: Math.round(target.y * 1000) / 1000,
+        theta_deg: null,
+        source: "dashboard_edit",
+      }});
+      const postAuthoring = async (url, body, method = "POST") => {{
+        setMapAuthoringStatus("Saving map edit...", "");
+        try {{
+          const response = await fetch(url, {{
+            method,
+            headers: {{"Content-Type": "application/json"}},
+            body: JSON.stringify(body),
+          }});
+          const result = await response.json();
+          if (!response.ok || result.ok === false) {{
+            throw new Error(result.message || result.error || "map_authoring_failed");
+          }}
+          mapAuthoring = result.authoring || mapAuthoring;
+          setMapAuthoringStatus("Map edit saved; refreshing", "ok");
+          await refreshDimOSMap();
+          window.setTimeout(() => window.location.reload(), 150);
+          return result;
+        }} catch (error) {{
+          setMapAuthoringStatus(`Map edit failed: ${{error.message}}`, "error");
+          return null;
+        }}
+      }};
+      const setMapEditMode = (mode) => {{
+        mapEditMode = mode || "select";
+        if (mapEditControls) {{
+          mapEditControls.querySelectorAll("[data-map-edit-mode]").forEach((button) => {{
+            button.setAttribute("aria-pressed", button.getAttribute("data-map-edit-mode") === mapEditMode ? "true" : "false");
+          }});
+        }}
+        setMapAuthoringStatus(mapEditMode === "select" ? "Map authoring idle" : `Map authoring: ${{mapEditMode}}`, mapEditMode === "select" ? "" : "ok");
+      }};
+      const selectMapObject = (target) => {{
+        const item = target ? target.closest("[data-edit-kind][data-edit-id]") : null;
+        selectedMapObject = item ? {{
+          kind: item.getAttribute("data-edit-kind"),
+          id: item.getAttribute("data-edit-id"),
+        }} : null;
+        setMapAuthoringStatus(
+          selectedMapObject ? `Selected ${{selectedMapObject.kind}} ${{selectedMapObject.id}}` : "Map authoring idle",
+          selectedMapObject ? "ok" : ""
+        );
+        return selectedMapObject;
+      }};
+      const entityKindForSelected = () => {{
+        if (!selectedMapObject) return "checkpoint";
+        if (["zone", "asset", "package"].includes(selectedMapObject.kind)) return selectedMapObject.kind;
+        return "checkpoint";
+      }};
+      const deleteSelectedMapObject = async () => {{
+        if (!selectedMapObject || !selectedMapObject.id) {{
+          setMapAuthoringStatus("Select an authored object first", "error");
+          return;
+        }}
+        const id = selectedMapObject.id;
+        if (!window.confirm(`Delete authored map object ${{id}}?`)) return;
+        const kind = selectedMapObject.kind;
+        if (kind === "route_stop") {{
+          await removeRouteWaypoint(id);
+        }} else if (kind === "no_go_shape") {{
+          await postAuthoring(`/api/map/no_go_shapes/${{encodeURIComponent(id)}}`, {{}}, "DELETE");
+        }} else if (kind === "incident") {{
+          const current = mapAuthoring || {{}};
+          const incidentLocations = (current.incident_locations || []).filter((item) => item.incident_id !== id);
+          await postAuthoring("/api/map/authoring", {{...current, incident_locations: incidentLocations}}, "PUT");
+        }} else {{
+          await postAuthoring(`/api/map/entities/${{encodeURIComponent(id)}}`, {{}}, "DELETE");
+        }}
+      }};
+      const placeSelectedFromObservation = async () => {{
+        if (!selectedMapObject || !selectedMapObject.id) {{
+          setMapAuthoringStatus("Select an entity before using an observation", "error");
+          return;
+        }}
+        const observationId = window.prompt("Observation id or blank to use tag id", "");
+        const tagInput = observationId ? "" : window.prompt("Tag id", "");
+        const payload = observationId
+          ? {{observation_id: observationId, kind: entityKindForSelected()}}
+          : {{tag_id: Number(tagInput), kind: entityKindForSelected()}};
+        await postAuthoring(`/api/map/entities/${{encodeURIComponent(selectedMapObject.id)}}/from_observation`, payload);
+      }};
+      const selectedRoute = () => {{
+        const current = mapAuthoring || {{}};
+        const routes = Array.isArray(current.routes) ? current.routes : [];
+        if (!routes.length) return null;
+        return routes.find((route) => route.id === current.selected_route_id) || routes[0];
+      }};
+      const routeIndexForTarget = (route, targetId) => {{
+        if (!route || !Array.isArray(route.waypoints)) return -1;
+        return route.waypoints.findIndex((waypoint) => waypoint.id === targetId || waypoint.target_id === targetId);
+      }};
+      const saveRoutes = async (routes, selectedRouteId = null) => {{
+        const current = mapAuthoring || {{}};
+        await postAuthoring("/api/map/authoring", {{
+          ...current,
+          routes,
+          selected_route_id: selectedRouteId || current.selected_route_id || (routes[0] && routes[0].id) || null,
+        }}, "PUT");
+      }};
+      const removeRouteWaypoint = async (targetId) => {{
+        const current = mapAuthoring || {{}};
+        const routes = Array.isArray(current.routes) ? [...current.routes] : [];
+        const route = routes.find((item) => item.id === current.selected_route_id) || routes[0];
+        const routeIndex = routes.indexOf(route);
+        if (!route || routeIndex < 0) return;
+        route.waypoints = (route.waypoints || []).filter((waypoint) => waypoint.id !== targetId && waypoint.target_id !== targetId);
+        routes[routeIndex] = route;
+        await saveRoutes(routes, route.id);
+      }};
+      const moveSelectedRouteWaypoint = async (direction) => {{
+        if (!selectedMapObject || selectedMapObject.kind !== "route_stop") {{
+          setMapAuthoringStatus("Select a route waypoint first", "error");
+          return;
+        }}
+        const current = mapAuthoring || {{}};
+        const routes = Array.isArray(current.routes) ? [...current.routes] : [];
+        const route = routes.find((item) => item.id === current.selected_route_id) || routes[0];
+        const routeIndex = routes.indexOf(route);
+        const waypointIndex = routeIndex >= 0 ? routeIndexForTarget(route, selectedMapObject.id) : -1;
+        const nextIndex = waypointIndex + direction;
+        if (!route || waypointIndex < 0 || nextIndex < 0 || nextIndex >= route.waypoints.length) return;
+        const waypoints = [...route.waypoints];
+        [waypoints[waypointIndex], waypoints[nextIndex]] = [waypoints[nextIndex], waypoints[waypointIndex]];
+        route.waypoints = waypoints;
+        routes[routeIndex] = route;
+        await saveRoutes(routes, route.id);
+      }};
+      const selectRouteByPrompt = async () => {{
+        const current = mapAuthoring || {{}};
+        const routes = Array.isArray(current.routes) ? current.routes : [];
+        const routeId = window.prompt("Route id", current.selected_route_id || (routes[0] && routes[0].id) || "AUTHORED_ROUTE");
+        if (!routeId) return;
+        await postAuthoring(`/api/map/routes/${{encodeURIComponent(routeId)}}/select`, {{}});
+      }};
+      const mapEditId = (prefix) => `${{prefix}}-${{Date.now().toString(36)}}`;
+      const applyMapEditAt = async (target) => {{
+        const pose = authoringPoint(target);
+        if (mapEditMode === "home") {{
+          const current = mapAuthoring || {{}};
+          await postAuthoring("/api/map/authoring", {{...current, home: pose}}, "PUT");
+        }} else if (mapEditMode === "zone") {{
+          const label = window.prompt("Label name", "CHECKPOINT");
+          if (!label) return;
+          await postAuthoring("/api/map/entities", {{
+            id: label.trim().replace(/\\s+/g, "_").toUpperCase(),
+            kind: "checkpoint",
+            label,
+            pose,
+          }});
+        }} else if (mapEditMode === "asset") {{
+          const label = window.prompt("Asset id", "ASSET_1");
+          if (!label) return;
+          await postAuthoring("/api/map/entities", {{
+            id: label.trim().replace(/\\s+/g, "_").toUpperCase(),
+            kind: "asset",
+            label,
+            pose,
+          }});
+        }} else if (mapEditMode === "package") {{
+          const label = window.prompt("Package id", "PKG-NEW");
+          if (!label) return;
+          await postAuthoring("/api/map/entities", {{
+            id: label.trim().replace(/\\s+/g, "_").toUpperCase(),
+            kind: "package",
+            label,
+            pose,
+          }});
+        }} else if (mapEditMode === "no_go") {{
+          const size = 0.5;
+          await postAuthoring("/api/map/no_go_shapes", {{
+            id: mapEditId("NO_GO"),
+            label: "Authored No-Go",
+            shape: "rectangle",
+            points: [
+              {{...pose, x: pose.x - size, y: pose.y - size}},
+              {{...pose, x: pose.x + size, y: pose.y + size}},
+            ],
+            enabled: true,
+            dimos_constraint_status: "not_supported",
+          }});
+        }} else if (mapEditMode === "route") {{
+          const current = mapAuthoring || {{}};
+          const routes = Array.isArray(current.routes) ? [...current.routes] : [];
+          const route = routes[0] || {{id: "AUTHORED_ROUTE", label: "Authored Route", waypoints: [], mission_id: null}};
+          route.waypoints = [...(route.waypoints || []), {{
+            id: mapEditId("WP"),
+            label: `Waypoint ${{(route.waypoints || []).length + 1}}`,
+            pose,
+            target_id: null,
+            required: true,
+          }}];
+          routes[0] = route;
+          await postAuthoring("/api/map/authoring", {{...current, routes}}, "PUT");
+        }} else if (mapEditMode === "incident") {{
+          const incidentId = window.prompt("Incident id", "INC-001");
+          if (!incidentId) return;
+          await postAuthoring(`/api/map/incidents/${{encodeURIComponent(incidentId)}}/location`, {{
+            pose,
+            evidence_observation_ids: [],
+          }});
+        }} else if (mapEditMode === "tag") {{
+          const tagId = Number(window.prompt("Tag id", "999"));
+          const entityId = window.prompt("Entity id", "CHECKPOINT");
+          if (!Number.isFinite(tagId) || !entityId) return;
+          await postAuthoring("/api/map/tag_bindings", {{
+            tag_id: tagId,
+            entity_id: entityId.trim(),
+            label: entityId.trim(),
+            binding_kind: "checkpoint",
+          }});
+        }}
       }};
       const setLiveMapUnavailable = (text, keepRobot = false) => {{
         if (liveMapStatus) liveMapStatus.textContent = text;
@@ -1506,7 +1979,37 @@ def render_dashboard_html(
         }});
       }}
       if (liveMapSvg) {{
+        liveMapSvg.addEventListener("mousedown", (event) => {{
+          if (mapEditMode !== "select") return;
+          const item = selectMapObject(event.target);
+          if (!item || !["zone", "asset", "package"].includes(item.kind)) return;
+          dragMapObject = item;
+        }});
+        liveMapSvg.addEventListener("mouseup", async (event) => {{
+          if (!dragMapObject) return;
+          const item = dragMapObject;
+          dragMapObject = null;
+          const target = worldFromSvgEvent(event);
+          if (!target) return;
+          await postAuthoring(`/api/map/entities/${{encodeURIComponent(item.id)}}`, {{
+            id: item.id,
+            kind: item.kind,
+            label: item.id,
+            pose: authoringPoint(target),
+          }}, "PUT");
+        }});
         liveMapSvg.addEventListener("click", async (event) => {{
+          if (mapEditMode !== "select") {{
+            event.preventDefault();
+            const target = worldFromSvgEvent(event);
+            if (!target) {{
+              setMapAuthoringStatus("Map edit target unavailable", "error");
+              return;
+            }}
+            await applyMapEditAt(target);
+            return;
+          }}
+          if (selectMapObject(event.target)) return;
           if (!goToArmed) return;
           event.preventDefault();
           const target = worldFromSvgEvent(event);
@@ -1573,6 +2076,54 @@ def render_dashboard_html(
             setGoToArmed(!goToArmed);
           }}
           await refreshLiveMap();
+        }});
+      }}
+      if (mapEditControls) {{
+        mapEditControls.addEventListener("click", async (event) => {{
+          const modeButton = event.target.closest("button[data-map-edit-mode]");
+          if (modeButton) {{
+            setGoToArmed(false);
+            setMapEditMode(modeButton.getAttribute("data-map-edit-mode") || "select");
+            modeButton.blur();
+            return;
+          }}
+          const actionButton = event.target.closest("button[data-map-edit-action]");
+          if (!actionButton) return;
+          const action = actionButton.getAttribute("data-map-edit-action");
+          actionButton.blur();
+          if (action === "save") {{
+            const current = mapAuthoring || {{}};
+            await postAuthoring("/api/map/authoring", current, "PUT");
+          }} else if (action === "reset") {{
+            if (!window.confirm("Remove all authored map edits for this run?")) return;
+            await postAuthoring("/api/map/authoring", {{
+              schema_version: 1,
+              site_id: "",
+              frame: "world",
+              entities: [],
+              no_go_shapes: [],
+              routes: [],
+              incident_locations: [],
+              tag_bindings: [],
+            }}, "PUT");
+          }} else if (action === "export") {{
+            const result = await postAuthoring("/api/map/export", {{}});
+            if (result && result.exports) {{
+              setMapAuthoringStatus("Map authoring exported to run exports directory", "ok");
+            }}
+          }} else if (action === "delete_selected") {{
+            await deleteSelectedMapObject();
+          }} else if (action === "use_observation") {{
+            await placeSelectedFromObservation();
+          }} else if (action === "route_select") {{
+            await selectRouteByPrompt();
+          }} else if (action === "route_up") {{
+            await moveSelectedRouteWaypoint(-1);
+          }} else if (action === "route_down") {{
+            await moveSelectedRouteWaypoint(1);
+          }} else if (action === "publish_no_go") {{
+            await postAuthoring("/api/map/no_go_shapes/publish", {{}});
+          }}
         }});
       }}
       if (layerControls) {{
@@ -1862,11 +2413,54 @@ def _render_no_go_zone(projector: _MapProjector, zone: dict[str, Any]) -> str:
     height = radius * 1.25
     title = escape(str(zone.get("display_name") or zone["id"]))
     return (
-        f'<g><title>{title}</title>'
+        f'<g data-edit-kind="zone" data-edit-id="{escape(str(zone["id"]))}"><title>{title}</title>'
         f'<rect class="map-no-go" x="{x - width / 2:.1f}" y="{y - height / 2:.1f}" '
         f'width="{width:.1f}" height="{height:.1f}" rx="4" />'
         f'<rect class="map-no-go-hatch" x="{x - width / 2:.1f}" y="{y - height / 2:.1f}" '
         f'width="{width:.1f}" height="{height:.1f}" rx="4" />'
+        "</g>"
+    )
+
+
+def _render_no_go_shape(projector: _MapProjector, shape: dict[str, Any]) -> str:
+    if not isinstance(shape, dict) or not shape.get("enabled", True):
+        return ""
+    points = [_authoring_pose(point) for point in shape.get("points") or []]
+    points = [point for point in points if point is not None]
+    if len(points) < 2:
+        return ""
+    title = escape(
+        f"{shape.get('label') or shape.get('id') or 'No-go shape'} / "
+        f"{shape.get('dimos_constraint_status') or 'not_supported'}"
+    )
+    if shape.get("shape") == "rectangle":
+        xs = [point[0] for point in points]
+        ys = [point[1] for point in points]
+        x1 = projector.x(min(xs))
+        x2 = projector.x(max(xs))
+        y1 = projector.y(max(ys))
+        y2 = projector.y(min(ys))
+        x = min(x1, x2)
+        y = min(y1, y2)
+        width = abs(x2 - x1)
+        height = abs(y2 - y1)
+        return (
+            f'<g data-edit-kind="no_go_shape" data-edit-id="{escape(str(shape.get("id") or ""))}" '
+            f'data-authored-no-go="{escape(str(shape.get("id") or ""))}"><title>{title}</title>'
+            f'<rect class="map-no-go" x="{x:.1f}" y="{y:.1f}" '
+            f'width="{width:.1f}" height="{height:.1f}" rx="4" />'
+            f'<rect class="map-no-go-hatch" x="{x:.1f}" y="{y:.1f}" '
+            f'width="{width:.1f}" height="{height:.1f}" rx="4" />'
+            "</g>"
+        )
+    svg_points = " ".join(
+        f"{projector.x(point[0]):.1f},{projector.y(point[1]):.1f}" for point in points
+    )
+    return (
+        f'<g data-edit-kind="no_go_shape" data-edit-id="{escape(str(shape.get("id") or ""))}" '
+        f'data-authored-no-go="{escape(str(shape.get("id") or ""))}"><title>{title}</title>'
+        f'<polygon class="map-no-go" points="{svg_points}" />'
+        f'<polygon class="map-no-go-hatch" points="{svg_points}" />'
         "</g>"
     )
 
@@ -1877,7 +2471,7 @@ def _render_zone(projector: _MapProjector, zone: dict[str, Any]) -> str:
     label = escape(str(zone["id"]))
     title = escape(str(zone.get("display_name") or zone["id"]))
     return (
-        f'<g><title>{title}</title>'
+        f'<g data-edit-kind="zone" data-edit-id="{escape(str(zone["id"]))}"><title>{title}</title>'
         f'<line class="map-zone-anchor" x1="{x - 8:.1f}" y1="{y:.1f}" x2="{x + 8:.1f}" y2="{y:.1f}" />'
         f'<line class="map-zone-anchor" x1="{x:.1f}" y1="{y - 8:.1f}" x2="{x:.1f}" y2="{y + 8:.1f}" />'
         f'<circle class="map-zone-anchor" cx="{x:.1f}" cy="{y:.1f}" r="4.5" />'
@@ -1892,7 +2486,7 @@ def _render_asset(projector: _MapProjector, asset: dict[str, Any]) -> str:
     label = escape(str(asset["id"]))
     title = escape(str(asset.get("display_name") or asset["id"]))
     return (
-        f'<g><title>{title}</title>'
+        f'<g data-edit-kind="asset" data-edit-id="{escape(str(asset["id"]))}"><title>{title}</title>'
         f'<rect class="map-asset" x="{x - 7:.1f}" y="{y - 7:.1f}" width="14" height="14" rx="2" />'
         f'<rect class="map-tag-face" x="{x - 3:.1f}" y="{y - 3:.1f}" width="6" height="6" />'
         f'<text class="map-asset-label" x="{x + 10:.1f}" y="{y + 4:.1f}">{label}</text>'
@@ -1907,7 +2501,7 @@ def _render_package(projector: _MapProjector, package: dict[str, Any]) -> str:
     label = escape(str(package["id"]))
     title = escape(f"{package['id']} / {state}")
     return (
-        f'<g><title>{title}</title>'
+        f'<g data-edit-kind="package" data-edit-id="{escape(str(package["id"]))}"><title>{title}</title>'
         f'<rect class="map-package state-{escape(state)}" x="{x - 7:.1f}" y="{y - 7:.1f}" '
         f'width="14" height="14" rx="2" transform="rotate(45 {x:.1f} {y:.1f})" />'
         f'<text class="map-package-label" x="{x + 11:.1f}" y="{y + 4:.1f}">{label}</text>'
@@ -1923,7 +2517,7 @@ def _render_observation(projector: _MapProjector, observation: dict[str, Any]) -
         f"{observation.get('id')} tags {','.join(str(tag) for tag in observation['visible_tag_ids'])}"
     )
     return (
-        f'<g><title>{title}</title>'
+        f'<g data-edit-kind="observation" data-edit-id="{escape(str(observation["id"]))}"><title>{title}</title>'
         f'<circle class="map-observation" cx="{zone_x:.1f}" cy="{zone_y:.1f}" r="5.5" />'
         f'<text class="map-asset-label" x="{zone_x + 8:.1f}" y="{zone_y - 7:.1f}">{label}</text>'
         "</g>"
@@ -1938,7 +2532,7 @@ def _render_incident(projector: _MapProjector, incident: dict[str, Any]) -> str:
         f"{incident.get('id')} {incident.get('severity')} {incident.get('state')}"
     )
     return (
-        f'<g><title>{title}</title>'
+        f'<g data-edit-kind="incident" data-edit-id="{escape(str(incident["id"]))}"><title>{title}</title>'
         f'<circle class="map-incident" cx="{x:.1f}" cy="{y:.1f}" r="15" />'
         f'<text class="map-incident-label" x="{x + 14:.1f}" y="{y - 13:.1f}">{label}</text>'
         "</g>"
@@ -1950,7 +2544,7 @@ def _render_route_stop(projector: _MapProjector, stop: dict[str, Any], index: in
     y = projector.y(float(stop["y"]))
     title = escape(str(stop.get("target_id") or "route stop"))
     return (
-        f'<g><title>{title}</title>'
+        f'<g data-edit-kind="route_stop" data-edit-id="{escape(str(stop.get("target_id") or ""))}"><title>{title}</title>'
         f'<circle class="map-route-stop" cx="{x:.1f}" cy="{y:.1f}" r="9" />'
         f'<text class="map-route-index" x="{x:.1f}" y="{y + 1:.1f}">{index}</text>'
         "</g>"
@@ -2137,9 +2731,18 @@ def write_dashboard_html(run_dir: str | Path, *, robot_control_token: str | None
     root = Path(run_dir)
     state = _read_json(root / "state.json")
     report = _read_json(root / "report.json")
+    authoring = load_map_authoring(
+        root,
+        site_id=str((state.get("site") or {}).get("site_id") or ""),
+    ).model_dump(mode="json")
     html_path = root / "dashboard.html"
     html_path.write_text(
-        render_dashboard_html(state, report, robot_control_token=robot_control_token),
+        render_dashboard_html(
+            state,
+            report,
+            robot_control_token=robot_control_token,
+            authoring=authoring,
+        ),
         encoding="utf-8",
     )
     return html_path

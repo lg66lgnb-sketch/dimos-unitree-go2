@@ -19,6 +19,8 @@ import time
 from typing import Any
 from urllib.parse import urlparse
 
+from pydantic import ValidationError
+
 from dimos.experimental.dogops.dashboard_static import (
     build_map_data,
     build_poi_data,
@@ -26,6 +28,29 @@ from dimos.experimental.dogops.dashboard_static import (
     write_dashboard_html,
 )
 from dimos.experimental.dogops.live_map import DogOpsLiveMapAdapter
+from dimos.experimental.dogops.map_authoring import (
+    EditableIncidentLocation,
+    EditableMapEntity,
+    EditableNoGoShape,
+    EditableRoute,
+    EditableTagBinding,
+    MapAuthoringState,
+    delete_entity,
+    delete_no_go_shape,
+    delete_route,
+    delete_tag_binding,
+    export_authoring_yaml,
+    load_map_authoring,
+    replace_entity,
+    replace_incident_location,
+    replace_no_go_shape,
+    replace_route,
+    replace_tag_binding,
+    save_map_authoring,
+    select_route,
+    publish_no_go_constraints,
+    validation_error_message,
+)
 from dimos.experimental.dogops.store import DogOpsStore
 
 try:  # pragma: no cover - exercised only inside a full DimOS checkout.
@@ -75,6 +100,7 @@ DEFAULT_ROBOT_IP = (
 )
 _ROBOT_SESSIONS: dict[str, _RobotMotionSession] = {}
 _ROBOT_SESSIONS_LOCK = threading.Lock()
+_AUTHORING_LOCK = threading.Lock()
 _LIVE_MAP_ADAPTER = DogOpsLiveMapAdapter()
 
 
@@ -175,14 +201,26 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/map":
             state = self._read_json(self.run_dir / "state.json")
             report = self._read_json(self.run_dir / "report.json")
-            self._send_json(build_map_data(state, report, live_overlay=_LIVE_MAP_ADAPTER.snapshot()))
+            authoring = self._load_authoring(state)
+            self._send_json(
+                build_map_data(
+                    state,
+                    report,
+                    live_overlay=_LIVE_MAP_ADAPTER.snapshot(),
+                    authoring=authoring.model_dump(mode="json"),
+                )
+            )
+        elif path == "/api/map/authoring":
+            state = self._read_json(self.run_dir / "state.json")
+            self._send_json(self._load_authoring(state).model_dump(mode="json"))
         elif path == "/api/robot/pose":
             if self._authorize_local_read():
                 self._send_json(_robot_pose_snapshot(self.robot_ip))
         elif path == "/api/route":
             state = self._read_json(self.run_dir / "state.json")
             report = self._read_json(self.run_dir / "report.json")
-            self._send_json(build_route_data(state, report))
+            authoring = self._load_authoring(state)
+            self._send_json(build_route_data(state, report, authoring=authoring.model_dump(mode="json")))
         elif path == "/api/poi":
             state = self._read_json(self.run_dir / "state.json")
             report = self._read_json(self.run_dir / "report.json")
@@ -212,11 +250,273 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/robot/map_origin":
             if self._authorize_robot_control():
                 self._robot_map_origin()
+        elif path == "/api/map/entities":
+            self._upsert_map_entity()
+        elif path == "/api/map/no_go_shapes":
+            self._upsert_no_go_shape()
+        elif path == "/api/map/routes":
+            self._upsert_map_route()
+        elif path.startswith("/api/map/incidents/") and path.endswith("/location"):
+            parts = path.split("/")
+            incident_id = parts[4] if len(parts) >= 6 else ""
+            self._upsert_incident_location(incident_id)
+        elif path == "/api/map/tag_bindings":
+            self._upsert_tag_binding()
+        elif path == "/api/map/export":
+            self._export_map_authoring()
+        elif path == "/api/map/no_go_shapes/publish":
+            self._publish_no_go_shapes()
+        elif path.startswith("/api/map/entities/") and path.endswith("/from_observation"):
+            parts = path.split("/")
+            entity_id = parts[4] if len(parts) >= 6 else ""
+            self._place_entity_from_observation(entity_id)
+        elif path.startswith("/api/map/routes/") and path.endswith("/select"):
+            parts = path.split("/")
+            route_id = parts[4] if len(parts) >= 6 else ""
+            self._select_map_route(route_id)
+        else:
+            self._send_json({"error": "not_found", "path": path}, HTTPStatus.NOT_FOUND)
+
+    def do_PUT(self) -> None:
+        path = urlparse(self.path).path
+        if path == "/api/map/authoring":
+            self._replace_map_authoring()
+        elif path.startswith("/api/map/entities/"):
+            self._upsert_map_entity(path.split("/")[-1])
+        elif path.startswith("/api/map/no_go_shapes/"):
+            self._upsert_no_go_shape(path.split("/")[-1])
+        elif path.startswith("/api/map/routes/"):
+            self._upsert_map_route(path.split("/")[-1])
+        else:
+            self._send_json({"error": "not_found", "path": path}, HTTPStatus.NOT_FOUND)
+
+    def do_DELETE(self) -> None:
+        path = urlparse(self.path).path
+        if path.startswith("/api/map/entities/"):
+            self._delete_map_entity(path.split("/")[-1])
+        elif path.startswith("/api/map/no_go_shapes/"):
+            self._delete_no_go_shape(path.split("/")[-1])
+        elif path.startswith("/api/map/routes/"):
+            self._delete_map_route(path.split("/")[-1])
+        elif path.startswith("/api/map/tag_bindings/"):
+            self._delete_tag_binding(path.split("/")[-1])
         else:
             self._send_json({"error": "not_found", "path": path}, HTTPStatus.NOT_FOUND)
 
     def log_message(self, format: str, *args: object) -> None:
         return
+
+    def _load_authoring(self, state: dict[str, Any] | None = None) -> MapAuthoringState:
+        if state is None:
+            state = self._read_json(self.run_dir / "state.json")
+        site_id = str((state.get("site") or {}).get("site_id") or "")
+        return load_map_authoring(self.run_dir, site_id=site_id)
+
+    def _send_authoring(self, authoring: MapAuthoringState) -> None:
+        state = self._read_json(self.run_dir / "state.json")
+        report = self._read_json(self.run_dir / "report.json")
+        payload = authoring.model_dump(mode="json")
+        self._send_json(
+            {
+                "ok": True,
+                "authoring": payload,
+                "map": build_map_data(
+                    state,
+                    report,
+                    live_overlay=_LIVE_MAP_ADAPTER.snapshot(),
+                    authoring=payload,
+                ),
+            }
+        )
+
+    def _handle_authoring_error(self, exc: Exception) -> None:
+        message = (
+            validation_error_message(exc)
+            if isinstance(exc, (ValidationError, ValueError))
+            else str(exc)
+        )
+        self._send_json(
+            {"ok": False, "error": "invalid_map_authoring", "message": message},
+            HTTPStatus.BAD_REQUEST,
+        )
+
+    def _persist_authoring_mutation(self, mutate: Any) -> MapAuthoringState:
+        with _AUTHORING_LOCK:
+            authoring = mutate(self._load_authoring())
+            save_map_authoring(self.run_dir, authoring)
+            return authoring
+
+    def _replace_map_authoring(self) -> None:
+        state = self._read_json(self.run_dir / "state.json")
+        payload = self._read_body_json()
+        payload.setdefault("site_id", str((state.get("site") or {}).get("site_id") or ""))
+        try:
+            authoring = MapAuthoringState.model_validate(payload)
+            with _AUTHORING_LOCK:
+                save_map_authoring(self.run_dir, authoring)
+        except (ValidationError, ValueError) as exc:
+            self._handle_authoring_error(exc)
+            return
+        self._send_authoring(authoring)
+
+    def _upsert_map_entity(self, entity_id: str | None = None) -> None:
+        payload = self._read_body_json()
+        if entity_id:
+            payload["id"] = entity_id
+        try:
+            entity = EditableMapEntity.model_validate(payload)
+            authoring = self._persist_authoring_mutation(
+                lambda existing: replace_entity(existing, entity)
+            )
+        except (ValidationError, ValueError) as exc:
+            self._handle_authoring_error(exc)
+            return
+        self._send_authoring(authoring)
+
+    def _place_entity_from_observation(self, entity_id: str) -> None:
+        payload = self._read_body_json()
+        state = self._read_json(self.run_dir / "state.json")
+        try:
+            observation = _resolve_observation(state, payload)
+            pose = _observation_pose(state, observation)
+            existing = _authored_or_site_entity(state, self._load_authoring(), entity_id)
+            if existing is None:
+                existing = {
+                    "id": entity_id,
+                    "kind": str(payload.get("kind") or "checkpoint"),
+                    "label": entity_id,
+                }
+            existing["pose"] = {
+                "x": pose[0],
+                "y": pose[1],
+                "theta_deg": pose[2],
+                "source": "observation",
+            }
+            if observation.get("tag_id") is not None:
+                existing["tag_id"] = observation.get("tag_id")
+            entity = EditableMapEntity.model_validate(existing)
+            authoring = self._persist_authoring_mutation(
+                lambda current: replace_entity(current, entity)
+            )
+        except (ValidationError, ValueError) as exc:
+            self._handle_authoring_error(exc)
+            return
+        self._send_authoring(authoring)
+
+    def _delete_map_entity(self, entity_id: str) -> None:
+        authoring = self._persist_authoring_mutation(
+            lambda existing: delete_entity(existing, entity_id)
+        )
+        self._send_authoring(authoring)
+
+    def _upsert_no_go_shape(self, shape_id: str | None = None) -> None:
+        payload = self._read_body_json()
+        if shape_id:
+            payload["id"] = shape_id
+        payload.setdefault("dimos_constraint_status", "not_supported")
+        try:
+            shape = EditableNoGoShape.model_validate(payload)
+            authoring = self._persist_authoring_mutation(
+                lambda existing: replace_no_go_shape(existing, shape)
+            )
+        except (ValidationError, ValueError) as exc:
+            self._handle_authoring_error(exc)
+            return
+        self._send_authoring(authoring)
+
+    def _delete_no_go_shape(self, shape_id: str) -> None:
+        authoring = self._persist_authoring_mutation(
+            lambda existing: delete_no_go_shape(existing, shape_id)
+        )
+        self._send_authoring(authoring)
+
+    def _upsert_map_route(self, route_id: str | None = None) -> None:
+        payload = self._read_body_json()
+        if route_id:
+            payload["id"] = route_id
+        try:
+            route = EditableRoute.model_validate(payload)
+            authoring = self._persist_authoring_mutation(
+                lambda existing: replace_route(existing, route)
+            )
+        except (ValidationError, ValueError) as exc:
+            self._handle_authoring_error(exc)
+            return
+        self._send_authoring(authoring)
+
+    def _delete_map_route(self, route_id: str) -> None:
+        authoring = self._persist_authoring_mutation(
+            lambda existing: delete_route(existing, route_id)
+        )
+        self._send_authoring(authoring)
+
+    def _select_map_route(self, route_id: str) -> None:
+        try:
+            authoring = self._persist_authoring_mutation(
+                lambda existing: select_route(existing, route_id)
+            )
+        except (ValidationError, ValueError) as exc:
+            self._handle_authoring_error(exc)
+            return
+        self._send_authoring(authoring)
+
+    def _upsert_incident_location(self, incident_id: str) -> None:
+        payload = self._read_body_json()
+        payload["incident_id"] = incident_id or payload.get("incident_id")
+        try:
+            location = EditableIncidentLocation.model_validate(payload)
+            authoring = self._persist_authoring_mutation(
+                lambda existing: replace_incident_location(existing, location)
+            )
+        except (ValidationError, ValueError) as exc:
+            self._handle_authoring_error(exc)
+            return
+        self._send_authoring(authoring)
+
+    def _upsert_tag_binding(self) -> None:
+        payload = self._read_body_json()
+        try:
+            binding = EditableTagBinding.model_validate(payload)
+
+            def add_binding(existing: MapAuthoringState) -> MapAuthoringState:
+                if any(item.tag_id == binding.tag_id for item in existing.tag_bindings):
+                    raise ValueError(f"duplicate tag id: {binding.tag_id}")
+                return replace_tag_binding(existing, binding)
+
+            authoring = self._persist_authoring_mutation(add_binding)
+        except (ValidationError, ValueError) as exc:
+            self._handle_authoring_error(exc)
+            return
+        self._send_authoring(authoring)
+
+    def _delete_tag_binding(self, tag_id: str) -> None:
+        try:
+            parsed_tag_id = int(tag_id)
+        except ValueError:
+            self._send_json(
+                {"ok": False, "error": "invalid_tag_id", "tag_id": tag_id},
+                HTTPStatus.BAD_REQUEST,
+            )
+            return
+        authoring = self._persist_authoring_mutation(
+            lambda existing: delete_tag_binding(existing, parsed_tag_id)
+        )
+        self._send_authoring(authoring)
+
+    def _export_map_authoring(self) -> None:
+        authoring = self._load_authoring()
+        paths = export_authoring_yaml(self.run_dir, authoring)
+        self._send_json({"ok": True, "exports": paths})
+
+    def _publish_no_go_shapes(self) -> None:
+        try:
+            with _AUTHORING_LOCK:
+                authoring = publish_no_go_constraints(self._load_authoring())
+                save_map_authoring(self.run_dir, authoring)
+        except (ValidationError, ValueError) as exc:
+            self._handle_authoring_error(exc)
+            return
+        self._send_authoring(authoring)
 
     def _mark_work_order_ready(self, work_order_id: str) -> None:
         store = DogOpsStore.load_existing(self.run_dir)
@@ -343,7 +643,7 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         payload = self._read_body_json()
         try:
             x, y = _go_to_target(payload)
-        except ValueError as exc:
+        except (ValidationError, ValueError) as exc:
             self._send_json(
                 {"ok": False, "error": "invalid_go_to_target", "message": str(exc)},
                 HTTPStatus.BAD_REQUEST,
@@ -508,6 +808,87 @@ def _run_robot_call(fn: Any) -> Any:
     if "error" in result:
         raise result["error"]
     return result.get("value")
+
+
+def _resolve_observation(state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    observations = state.get("observations") or []
+    observation_id = payload.get("observation_id")
+    tag_id = payload.get("tag_id")
+    for observation in reversed(observations):
+        if observation_id and observation.get("id") == observation_id:
+            return observation
+        if tag_id is not None and observation.get("tag_id") == int(tag_id):
+            return observation
+        visible_tags = (observation.get("facts") or {}).get("visible_tag_ids")
+        if tag_id is not None and _tag_id_in_visible_tags(int(tag_id), visible_tags):
+            return observation
+    raise ValueError("matching observation not found")
+
+
+def _observation_pose(
+    state: dict[str, Any],
+    observation: dict[str, Any],
+) -> tuple[float, float, float | None]:
+    pose = observation.get("pose") or {}
+    x = _finite_or_none(pose.get("x"))
+    y = _finite_or_none(pose.get("y"))
+    theta = _finite_or_none(pose.get("theta_deg"))
+    if x is not None and y is not None:
+        return x, y, theta
+    zone_id = str(observation.get("zone_id") or "")
+    for zone in (state.get("site") or {}).get("zones") or []:
+        if zone.get("id") != zone_id:
+            continue
+        zone_pose = zone.get("pose_hint") or {}
+        x = _finite_or_none(zone_pose.get("x"))
+        y = _finite_or_none(zone_pose.get("y"))
+        theta = _finite_or_none(zone_pose.get("theta_deg"))
+        if x is not None and y is not None:
+            return x, y, theta
+    raise ValueError("observation has no map pose")
+
+
+def _authored_or_site_entity(
+    state: dict[str, Any],
+    authoring: MapAuthoringState,
+    entity_id: str,
+) -> dict[str, Any] | None:
+    for entity in authoring.entities:
+        if entity.id == entity_id:
+            return entity.model_dump(mode="json")
+    site = state.get("site") or {}
+    for kind, collection in (
+        ("zone", site.get("zones") or []),
+        ("asset", site.get("assets") or []),
+        ("package", site.get("packages") or []),
+    ):
+        for item in collection:
+            if item.get("id") != entity_id:
+                continue
+            return {
+                "id": entity_id,
+                "kind": kind,
+                "label": item.get("display_name") or entity_id,
+                "tag_id": item.get("tag_id"),
+                "zone_id": item.get("zone_id") or item.get("expected_zone_id"),
+            }
+    return None
+
+
+def _tag_id_in_visible_tags(tag_id: int, visible_tags: object) -> bool:
+    if isinstance(visible_tags, str):
+        return str(tag_id) in {item.strip() for item in visible_tags.split(",")}
+    if isinstance(visible_tags, list):
+        return any(str(item) == str(tag_id) for item in visible_tags)
+    return False
+
+
+def _finite_or_none(value: Any) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
 
 
 def _resolve_motion_request(
