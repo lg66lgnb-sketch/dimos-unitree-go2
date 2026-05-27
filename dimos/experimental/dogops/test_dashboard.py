@@ -63,6 +63,8 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert "Inspection points" in content
     assert "<span>Mode</span><strong>Real dog</strong>" in content
     assert 'data-map-viewer' in content
+    assert 'data-mission-map' in content
+    assert content.index('data-map-viewer') < content.index('data-mission-map')
     assert 'data-rerun-source-url="rerun+http://127.0.0.1:9877/proxy"' in content
     assert 'data-rerun-view-mode="dogops-2d"' in content
     assert 'data-rerun-embed-url=""' in content
@@ -73,7 +75,8 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert 'data-viewer-offline' in content
     assert 'class="map-target-overlay" data-route-map' in content
     assert "data-viewer-offline data-route-map" not in content
-    assert "Offline map artifact" in content
+    assert "Mission Map" in content
+    assert "Rerun above remains the live map surface." in content
     assert "Inspection Evidence" in content
     assert 'data-route-action="explore"' in content
     assert 'data-route-action="stop-explore"' in content

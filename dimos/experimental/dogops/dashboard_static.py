@@ -626,6 +626,23 @@ def render_dashboard_html(
       background: #f8fafc;
       overflow: hidden;
     }}
+    .mission-map-panel {{
+      border-top: 1px solid var(--line);
+      background: #ffffff;
+      padding: 12px;
+    }}
+    .mission-map-panel h3 {{
+      margin: 0 0 4px;
+      font-size: 14px;
+    }}
+    .mission-map-panel p {{
+      margin: 0 0 10px;
+      color: var(--muted);
+      font-size: 12px;
+    }}
+    .mission-map-panel .map-viz {{
+      min-height: 360px;
+    }}
     .route-tools {{
       display: grid;
       gap: 10px;
@@ -1326,10 +1343,11 @@ def map_viewer_panel(
         "<span data-rerun-status>Connecting to Rerun...</span>"
         "</div>"
         "</div>"
-        '<details class="offline-snapshot">'
-        "<summary>Offline map artifact</summary>"
+        '<div class="mission-map-panel" data-mission-map>'
+        "<h3>Mission Map</h3>"
+        "<p>DimOS/DogOps map artifact and route plan. Rerun above remains the live map surface.</p>"
         f'<div class="map-viz">{map_svg(site_map, route_plan)}</div>'
-        "</details>"
+        "</div>"
         "</div>"
     )
 
