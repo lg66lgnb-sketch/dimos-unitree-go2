@@ -1536,7 +1536,10 @@ def render_dashboard_html(
         try {{
           const response = await fetch(url, {{
             method,
-            headers: {{"Content-Type": "application/json"}},
+            headers: {{
+              "Content-Type": "application/json",
+              "X-DogOps-Control-Token": robotControlToken,
+            }},
             body: JSON.stringify(body),
           }});
           const result = await response.json();

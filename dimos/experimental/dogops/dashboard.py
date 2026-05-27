@@ -251,55 +251,72 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
             if self._authorize_robot_control():
                 self._robot_map_origin()
         elif path == "/api/map/entities":
-            self._upsert_map_entity()
+            if self._authorize_map_authoring_write():
+                self._upsert_map_entity()
         elif path == "/api/map/no_go_shapes":
-            self._upsert_no_go_shape()
+            if self._authorize_map_authoring_write():
+                self._upsert_no_go_shape()
         elif path == "/api/map/routes":
-            self._upsert_map_route()
+            if self._authorize_map_authoring_write():
+                self._upsert_map_route()
         elif path.startswith("/api/map/incidents/") and path.endswith("/location"):
-            parts = path.split("/")
-            incident_id = parts[4] if len(parts) >= 6 else ""
-            self._upsert_incident_location(incident_id)
+            if self._authorize_map_authoring_write():
+                parts = path.split("/")
+                incident_id = parts[4] if len(parts) >= 6 else ""
+                self._upsert_incident_location(incident_id)
         elif path == "/api/map/tag_bindings":
-            self._upsert_tag_binding()
+            if self._authorize_map_authoring_write():
+                self._upsert_tag_binding()
         elif path == "/api/map/export":
-            self._export_map_authoring()
+            if self._authorize_map_authoring_write():
+                self._export_map_authoring()
         elif path == "/api/map/no_go_shapes/publish":
-            self._publish_no_go_shapes()
+            if self._authorize_map_authoring_write():
+                self._publish_no_go_shapes()
         elif path.startswith("/api/map/entities/") and path.endswith("/from_observation"):
-            parts = path.split("/")
-            entity_id = parts[4] if len(parts) >= 6 else ""
-            self._place_entity_from_observation(entity_id)
+            if self._authorize_map_authoring_write():
+                parts = path.split("/")
+                entity_id = parts[4] if len(parts) >= 6 else ""
+                self._place_entity_from_observation(entity_id)
         elif path.startswith("/api/map/routes/") and path.endswith("/select"):
-            parts = path.split("/")
-            route_id = parts[4] if len(parts) >= 6 else ""
-            self._select_map_route(route_id)
+            if self._authorize_map_authoring_write():
+                parts = path.split("/")
+                route_id = parts[4] if len(parts) >= 6 else ""
+                self._select_map_route(route_id)
         else:
             self._send_json({"error": "not_found", "path": path}, HTTPStatus.NOT_FOUND)
 
     def do_PUT(self) -> None:
         path = urlparse(self.path).path
         if path == "/api/map/authoring":
-            self._replace_map_authoring()
+            if self._authorize_map_authoring_write():
+                self._replace_map_authoring()
         elif path.startswith("/api/map/entities/"):
-            self._upsert_map_entity(path.split("/")[-1])
+            if self._authorize_map_authoring_write():
+                self._upsert_map_entity(path.split("/")[-1])
         elif path.startswith("/api/map/no_go_shapes/"):
-            self._upsert_no_go_shape(path.split("/")[-1])
+            if self._authorize_map_authoring_write():
+                self._upsert_no_go_shape(path.split("/")[-1])
         elif path.startswith("/api/map/routes/"):
-            self._upsert_map_route(path.split("/")[-1])
+            if self._authorize_map_authoring_write():
+                self._upsert_map_route(path.split("/")[-1])
         else:
             self._send_json({"error": "not_found", "path": path}, HTTPStatus.NOT_FOUND)
 
     def do_DELETE(self) -> None:
         path = urlparse(self.path).path
         if path.startswith("/api/map/entities/"):
-            self._delete_map_entity(path.split("/")[-1])
+            if self._authorize_map_authoring_write():
+                self._delete_map_entity(path.split("/")[-1])
         elif path.startswith("/api/map/no_go_shapes/"):
-            self._delete_no_go_shape(path.split("/")[-1])
+            if self._authorize_map_authoring_write():
+                self._delete_no_go_shape(path.split("/")[-1])
         elif path.startswith("/api/map/routes/"):
-            self._delete_map_route(path.split("/")[-1])
+            if self._authorize_map_authoring_write():
+                self._delete_map_route(path.split("/")[-1])
         elif path.startswith("/api/map/tag_bindings/"):
-            self._delete_tag_binding(path.split("/")[-1])
+            if self._authorize_map_authoring_write():
+                self._delete_tag_binding(path.split("/")[-1])
         else:
             self._send_json({"error": "not_found", "path": path}, HTTPStatus.NOT_FOUND)
 
@@ -757,6 +774,25 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         provided = self.headers.get(ROBOT_CONTROL_TOKEN_HEADER, "")
         if not secrets.compare_digest(provided, expected):
             self._send_json({"ok": False, "error": "robot_control_forbidden"}, HTTPStatus.FORBIDDEN)
+            return False
+
+        return True
+
+    def _authorize_map_authoring_write(self) -> bool:
+        host = self.headers.get("Host", "")
+        if not _is_loopback_host(_host_name(host)):
+            self._send_json({"ok": False, "error": "map_authoring_local_only"}, HTTPStatus.FORBIDDEN)
+            return False
+
+        origin = self.headers.get("Origin")
+        if origin and not _origin_matches_host(origin, host):
+            self._send_json({"ok": False, "error": "map_authoring_bad_origin"}, HTTPStatus.FORBIDDEN)
+            return False
+
+        expected = self.robot_control_token
+        provided = self.headers.get(ROBOT_CONTROL_TOKEN_HEADER, "")
+        if not secrets.compare_digest(provided, expected):
+            self._send_json({"ok": False, "error": "map_authoring_forbidden"}, HTTPStatus.FORBIDDEN)
             return False
 
         return True

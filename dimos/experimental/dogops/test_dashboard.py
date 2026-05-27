@@ -54,11 +54,17 @@ def _post_json(
         return exc.status, json.loads(exc.read().decode("utf-8"))
 
 
-def _put_json(url: str, payload: dict[str, Any]) -> tuple[int, dict[str, object]]:
+def _put_json(
+    url: str,
+    payload: dict[str, Any],
+    *,
+    headers: dict[str, str] | None = None,
+) -> tuple[int, dict[str, object]]:
+    request_headers = {"Content-Type": "application/json", **(headers or {})}
     request = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers=request_headers,
         method="PUT",
     )
     try:
@@ -68,8 +74,12 @@ def _put_json(url: str, payload: dict[str, Any]) -> tuple[int, dict[str, object]
         return exc.status, json.loads(exc.read().decode("utf-8"))
 
 
-def _delete_json(url: str) -> tuple[int, dict[str, object]]:
-    request = urllib.request.Request(url, method="DELETE")
+def _delete_json(
+    url: str,
+    *,
+    headers: dict[str, str] | None = None,
+) -> tuple[int, dict[str, object]]:
+    request = urllib.request.Request(url, headers=headers or {}, method="DELETE")
     try:
         with urllib.request.urlopen(request, timeout=5) as response:
             return response.status, json.loads(response.read().decode("utf-8"))
@@ -290,6 +300,7 @@ def test_dashboard_map_authoring_endpoints_persist_and_compose(tmp_path) -> None
                 "pose": {"x": 7.0, "y": 8.0, "source": "dashboard_edit"},
                 "tag_id": 222,
             },
+            headers=_robot_headers(server),
         )
         status_shape, shape_result = _post_json(
             f"{base_url}/api/map/no_go_shapes",
@@ -303,6 +314,7 @@ def test_dashboard_map_authoring_endpoints_persist_and_compose(tmp_path) -> None
                 ],
                 "enabled": True,
             },
+            headers=_robot_headers(server),
         )
         status_route, route_result = _post_json(
             f"{base_url}/api/map/routes",
@@ -318,6 +330,7 @@ def test_dashboard_map_authoring_endpoints_persist_and_compose(tmp_path) -> None
                     }
                 ],
             },
+            headers=_robot_headers(server),
         )
         map_data = _get_json(f"{base_url}/api/map")
     finally:
@@ -352,8 +365,16 @@ def test_dashboard_map_authoring_rejects_duplicate_tag_binding(tmp_path) -> None
         "binding_kind": "checkpoint",
     }
     try:
-        first_status, first = _post_json(f"{base_url}/api/map/tag_bindings", payload)
-        second_status, second = _post_json(f"{base_url}/api/map/tag_bindings", payload)
+        first_status, first = _post_json(
+            f"{base_url}/api/map/tag_bindings",
+            payload,
+            headers=_robot_headers(server),
+        )
+        second_status, second = _post_json(
+            f"{base_url}/api/map/tag_bindings",
+            payload,
+            headers=_robot_headers(server),
+        )
     finally:
         server.shutdown()
         server.server_close()
@@ -364,6 +385,65 @@ def test_dashboard_map_authoring_rejects_duplicate_tag_binding(tmp_path) -> None
     assert second_status == 400
     assert second["ok"] is False
     assert second["error"] == "invalid_map_authoring"
+
+
+def test_dashboard_map_authoring_write_requires_token(tmp_path) -> None:
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        status, result = _post_json(
+            f"{base_url}/api/map/entities",
+            {
+                "id": "CHECKPOINT_FORBIDDEN",
+                "kind": "checkpoint",
+                "label": "Checkpoint Forbidden",
+                "pose": {"x": 1.0, "y": 2.0, "source": "dashboard_edit"},
+            },
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 403
+    assert result["ok"] is False
+    assert result["error"] == "map_authoring_forbidden"
+    assert not (run_dir / "map_authoring.json").exists()
+
+
+def test_dashboard_map_authoring_write_rejects_cross_origin(tmp_path) -> None:
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        status, result = _post_json(
+            f"{base_url}/api/map/entities",
+            {
+                "id": "CHECKPOINT_BAD_ORIGIN",
+                "kind": "checkpoint",
+                "label": "Checkpoint Bad Origin",
+                "pose": {"x": 1.0, "y": 2.0, "source": "dashboard_edit"},
+            },
+            headers={**_robot_headers(server), "Origin": "https://example.com"},
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 403
+    assert result["ok"] is False
+    assert result["error"] == "map_authoring_bad_origin"
+    assert not (run_dir / "map_authoring.json").exists()
 
 
 def test_dashboard_map_authoring_delete_and_export(tmp_path) -> None:
@@ -383,11 +463,17 @@ def test_dashboard_map_authoring_delete_and_export(tmp_path) -> None:
                 "label": "Checkpoint Delete",
                 "pose": {"x": 2.0, "y": 3.0, "source": "dashboard_edit"},
             },
+            headers=_robot_headers(server),
         )
         delete_status, delete_result = _delete_json(
-            f"{base_url}/api/map/entities/CHECKPOINT_DELETE"
+            f"{base_url}/api/map/entities/CHECKPOINT_DELETE",
+            headers=_robot_headers(server),
         )
-        export_status, export_result = _post_json(f"{base_url}/api/map/export", {})
+        export_status, export_result = _post_json(
+            f"{base_url}/api/map/export",
+            {},
+            headers=_robot_headers(server),
+        )
     finally:
         server.shutdown()
         server.server_close()
@@ -412,6 +498,7 @@ def test_dashboard_map_authoring_observation_placement_and_route_select(tmp_path
         status_place, placed = _post_json(
             f"{base_url}/api/map/entities/COOLING_1/from_observation",
             {"observation_id": "OBS-003", "kind": "asset"},
+            headers=_robot_headers(server),
         )
         status_route, route_result = _post_json(
             f"{base_url}/api/map/routes",
@@ -427,10 +514,12 @@ def test_dashboard_map_authoring_observation_placement_and_route_select(tmp_path
                     }
                 ],
             },
+            headers=_robot_headers(server),
         )
         status_select, selected = _post_json(
             f"{base_url}/api/map/routes/ROUTE_SELECT/select",
             {},
+            headers=_robot_headers(server),
         )
         map_data = _get_json(f"{base_url}/api/map")
     finally:
@@ -469,8 +558,13 @@ def test_dashboard_no_go_publish_keeps_unsupported_without_publisher(tmp_path) -
                 ],
                 "enabled": True,
             },
+            headers=_robot_headers(server),
         )
-        status, result = _post_json(f"{base_url}/api/map/no_go_shapes/publish", {})
+        status, result = _post_json(
+            f"{base_url}/api/map/no_go_shapes/publish",
+            {},
+            headers=_robot_headers(server),
+        )
     finally:
         server.shutdown()
         server.server_close()
