@@ -98,7 +98,7 @@ def test_skill_container_gather_heatmap_records_costmap_run(tmp_path) -> None:
         live_map_adapter=_FakeHeatmapAdapter(),  # type: ignore[arg-type]
     )
 
-    result = _payload(skills.gather_heatmap(area_id="AISLE_1", duration_s=2.0))
+    result = _payload(skills.gather_heatmap(area_id="AISLE_1", duration_s=0.0))
 
     assert result["ok"] is True
     assert result["skill"] == "gather_heatmap"

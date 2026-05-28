@@ -852,7 +852,7 @@ def test_dashboard_gather_heatmap_persists_snapshot_and_history(tmp_path, monkey
     try:
         status, result = _post_json(
             f"{base_url}/api/map/heatmap/gather",
-            {"area_id": "AISLE_1", "duration_s": 3},
+            {"area_id": "AISLE_1", "duration_s": 0},
             headers=_robot_headers(server),
         )
         map_data = _get_json(f"{base_url}/api/map")

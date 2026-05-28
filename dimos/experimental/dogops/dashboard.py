@@ -557,6 +557,7 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         result = gather_heatmap_run(
             self.run_dir,
             live_snapshot=_LIVE_MAP_ADAPTER.snapshot(),
+            live_snapshot_reader=_LIVE_MAP_ADAPTER.snapshot,
             area_id=area_id,
             duration_s=max(0.0, duration_s),
         )

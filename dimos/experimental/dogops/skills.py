@@ -328,6 +328,7 @@ class DogOpsSkillContainer(Module):
         result = gather_heatmap_run(
             self.run_dir,
             live_snapshot=live_adapter.snapshot(),
+            live_snapshot_reader=live_adapter.snapshot,
             area_id=area_id,
             duration_s=duration_s,
         )

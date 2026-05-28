@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from collections.abc import Callable
 import time
 from types import SimpleNamespace
 from typing import Any, Literal
@@ -16,6 +17,8 @@ HEATMAP_RUN_ID = "GATHER_HEATMAP"
 HEATMAP_RUN_LABEL = "Gather Heatmap"
 HEATMAP_DIRNAME = "heatmaps"
 LATEST_HEATMAP_FILENAME = "latest_heatmap.json"
+MAX_GATHER_DURATION_S = 30.0
+DEFAULT_SAMPLE_INTERVAL_S = 1.0
 
 
 class HeatmapRunEvent(DogOpsModel):
@@ -59,13 +62,25 @@ def gather_heatmap_run(
     run_dir: str | Path,
     *,
     live_snapshot: dict[str, Any],
+    live_snapshot_reader: Callable[[], dict[str, Any]] | None = None,
     area_id: str = "",
     duration_s: float = 0.0,
+    sample_interval_s: float = DEFAULT_SAMPLE_INTERVAL_S,
+    sleep_fn: Callable[[float], None] = time.sleep,
     now: float | None = None,
 ) -> dict[str, Any]:
     root = Path(run_dir)
     started_at = now or time.time()
     route_run_id = new_route_run_id(HEATMAP_RUN_ID, now=started_at)
+    duration_s = min(max(0.0, float(duration_s or 0.0)), MAX_GATHER_DURATION_S)
+    snapshots = _sample_live_snapshots(
+        live_snapshot,
+        live_snapshot_reader=live_snapshot_reader,
+        duration_s=duration_s,
+        sample_interval_s=sample_interval_s,
+        sleep_fn=sleep_fn,
+    )
+    live_snapshot = _merge_live_snapshots(snapshots)
     costmap = live_snapshot.get("costmap") if isinstance(live_snapshot, dict) else None
     cells = costmap.get("cells") if isinstance(costmap, dict) else None
     has_costmap = isinstance(cells, list) and bool(cells)
@@ -233,3 +248,62 @@ def _heatmap_snapshot_payload(
         "target": live_snapshot.get("target"),
         "costmap": costmap,
     }
+
+
+def _sample_live_snapshots(
+    initial_snapshot: dict[str, Any],
+    *,
+    live_snapshot_reader: Callable[[], dict[str, Any]] | None,
+    duration_s: float,
+    sample_interval_s: float,
+    sleep_fn: Callable[[float], None],
+) -> list[dict[str, Any]]:
+    snapshots = [initial_snapshot]
+    if live_snapshot_reader is None or duration_s <= 0:
+        return snapshots
+    interval = max(0.1, float(sample_interval_s or DEFAULT_SAMPLE_INTERVAL_S))
+    deadline = time.time() + duration_s
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        sleep_fn(min(interval, remaining))
+        try:
+            snapshot = live_snapshot_reader()
+        except Exception:
+            continue
+        if isinstance(snapshot, dict):
+            snapshots.append(snapshot)
+    return snapshots
+
+
+def _merge_live_snapshots(snapshots: list[dict[str, Any]]) -> dict[str, Any]:
+    if not snapshots:
+        return {}
+    latest = dict(snapshots[-1])
+    costmaps = [
+        snapshot.get("costmap")
+        for snapshot in snapshots
+        if isinstance(snapshot.get("costmap"), dict)
+    ]
+    if not costmaps:
+        return latest
+    cells_by_key: dict[tuple[float, float, float, float], dict[str, Any]] = {}
+    for costmap in costmaps:
+        for cell in costmap.get("cells") or []:
+            if not isinstance(cell, dict):
+                continue
+            key = (
+                round(float(cell.get("x") or 0.0), 4),
+                round(float(cell.get("y") or 0.0), 4),
+                round(float(cell.get("width") or 0.0), 4),
+                round(float(cell.get("height") or 0.0), 4),
+            )
+            previous = cells_by_key.get(key)
+            if previous is None or float(cell.get("cost") or 0.0) > float(previous.get("cost") or 0.0):
+                cells_by_key[key] = dict(cell)
+    merged_costmap = dict(costmaps[-1])
+    merged_costmap["cells"] = list(cells_by_key.values())
+    latest["costmap"] = merged_costmap
+    latest["samples"] = len(snapshots)
+    return latest
