@@ -163,6 +163,8 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert 'data-map-edit-action="route_down"' in content
     assert 'data-map-edit-action="publish_no_go"' in content
     assert 'data-map-edit-action="export"' in content
+    assert 'data-map-edit-label-row' in content
+    assert 'data-map-edit-route-row' in content
     assert 'data-map-authoring-status' in content
     assert "/api/map/authoring" in content
     assert "/api/map/entities" in content
@@ -270,6 +272,34 @@ def test_dashboard_map_layer_controls_match_svg_layers(tmp_path) -> None:
     assert "if (data.bounds) liveOverlayBounds = data.bounds" in content
     assert "const projectWorldPoint = (x, y) => projectLivePose({x, y})" in content
     assert "const projectLiveOverlayPoint = (x, y) => projectLiveOverlayPose({x, y})" in content
+
+
+def test_dashboard_map_controls_are_grouped_near_legend(tmp_path) -> None:
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+
+    html_path = write_dashboard_html(run_dir)
+    content = html_path.read_text(encoding="utf-8")
+
+    label_row = re.search(r'<div class="map-edit-row" data-map-edit-label-row>(.*?)</div>', content)
+    route_row = re.search(r'<div class="map-edit-row" data-map-edit-route-row>(.*?)</div>', content)
+    assert label_row is not None
+    assert route_row is not None
+    assert 'data-map-edit-mode="zone"' in label_row.group(1)
+    assert 'data-map-edit-mode="asset"' in label_row.group(1)
+    assert 'data-map-edit-mode="no_go"' in label_row.group(1)
+    assert 'data-map-edit-mode="route"' not in label_row.group(1)
+    assert 'data-map-edit-mode="route"' in route_row.group(1)
+    assert 'data-map-edit-action="route_select"' in route_row.group(1)
+    assert 'data-map-edit-action="run_route"' in route_row.group(1)
+    assert 'data-map-edit-action="route_down"' in route_row.group(1)
+
+    svg_end = content.index("</svg>")
+    layer_controls = content.index('<div class="map-layer-controls"', svg_end)
+    legend = content.index('<div class="map-legend">', layer_controls)
+    assert svg_end < layer_controls < legend
+    assert '<i class="legend-heatmap"></i>Heatmap' in content
+    assert ".map-legend, .map-layer-controls" in content
 
 
 def test_dashboard_rerun_web_url_stays_loopback_only() -> None:

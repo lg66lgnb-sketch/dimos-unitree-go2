@@ -621,40 +621,49 @@ def render_site_map(
     )
     layer_controls = (
         '<div class="map-layer-controls" data-map-layer-controls>'
-        '<button type="button" data-map-layer="semantic" aria-pressed="true">Semantic</button>'
-        '<button type="button" data-map-layer="heatmap" aria-pressed="true">Heatmap</button>'
-        '<button type="button" data-map-layer="path" aria-pressed="true">Path</button>'
-        '<button type="button" data-map-layer="robot" aria-pressed="true">Robot</button>'
+        '<button type="button" data-map-layer="semantic" aria-pressed="true">'
+        '<i class="layer-semantic"></i>Semantic</button>'
+        '<button type="button" data-map-layer="heatmap" aria-pressed="true">'
+        '<i class="legend-heatmap"></i>Heatmap</button>'
+        '<button type="button" data-map-layer="path" aria-pressed="true">'
+        '<i class="legend-route"></i>Path</button>'
+        '<button type="button" data-map-layer="robot" aria-pressed="true">'
+        '<i class="legend-live"></i>Robot</button>'
         "</div>"
     )
     edit_controls = (
         '<div class="map-edit-controls" data-map-edit-controls>'
+        '<div class="map-edit-row" data-map-edit-general-row>'
         '<button type="button" data-map-edit-mode="select" aria-pressed="true">Select</button>'
         '<button type="button" data-map-edit-mode="home" aria-pressed="false">Set Home</button>'
+        '<button type="button" data-map-edit-action="delete_selected">Delete</button>'
+        '<button type="button" data-map-edit-action="save">Save</button>'
+        '<button type="button" data-map-edit-action="reset">Reset</button>'
+        '<button type="button" data-map-edit-action="export">Export</button>'
+        "</div>"
+        '<div class="map-edit-row" data-map-edit-label-row>'
         '<button type="button" data-map-edit-mode="zone" aria-pressed="false">Label</button>'
         '<button type="button" data-map-edit-mode="asset" aria-pressed="false">Asset</button>'
         '<button type="button" data-map-edit-mode="package" aria-pressed="false">Package</button>'
         '<button type="button" data-map-edit-mode="no_go" aria-pressed="false">No-Go</button>'
-        '<button type="button" data-map-edit-mode="route" aria-pressed="false">Route</button>'
         '<button type="button" data-map-edit-mode="incident" aria-pressed="false">Incident</button>'
         '<button type="button" data-map-edit-mode="tag" aria-pressed="false">Bind Tag</button>'
         '<button type="button" data-map-edit-action="use_observation">Use Observation</button>'
-        '<button type="button" data-map-edit-action="delete_selected">Delete</button>'
+        '<button type="button" data-map-edit-action="publish_no_go">Publish No-Go</button>'
+        "</div>"
+        '<div class="map-edit-row" data-map-edit-route-row>'
+        '<button type="button" data-map-edit-mode="route" aria-pressed="false">Route</button>'
         '<button type="button" data-map-edit-action="route_select">Select Route</button>'
         '<button type="button" data-map-edit-action="run_route">Run Route</button>'
         '<button type="button" data-map-edit-action="stop_route">Stop Route</button>'
         '<button type="button" data-map-edit-action="route_up">Route Up</button>'
         '<button type="button" data-map-edit-action="route_down">Route Down</button>'
-        '<button type="button" data-map-edit-action="publish_no_go">Publish No-Go</button>'
-        '<button type="button" data-map-edit-action="save">Save</button>'
-        '<button type="button" data-map-edit-action="reset">Reset</button>'
-        '<button type="button" data-map-edit-action="export">Export</button>'
+        "</div>"
         "</div>"
     )
     return f"""
       <div class="map-shell" data-map-surface>
         {_render_rerun_surface(rerun_web_url)}
-        {layer_controls}
         {edit_controls}
         <svg class="site-map" role="img" aria-label="DogOps mission map"
           data-live-map-svg data-map-bounds="{bounds_attr}" data-map-authoring="{authoring_attr}"
@@ -692,6 +701,7 @@ def render_site_map(
             {robot}
           </g>
         </svg>
+        {layer_controls}
         {legend}
         <div class="map-workflow">
           <a href="{rerun_web_url_attr}" target="_blank" rel="noreferrer" data-rerun-web-link>Open Rerun Web</a>
@@ -1010,20 +1020,37 @@ def render_dashboard_html(
     .map-go-to-cross {{ stroke: #fecaca; stroke-linecap: round; stroke-width: 2; }}
     .map-axis-label {{ fill: #657184; font-size: 10px; }}
     .site-map.go-to-armed {{ cursor: crosshair; }}
-    .map-legend {{
+    .map-legend, .map-layer-controls {{
       color: #a9b4c4;
       display: flex;
       flex-wrap: wrap;
       gap: 12px;
       font-size: 12px;
     }}
-    .map-legend span {{ align-items: center; display: inline-flex; gap: 6px; }}
-    .map-legend i {{
+    .map-legend span, .map-layer-controls button {{
+      align-items: center;
+      display: inline-flex;
+      gap: 6px;
+    }}
+    .map-legend i, .map-layer-controls i {{
       border-radius: 999px;
       display: inline-block;
       height: 10px;
       width: 10px;
     }}
+    .map-layer-controls button {{
+      background: transparent;
+      border: 0;
+      color: inherit;
+      cursor: pointer;
+      font: inherit;
+      padding: 0;
+    }}
+    .map-layer-controls button[aria-pressed="true"] {{
+      color: #d8fff6;
+      font-weight: 700;
+    }}
+    .map-layer-controls button[aria-pressed="false"] {{ opacity: 0.48; }}
     .legend-free {{ background: #484981; }}
     .legend-heatmap {{ background: #f97316; }}
     .legend-route {{ background: #52e0c4; }}
@@ -1031,6 +1058,7 @@ def render_dashboard_html(
     .legend-tag {{ background: #a78bfa; }}
     .legend-no-go {{ background: #ef4444; }}
     .legend-incident {{ background: #fb7185; }}
+    .layer-semantic {{ background: #a78bfa; }}
     .map-workflow {{
       align-items: center;
       color: #a9b4c4;
@@ -1051,17 +1079,16 @@ def render_dashboard_html(
     }}
     .map-command-status.ok {{ color: #86efac; }}
     .map-command-status.error {{ color: #fca5a5; }}
-    .map-layer-controls {{
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-    }}
     .map-edit-controls {{
+      display: grid;
+      gap: 8px;
+    }}
+    .map-edit-row {{
       display: flex;
       flex-wrap: wrap;
       gap: 8px;
     }}
-    .map-layer-controls button, .map-edit-controls button {{
+    .map-edit-controls button {{
       background: #0d1119;
       border: 1px solid #334155;
       border-radius: 999px;
@@ -1071,7 +1098,7 @@ def render_dashboard_html(
       min-height: 30px;
       padding: 5px 10px;
     }}
-    .map-layer-controls button[aria-pressed="true"], .map-edit-controls button[aria-pressed="true"] {{
+    .map-edit-controls button[aria-pressed="true"] {{
       background: #123b36;
       border-color: #52e0c4;
       color: #d8fff6;
