@@ -150,6 +150,7 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert 'data-route-action-row' in content
     assert 'data-route-action-kind="capture_image"' in content
     assert 'data-route-action-kind="gemini_inspect_image"' in content
+    assert 'data-saved-images' in content
     assert 'data-route-action-kind="scan_qr"' in content
     assert 'data-route-action-kind="scan_tags"' in content
     assert 'data-route-action-kind="wait"' in content
@@ -2085,6 +2086,71 @@ def test_dashboard_route_run_history_endpoints(tmp_path) -> None:
     assert {"waypoint", "observation", "incident", "work_order", "verification"} <= timeline_kinds
     assert status_events == 200
     assert events["events"][0]["route_run_id"] == route_state.route_run_id  # type: ignore[index]
+
+
+def test_dashboard_route_run_images_api_serves_saved_image_files(tmp_path) -> None:
+    run_dir = tmp_path / ".dogops" / "runs" / "latest"
+    run_offline_simulation(out=run_dir)
+    save_map_authoring(
+        run_dir,
+        MapAuthoringState(
+            selected_route_id="ROUTE_IMAGE",
+            routes=[
+                EditableRoute(
+                    id="ROUTE_IMAGE",
+                    label="Route Image",
+                    waypoints=[
+                        EditableRouteWaypoint(
+                            id="WP-IMAGE",
+                            label="Waypoint Image",
+                            pose=EditableMapPoint(x=1.0, y=2.0),
+                            actions=[
+                                EditableRouteAction(
+                                    id="CAPTURE",
+                                    kind="capture_image",
+                                    args={"target": "COOLING_1"},
+                                )
+                            ],
+                        )
+                    ],
+                )
+            ],
+        ),
+    )
+    route_state = DogOpsRouteExecutor(run_dir).follow_route(dry_run=True)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        status_images, image_list = _get_json_with_status(
+            f"{base_url}/api/route-runs/images",
+            headers=_robot_headers(server),
+        )
+        image = image_list["images"][0]  # type: ignore[index]
+        request = urllib.request.Request(
+            f"{base_url}{image['url']}",  # type: ignore[index]
+            headers=_robot_headers(server),
+            method="GET",
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            image_status = response.status
+            image_type = response.headers["Content-Type"]
+            image_bytes = response.read()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert route_state.route_run_id
+    assert status_images == 200
+    assert image["route_run_id"] == route_state.route_run_id  # type: ignore[index]
+    assert image["dogops_run_id"] == "latest"  # type: ignore[index]
+    assert image["metadata"]["waypoint_id"] == "WP-IMAGE"  # type: ignore[index]
+    assert image_status == 200
+    assert image_type == "image/png"
+    assert image_bytes.startswith(b"\x89PNG\r\n\x1a\n")
 
 
 def test_dashboard_route_run_detail_uses_historical_run_dir(tmp_path) -> None:

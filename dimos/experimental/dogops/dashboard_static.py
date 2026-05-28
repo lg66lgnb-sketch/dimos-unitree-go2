@@ -1047,6 +1047,30 @@ def render_dashboard_html(
       gap: 12px;
       grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
     }}
+    .saved-image-grid {{
+      display: grid;
+      gap: 12px;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    }}
+    .saved-image {{
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fbfcfd;
+      overflow: hidden;
+    }}
+    .saved-image img {{
+      display: block;
+      width: 100%;
+      aspect-ratio: 4 / 3;
+      object-fit: cover;
+      background: #111827;
+    }}
+    .saved-image figcaption {{
+      padding: 7px 9px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+    }}
     .compact-list {{
       display: grid;
       gap: 8px;
@@ -1801,6 +1825,12 @@ def render_dashboard_html(
         </div>
       </div>
     </section>
+    <section class="wide">
+      <h2>Saved Images</h2>
+      <div class="saved-image-grid" data-saved-images>
+        <p class="muted">No saved route images yet</p>
+      </div>
+    </section>
   </main>
   <script>
     (() => {{
@@ -1827,6 +1857,7 @@ def render_dashboard_html(
       const routeRunHistory = document.querySelector("[data-route-run-history]");
       const routeRunTimeline = document.querySelector("[data-route-run-timeline]");
       const geminiEvidence = document.querySelector("[data-gemini-evidence]");
+      const savedImages = document.querySelector("[data-saved-images]");
       const liveHeatmap = liveMapSvg ? liveMapSvg.querySelector("[data-live-heatmap]") : null;
       const livePath = liveMapSvg ? liveMapSvg.querySelector("[data-live-path]") : null;
       const liveTrace = liveMapSvg ? liveMapSvg.querySelector("[data-live-trace]") : null;
@@ -1852,6 +1883,7 @@ def render_dashboard_html(
       let liveMapBounds = null;
       let liveOverlayBounds = null;
       let latestRouteRuns = [];
+      let savedImageUrls = [];
       let latestQrEventsById = new Map();
       try {{
         liveMapBounds = liveMapSvg ? JSON.parse(liveMapSvg.dataset.mapBounds || "{{}}") : null;
@@ -2254,6 +2286,36 @@ def render_dashboard_html(
           return `<tr><td>${{htmlEscape(metadata.waypoint_id || "-")}}</td><td>${{htmlEscape(summary)}}</td><td>${{htmlEscape(changed)}}</td><td>${{htmlEscape(metadata.severity || "-")}}</td><td>${{htmlEscape(confidence)}}</td><td>${{htmlEscape(baseline)}}</td></tr>`;
         }}).join("");
       }};
+      const renderSavedImages = async (images) => {{
+        if (!savedImages) return;
+        savedImageUrls.forEach((url) => URL.revokeObjectURL(url));
+        savedImageUrls = [];
+        const rows = Array.isArray(images) ? images.filter((item) => item.url) : [];
+        if (!rows.length) {{
+          savedImages.innerHTML = '<p class="muted">No saved route images yet</p>';
+          return;
+        }}
+        const cards = await Promise.all(rows.slice(0, 12).map(async (item) => {{
+          try {{
+            const response = await fetch(item.url, {{
+              cache: "no-store",
+              headers: {{"X-DogOps-Control-Token": robotControlToken}},
+            }});
+            if (!response.ok) throw new Error("image_fetch_failed");
+            const blob = await response.blob();
+            const url = URL.createObjectURL(blob);
+            savedImageUrls.push(url);
+            const metadata = item.metadata || {{}};
+            const runLabel = item.dogops_run_id || item.route_run_id || "-";
+            const waypoint = metadata.waypoint_id || "-";
+            const source = metadata.source || "image";
+            return `<figure class="saved-image"><img src="${{url}}" alt="Saved route image"><figcaption>Run ${{htmlEscape(runLabel)}}<br>${{htmlEscape(waypoint)}} / ${{htmlEscape(source)}}</figcaption></figure>`;
+          }} catch (_) {{
+            return "";
+          }}
+        }}));
+        savedImages.innerHTML = cards.filter(Boolean).join("") || '<p class="muted">No saved route images available</p>';
+      }};
       const refreshRouteRunHistory = async () => {{
         try {{
           const currentResponse = await fetch("/api/route-runs/current", {{
@@ -2274,6 +2336,14 @@ def render_dashboard_html(
             latestRouteRuns = Array.isArray(list.route_runs) ? list.route_runs : [];
             renderRouteRunHistory(list.route_runs || []);
             renderRouteTable();
+          }}
+          const imagesResponse = await fetch("/api/route-runs/images", {{
+            cache: "no-store",
+            headers: {{"X-DogOps-Control-Token": robotControlToken}},
+          }});
+          const imageList = await imagesResponse.json();
+          if (imagesResponse.ok && imageList.ok !== false) {{
+            await renderSavedImages(imageList.images || []);
           }}
         }} catch (_) {{
           // Keep the latest rendered history visible if polling fails.

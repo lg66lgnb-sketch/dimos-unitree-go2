@@ -253,6 +253,9 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/route-runs/current":
             if self._authorize_map_authoring_write():
                 self._route_runs_current()
+        elif path == "/api/route-runs/images":
+            if self._authorize_map_authoring_write():
+                self._route_run_images()
         elif path.startswith("/api/route-runs/"):
             if self._authorize_map_authoring_write():
                 self._route_runs_detail(path)
@@ -724,6 +727,32 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
             }
         )
 
+    def _route_run_images(self) -> None:
+        store = RouteRunStore(self.run_dir)
+        images: list[dict[str, Any]] = []
+        for route_run in store.list_route_runs(limit=12):
+            route_run_id = str(route_run.get("route_run_id") or "")
+            if not route_run_id:
+                continue
+            for evidence in store.route_run_evidence(route_run_id):
+                if evidence.get("kind") != "image" or not evidence.get("path"):
+                    continue
+                evidence_id = str(evidence.get("evidence_id") or "")
+                images.append(
+                    {
+                        "evidence_id": evidence_id,
+                        "route_run_id": route_run_id,
+                        "dogops_run_id": route_run.get("dogops_run_id"),
+                        "route_id": route_run.get("route_id"),
+                        "created_at": evidence.get("created_at"),
+                        "mime_type": evidence.get("mime_type"),
+                        "metadata": evidence.get("metadata") or {},
+                        "url": f"/api/route-runs/{route_run_id}/evidence/{evidence_id}/file",
+                    }
+                )
+        images.sort(key=lambda item: float(item.get("created_at") or 0.0), reverse=True)
+        self._send_json({"ok": True, "images": images[:12]})
+
     def _route_runs_detail(self, path: str) -> None:
         parts = [part for part in path.split("/") if part]
         route_run_id = parts[2] if len(parts) >= 3 else ""
@@ -741,6 +770,9 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         if len(parts) == 4 and parts[3] == "evidence":
             self._send_json({"ok": True, "evidence": store.route_run_evidence(route_run_id)})
             return
+        if len(parts) == 6 and parts[3] == "evidence" and parts[5] == "file":
+            self._send_route_run_evidence_file(store, route_run, parts[4])
+            return
         route_events = store.route_run_events(route_run_id)
         self._send_json(
             {
@@ -751,6 +783,37 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
                 "evidence": store.route_run_evidence(route_run_id),
             }
         )
+
+    def _send_route_run_evidence_file(
+        self,
+        store: RouteRunStore,
+        route_run: dict[str, Any],
+        evidence_id: str,
+    ) -> None:
+        evidence = next(
+            (
+                item
+                for item in store.route_run_evidence(str(route_run["route_run_id"]))
+                if item.get("evidence_id") == evidence_id
+            ),
+            None,
+        )
+        if evidence is None or evidence.get("kind") != "image" or not evidence.get("path"):
+            self._send_json({"ok": False, "error": "evidence_image_not_found"}, HTTPStatus.NOT_FOUND)
+            return
+        mime_type = str(evidence.get("mime_type") or "")
+        if mime_type not in {"image/jpeg", "image/png", "image/webp"}:
+            self._send_json({"ok": False, "error": "unsupported_evidence_image_type"}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+            return
+        run_root = Path(str(route_run.get("run_dir") or self.run_dir)).resolve()
+        evidence_path = Path(str(evidence["path"]))
+        resolved = evidence_path.resolve()
+        try:
+            resolved.relative_to(run_root)
+        except ValueError:
+            self._send_json({"ok": False, "error": "evidence_path_outside_run"}, HTTPStatus.FORBIDDEN)
+            return
+        self._send_file(resolved, mime_type)
 
     def _unified_timeline(
         self,
