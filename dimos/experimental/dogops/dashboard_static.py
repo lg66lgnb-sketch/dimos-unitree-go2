@@ -3132,14 +3132,16 @@ def render_dashboard_html(
           await refreshLiveMap();
         }});
       }}
+      if (routeTable) {{
+        routeTable.addEventListener("click", async (event) => {{
+          const routeTableButton = event.target.closest("button[data-route-table-action]");
+          if (!routeTableButton) return;
+          routeTableButton.blur();
+          await handleRouteTableAction(routeTableButton);
+        }});
+      }}
       if (mapEditControls) {{
         mapEditControls.addEventListener("click", async (event) => {{
-          const routeTableButton = event.target.closest("button[data-route-table-action]");
-          if (routeTableButton) {{
-            routeTableButton.blur();
-            await handleRouteTableAction(routeTableButton);
-            return;
-          }}
           const routeActionButton = event.target.closest("button[data-route-action-kind]");
           if (routeActionButton) {{
             routeActionButton.blur();

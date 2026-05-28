@@ -102,8 +102,9 @@ Incidents opened: 2
 Work orders verified closed: 1
 Open issue: PKG-103 missing
 Nav: 5/5 waypoints reached, 1 tag-search recovery, 0 safety stops
-What changed: PKG-104 moved from COOLING_1 to QA_HOLD; INC-001 resolved.
 ```
+
+Detailed "what changed" evidence belongs in generated reports and run history, but the dashboard does not require a dedicated What Changed panel.
 
 ---
 
@@ -840,11 +841,11 @@ If the dashboard exposes direct Go2 manual controls, they must be conservative, 
 
 Required panels:
 
-1. Mission timeline.
+1. Current run timeline.
 2. Manifest / package reconciliation.
 3. Incidents and work orders.
 4. Verification status.
-5. What changed.
+5. Route run history, including route, incident, verification, and change events.
 6. Navigation eval.
 7. Evidence images if available.
 8. Optional stretch: dock/portal readiness.
