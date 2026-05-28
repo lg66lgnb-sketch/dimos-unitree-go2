@@ -100,8 +100,13 @@ def test_mission_steps_provide_default_route_actions(tmp_path) -> None:
         for waypoint in route_run["selected_route_snapshot"]["waypoints"]
         for action in waypoint["actions"]
     ]
-    assert {"inspect_cooling", "wait_for_human_fix", "verify_cooling"} & set(action_ids)
-    assert "inspect_cooling_image" in action_ids
+    assert action_ids == [
+        "inspect_cooling_image",
+        "inspect_cooling",
+        "wait_for_human_fix",
+        "verify_cooling_image",
+        "verify_cooling",
+    ]
 
 
 def test_timeline_events_are_persisted_in_sqlite(tmp_path) -> None:

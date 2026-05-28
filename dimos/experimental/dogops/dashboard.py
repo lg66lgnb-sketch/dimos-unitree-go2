@@ -699,8 +699,8 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         route_run: dict[str, Any],
     ) -> list[dict[str, Any]]:
         timeline_run_dir = Path(str(route_run.get("run_dir") or self.run_dir))
-        state = self._read_json(timeline_run_dir / "state.json")
-        report = self._read_json(timeline_run_dir / "report.json")
+        state = self._read_optional_json(timeline_run_dir / "state.json")
+        report = self._read_optional_json(timeline_run_dir / "report.json")
         route_run_id = str(route_run.get("route_run_id") or "")
         dogops_run_id = str(route_run.get("dogops_run_id") or state.get("run", {}).get("id") or timeline_run_dir.name)
         rows = [
@@ -1259,6 +1259,11 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
 
     def _read_json(self, path: Path) -> dict[str, Any]:
         return json.loads(path.read_text(encoding="utf-8"))
+
+    def _read_optional_json(self, path: Path) -> dict[str, Any]:
+        if not path.exists():
+            return {}
+        return self._read_json(path)
 
     def _read_body_json(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0") or 0)

@@ -1613,6 +1613,51 @@ def test_dashboard_route_run_detail_uses_historical_run_dir(tmp_path) -> None:
     assert "second-run-only incident" in timeline_notes
 
 
+def test_dashboard_route_run_detail_survives_missing_run_files(tmp_path) -> None:
+    run_dir = tmp_path / ".dogops" / "runs" / "latest"
+    run_offline_simulation(out=run_dir)
+    save_map_authoring(
+        run_dir,
+        MapAuthoringState(
+            selected_route_id="ROUTE_A",
+            routes=[
+                EditableRoute(
+                    id="ROUTE_A",
+                    label="Route A",
+                    waypoints=[
+                        EditableRouteWaypoint(
+                            id="WP-1",
+                            label="Waypoint 1",
+                            pose=EditableMapPoint(x=1.0, y=2.0),
+                        )
+                    ],
+                )
+            ],
+        ),
+    )
+    route_state = DogOpsRouteExecutor(run_dir).follow_route(dry_run=True)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    (run_dir / "state.json").unlink()
+    (run_dir / "report.json").unlink()
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        status_detail, detail = _get_json_with_status(
+            f"{base_url}/api/route-runs/{route_state.route_run_id}",
+            headers=_robot_headers(server),
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status_detail == 200
+    assert detail["route_run"]["route_run_id"] == route_state.route_run_id  # type: ignore[index]
+    assert [row["kind"] for row in detail["timeline"]] == ["waypoint"]  # type: ignore[index]
+
+
 def test_dimos_mcp_call_command_prefers_configured_prefix(monkeypatch) -> None:
     monkeypatch.setenv("DOGOPS_DIMOS_MCP_CALL", "python -m dimos mcp call")
 

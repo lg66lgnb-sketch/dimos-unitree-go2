@@ -265,6 +265,121 @@ def test_capture_image_uses_configured_go2_image(tmp_path) -> None:
     assert copied_path.read_bytes() == b"fake-jpeg"
 
 
+def test_dry_run_executes_route_actions_and_records_qr_evidence(tmp_path) -> None:
+    route = EditableRoute(
+        id="ROUTE_QR",
+        label="Route QR",
+        waypoints=[
+            EditableRouteWaypoint(
+                id="WP-QR",
+                label="QR Waypoint",
+                pose=EditableMapPoint(x=1.0, y=2.0),
+                actions=[
+                    EditableRouteAction(
+                        id="SCAN-QR",
+                        kind="scan_qr",
+                        args={"expected": ["PKG-101"]},
+                    ),
+                ],
+            )
+        ],
+    )
+    save_map_authoring(
+        tmp_path,
+        MapAuthoringState(selected_route_id="ROUTE_QR", routes=[route]),
+    )
+
+    state = DogOpsRouteExecutor(tmp_path).follow_route(dry_run=True)
+
+    assert state.state == "completed"
+    action_events = [event for event in state.events if event.kind == "action"]
+    assert [event.state for event in action_events] == ["started", "completed"]
+    assert action_events[-1].payload["detected_payloads"] == ["PKG-101"]
+    assert RouteRunStore(tmp_path).route_run_detail(state.route_run_id or "")["actions_completed"] == 1
+    evidence = RouteRunStore(tmp_path).route_run_evidence(state.route_run_id or "")
+    assert evidence[0]["kind"] == "qr_detection"
+    assert evidence[0]["metadata"]["detected_payloads"] == ["PKG-101"]
+
+
+def test_optional_action_failure_records_and_continues(tmp_path) -> None:
+    route = EditableRoute(
+        id="ROUTE_OPTIONAL",
+        label="Route Optional",
+        waypoints=[
+            EditableRouteWaypoint(
+                id="WP-OPTIONAL",
+                label="Optional Waypoint",
+                pose=EditableMapPoint(x=1.0, y=2.0),
+                actions=[
+                    EditableRouteAction(
+                        id="OPTIONAL-QR",
+                        kind="scan_qr",
+                        required=False,
+                    ),
+                    EditableRouteAction(
+                        id="SCAN-TAGS",
+                        kind="scan_tags",
+                        args={"expected": [41]},
+                    ),
+                ],
+            )
+        ],
+    )
+    save_map_authoring(
+        tmp_path,
+        MapAuthoringState(selected_route_id="ROUTE_OPTIONAL", routes=[route]),
+    )
+
+    state = DogOpsRouteExecutor(tmp_path).follow_route(dry_run=True)
+
+    assert state.state == "completed"
+    action_events = [event for event in state.events if event.kind == "action"]
+    assert [(event.action_id, event.state) for event in action_events] == [
+        ("OPTIONAL-QR", "started"),
+        ("OPTIONAL-QR", "failed"),
+        ("SCAN-TAGS", "started"),
+        ("SCAN-TAGS", "completed"),
+    ]
+    route_run = RouteRunStore(tmp_path).route_run_detail(state.route_run_id or "")
+    assert route_run["state"] == "completed"
+    assert route_run["actions_completed"] == 1
+
+
+def test_skipped_action_state_is_preserved(tmp_path, monkeypatch) -> None:
+    route = EditableRoute(
+        id="ROUTE_SKIPPED",
+        label="Route Skipped",
+        waypoints=[
+            EditableRouteWaypoint(
+                id="WP-SKIPPED",
+                label="Skipped Waypoint",
+                pose=EditableMapPoint(x=1.0, y=2.0),
+                actions=[EditableRouteAction(id="WAIT", kind="wait")],
+            )
+        ],
+    )
+    save_map_authoring(
+        tmp_path,
+        MapAuthoringState(selected_route_id="ROUTE_SKIPPED", routes=[route]),
+    )
+
+    from dimos.experimental.dogops.route_actions import RouteActionResult
+    import dimos.experimental.dogops.route_executor as route_executor_module
+
+    monkeypatch.setattr(
+        route_executor_module,
+        "execute_route_action",
+        lambda *_, **__: RouteActionResult(ok=True, state="skipped", note="not needed"),
+    )
+
+    state = DogOpsRouteExecutor(tmp_path).follow_route(dry_run=True)
+
+    skipped_event = [event for event in state.events if event.action_id == "WAIT"][-1]
+    assert skipped_event.state == "skipped"
+    route_events = RouteRunStore(tmp_path).route_run_events(state.route_run_id or "")
+    assert route_events[-1]["state"] == "skipped"
+
+
 def test_route_action_exception_marks_route_failed(tmp_path) -> None:
     route = EditableRoute(
         id="ROUTE_BAD_ACTION",
@@ -553,3 +668,6 @@ def test_stop_route_invokes_transport_stop_handler(tmp_path) -> None:
 
     assert stopped.state == "stopped"
     assert calls == ["stop"]
+    events = RouteRunStore(tmp_path).route_run_events(stopped.route_run_id or "")
+    assert events[-1]["state"] == "stopped"
+    assert events[-1]["kind"] == "system"
