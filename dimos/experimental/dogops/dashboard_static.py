@@ -796,6 +796,28 @@ def render_site_map(
         </div>
         <div class="map-authoring-status" data-map-authoring-status>Map authoring idle</div>
         <div class="map-route-execution-status" data-route-execution-status>Execution: idle</div>
+        <div class="route-run-history">
+          <strong>Route Run History</strong>
+          <table>
+            <thead>
+              <tr><th>Time</th><th>Run</th><th>Route</th><th>State</th><th>Progress</th></tr>
+            </thead>
+            <tbody data-route-run-history>
+              <tr><td colspan="5">No route runs recorded</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="route-run-timeline">
+          <strong>Current Timeline</strong>
+          <table>
+            <thead>
+              <tr><th>#</th><th>Kind</th><th>State</th><th>Target</th><th>Note</th></tr>
+            </thead>
+            <tbody data-route-run-timeline>
+              <tr><td colspan="5">No active route timeline</td></tr>
+            </tbody>
+          </table>
+        </div>
         <div class="map-live-status" data-live-map-status>Live odom: waiting for Go2</div>
         <ol class="scan-strip">{scan_items}</ol>
       </div>
@@ -1214,6 +1236,29 @@ def render_dashboard_html(
     }}
     .map-route-execution-status.ok {{ color: #86efac; }}
     .map-route-execution-status.error {{ color: #fca5a5; }}
+    .route-run-history, .route-run-timeline {{
+      color: #cbd5e1;
+      display: grid;
+      gap: 6px;
+      font-size: 12px;
+    }}
+    .route-run-history strong, .route-run-timeline strong {{ color: #eef2f8; }}
+    .route-run-history table, .route-run-timeline table {{
+      border-collapse: collapse;
+      width: 100%;
+    }}
+    .route-run-history th, .route-run-history td,
+    .route-run-timeline th, .route-run-timeline td {{
+      border-bottom: 1px solid #1d2430;
+      padding: 5px 4px;
+      text-align: left;
+      vertical-align: top;
+    }}
+    .route-run-history th, .route-run-timeline th {{
+      color: #93a4b8;
+      font-size: 10px;
+      text-transform: uppercase;
+    }}
     .scan-strip {{
       color: #b8c4d4;
       display: grid;
@@ -1543,6 +1588,8 @@ def render_dashboard_html(
       const mapCommandStatus = document.querySelector("[data-map-command-status]");
       const mapAuthoringStatus = document.querySelector("[data-map-authoring-status]");
       const routeExecutionStatus = document.querySelector("[data-route-execution-status]");
+      const routeRunHistory = document.querySelector("[data-route-run-history]");
+      const routeRunTimeline = document.querySelector("[data-route-run-timeline]");
       const liveHeatmap = liveMapSvg ? liveMapSvg.querySelector("[data-live-heatmap]") : null;
       const livePath = liveMapSvg ? liveMapSvg.querySelector("[data-live-path]") : null;
       const liveTrace = liveMapSvg ? liveMapSvg.querySelector("[data-live-trace]") : null;
@@ -1784,9 +1831,70 @@ def render_dashboard_html(
         const total = Number(state.waypoints_total || 0);
         const reached = Number(state.waypoints_reached || 0);
         const active = state.active_waypoint_id ? ` active=${{state.active_waypoint_id}}` : "";
+        const action = state.active_action_id ? ` action=${{state.active_action_id}}` : "";
+        const run = state.route_run_id ? ` run=${{state.route_run_id}}` : "";
         const transport = state.transport ? ` transport=${{state.transport}}` : "";
         const error = state.last_error ? ` error=${{state.last_error}}` : "";
-        return `Execution: ${{state.state}} ${{reached}}/${{total}}${{active}}${{transport}}${{error}}`;
+        return `Execution: ${{state.state}} ${{reached}}/${{total}}${{active}}${{action}}${{run}}${{transport}}${{error}}`;
+      }};
+      const formatRouteRunTime = (seconds) => {{
+        if (!seconds) return "-";
+        try {{
+          return new Date(Number(seconds) * 1000).toLocaleTimeString();
+        }} catch (_) {{
+          return "-";
+        }}
+      }};
+      const htmlEscape = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({{
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;",
+      }}[char]));
+      const renderRouteRunHistory = (runs) => {{
+        if (!routeRunHistory) return;
+        if (!Array.isArray(runs) || !runs.length) {{
+          routeRunHistory.innerHTML = '<tr><td colspan="5">No route runs recorded</td></tr>';
+          return;
+        }}
+        routeRunHistory.innerHTML = runs.slice(0, 8).map((run) => {{
+          const progress = `${{Number(run.waypoints_reached || 0)}}/${{Number(run.waypoints_total || 0)}} wp, ${{Number(run.actions_completed || 0)}}/${{Number(run.actions_total || 0)}} act`;
+          return `<tr><td>${{htmlEscape(formatRouteRunTime(run.started_at))}}</td><td>${{htmlEscape(run.dogops_run_id || "-")}}</td><td>${{htmlEscape(run.route_id || "-")}}</td><td>${{htmlEscape(run.state || "-")}}</td><td>${{htmlEscape(progress)}}</td></tr>`;
+        }}).join("");
+      }};
+      const renderRouteRunTimeline = (events) => {{
+        if (!routeRunTimeline) return;
+        if (!Array.isArray(events) || !events.length) {{
+          routeRunTimeline.innerHTML = '<tr><td colspan="5">No active route timeline</td></tr>';
+          return;
+        }}
+        routeRunTimeline.innerHTML = events.slice(-10).map((event) => {{
+          const target = event.target_id || event.waypoint_id || event.action_id || "-";
+          return `<tr><td>${{htmlEscape(event.sequence || "")}}</td><td>${{htmlEscape(event.kind || "-")}}</td><td>${{htmlEscape(event.state || "-")}}</td><td>${{htmlEscape(target)}}</td><td>${{htmlEscape(event.note || "")}}</td></tr>`;
+        }}).join("");
+      }};
+      const refreshRouteRunHistory = async () => {{
+        try {{
+          const currentResponse = await fetch("/api/route-runs/current", {{
+            cache: "no-store",
+            headers: {{"X-DogOps-Control-Token": robotControlToken}},
+          }});
+          const current = await currentResponse.json();
+          if (currentResponse.ok && current.ok !== false) {{
+            renderRouteRunTimeline(current.timeline || current.events || []);
+          }}
+          const listResponse = await fetch("/api/route-runs", {{
+            cache: "no-store",
+            headers: {{"X-DogOps-Control-Token": robotControlToken}},
+          }});
+          const list = await listResponse.json();
+          if (listResponse.ok && list.ok !== false) {{
+            renderRouteRunHistory(list.route_runs || []);
+          }}
+        }} catch (_) {{
+          // Keep the latest rendered history visible if polling fails.
+        }}
       }};
       const refreshRouteExecution = async () => {{
         if (routeExecutionPolling) return;
@@ -1802,6 +1910,7 @@ def render_dashboard_html(
           }}
           const state = result.route_execution || {{}};
           setRouteExecutionStatus(routeExecutionText(state), state.state === "failed" ? "error" : "ok");
+          await refreshRouteRunHistory();
         }} catch (error) {{
           setRouteExecutionStatus(`Execution: status unavailable (${{error.message}})`, "error");
         }} finally {{
@@ -2595,9 +2704,11 @@ def render_dashboard_html(
       refreshLiveMap();
       refreshDimOSMap();
       refreshRouteExecution();
+      refreshRouteRunHistory();
       window.setInterval(refreshLiveMap, 1000);
       window.setInterval(refreshDimOSMap, 1500);
       window.setInterval(refreshRouteExecution, 1500);
+      window.setInterval(refreshRouteRunHistory, 5000);
     }})();
   </script>
 </body>

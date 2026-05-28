@@ -10,6 +10,7 @@ from dimos.experimental.dogops.map_authoring import (
     save_map_authoring,
 )
 from dimos.experimental.dogops.mission_engine import run_offline_simulation
+from dimos.experimental.dogops.route_actions import EditableRouteAction
 from dimos.experimental.dogops.route_executor import (
     CallableGoalPublisher,
     DogOpsRouteExecutor,
@@ -20,6 +21,7 @@ from dimos.experimental.dogops.route_executor import (
     route_execution_lock,
     save_route_execution,
 )
+from dimos.experimental.dogops.route_run_store import RouteRunStore
 
 
 def _route(route_id: str = "ROUTE_A") -> EditableRoute:
@@ -145,6 +147,319 @@ def test_fake_publisher_receives_goals_in_order_and_waits_for_odom(tmp_path) -> 
         "sent",
         "reached",
     ]
+
+
+def test_route_actions_record_timeline_and_placeholder_evidence(tmp_path) -> None:
+    route = EditableRoute(
+        id="ROUTE_ACTIONS",
+        label="Route Actions",
+        waypoints=[
+            EditableRouteWaypoint(
+                id="WP-ACTION",
+                label="Waypoint",
+                target_id="COOLING_1",
+                pose=EditableMapPoint(x=1.0, y=2.0),
+                actions=[
+                    EditableRouteAction(
+                        id="SCAN-TAGS",
+                        kind="scan_tags",
+                        args={"expected": [41]},
+                    ),
+                    EditableRouteAction(
+                        id="CAPTURE",
+                        kind="capture_image",
+                        args={"target": "COOLING_1"},
+                    ),
+                ],
+            )
+        ],
+    )
+    save_map_authoring(
+        tmp_path,
+        MapAuthoringState(selected_route_id="ROUTE_ACTIONS", routes=[route]),
+    )
+    current_goal = {"x": 0.0, "y": 0.0}
+
+    def publish(x: float, y: float, z: float, frame: str) -> dict[str, object]:
+        current_goal.update({"x": x, "y": y})
+        return {"accepted": True}
+
+    executor = DogOpsRouteExecutor(
+        tmp_path,
+        goal_publisher=CallableGoalPublisher(publish, transport_name="fake_nav"),
+        live_snapshot_reader=lambda: {
+            "robot_pose": {"x": current_goal["x"], "y": current_goal["y"]},
+            "target": {"x": current_goal["x"], "y": current_goal["y"]},
+            "topics": {"odom": {"age_s": 0.1}},
+        },
+        sleep_fn=lambda _: None,
+    )
+
+    state = executor.follow_route()
+
+    assert state.state == "completed"
+    assert state.route_run_id
+    action_events = [event for event in state.events if event.kind == "action"]
+    assert [event.action_id for event in action_events] == [
+        "SCAN-TAGS",
+        "SCAN-TAGS",
+        "CAPTURE",
+        "CAPTURE",
+    ]
+    assert action_events[-1].payload["source"] == "demo_placeholder"
+    evidence = RouteRunStore(tmp_path).route_run_evidence(state.route_run_id)
+    evidence_kinds = {item["kind"] for item in evidence}
+    assert {"tag_detection", "image"} <= evidence_kinds
+    image_evidence = [item for item in evidence if item["kind"] == "image"][0]
+    assert image_evidence["metadata"]["source"] == "demo_placeholder"
+    assert (tmp_path / "route_runs" / state.route_run_id / "evidence" / "WP-ACTION-CAPTURE.svg").exists()
+
+
+def test_capture_image_uses_configured_go2_image(tmp_path) -> None:
+    source_image = tmp_path / "go2-frame.jpg"
+    source_image.write_bytes(b"fake-jpeg")
+    route = EditableRoute(
+        id="ROUTE_IMAGE",
+        label="Route Image",
+        waypoints=[
+            EditableRouteWaypoint(
+                id="WP-IMAGE",
+                label="Waypoint",
+                pose=EditableMapPoint(x=1.0, y=2.0),
+                actions=[
+                    EditableRouteAction(
+                        id="CAPTURE",
+                        kind="capture_image",
+                        args={"image_path": str(source_image)},
+                    ),
+                ],
+            )
+        ],
+    )
+    save_map_authoring(
+        tmp_path,
+        MapAuthoringState(selected_route_id="ROUTE_IMAGE", routes=[route]),
+    )
+    current_goal = {"x": 0.0, "y": 0.0}
+
+    def publish(x: float, y: float, z: float, frame: str) -> dict[str, object]:
+        current_goal.update({"x": x, "y": y})
+        return {"accepted": True}
+
+    state = DogOpsRouteExecutor(
+        tmp_path,
+        goal_publisher=CallableGoalPublisher(publish, transport_name="fake_nav"),
+        live_snapshot_reader=lambda: {
+            "robot_pose": {"x": current_goal["x"], "y": current_goal["y"]},
+            "target": {"x": current_goal["x"], "y": current_goal["y"]},
+            "topics": {"odom": {"age_s": 0.1}},
+        },
+        sleep_fn=lambda _: None,
+    ).follow_route()
+
+    assert state.route_run_id
+    evidence = RouteRunStore(tmp_path).route_run_evidence(state.route_run_id)
+    image_evidence = [item for item in evidence if item["kind"] == "image"][0]
+    assert image_evidence["metadata"]["source"] == "go2_camera_configured"
+    copied_path = tmp_path / "route_runs" / state.route_run_id / "evidence" / "WP-IMAGE-CAPTURE.jpg"
+    assert copied_path.read_bytes() == b"fake-jpeg"
+
+
+def test_dry_run_executes_route_actions_and_records_qr_evidence(tmp_path) -> None:
+    route = EditableRoute(
+        id="ROUTE_QR",
+        label="Route QR",
+        waypoints=[
+            EditableRouteWaypoint(
+                id="WP-QR",
+                label="QR Waypoint",
+                pose=EditableMapPoint(x=1.0, y=2.0),
+                actions=[
+                    EditableRouteAction(
+                        id="SCAN-QR",
+                        kind="scan_qr",
+                        args={"expected": ["PKG-101"]},
+                    ),
+                ],
+            )
+        ],
+    )
+    save_map_authoring(
+        tmp_path,
+        MapAuthoringState(selected_route_id="ROUTE_QR", routes=[route]),
+    )
+
+    state = DogOpsRouteExecutor(tmp_path).follow_route(dry_run=True)
+
+    assert state.state == "completed"
+    action_events = [event for event in state.events if event.kind == "action"]
+    assert [event.state for event in action_events] == ["started", "completed"]
+    assert action_events[-1].payload["detected_payloads"] == ["PKG-101"]
+    assert RouteRunStore(tmp_path).route_run_detail(state.route_run_id or "")["actions_completed"] == 1
+    evidence = RouteRunStore(tmp_path).route_run_evidence(state.route_run_id or "")
+    assert evidence[0]["kind"] == "qr_detection"
+    assert evidence[0]["metadata"]["detected_payloads"] == ["PKG-101"]
+
+
+def test_optional_action_failure_records_and_continues(tmp_path) -> None:
+    route = EditableRoute(
+        id="ROUTE_OPTIONAL",
+        label="Route Optional",
+        waypoints=[
+            EditableRouteWaypoint(
+                id="WP-OPTIONAL",
+                label="Optional Waypoint",
+                pose=EditableMapPoint(x=1.0, y=2.0),
+                actions=[
+                    EditableRouteAction(
+                        id="OPTIONAL-QR",
+                        kind="scan_qr",
+                        required=False,
+                    ),
+                    EditableRouteAction(
+                        id="SCAN-TAGS",
+                        kind="scan_tags",
+                        args={"expected": [41]},
+                    ),
+                ],
+            )
+        ],
+    )
+    save_map_authoring(
+        tmp_path,
+        MapAuthoringState(selected_route_id="ROUTE_OPTIONAL", routes=[route]),
+    )
+
+    state = DogOpsRouteExecutor(tmp_path).follow_route(dry_run=True)
+
+    assert state.state == "completed"
+    action_events = [event for event in state.events if event.kind == "action"]
+    assert [(event.action_id, event.state) for event in action_events] == [
+        ("OPTIONAL-QR", "started"),
+        ("OPTIONAL-QR", "failed"),
+        ("SCAN-TAGS", "started"),
+        ("SCAN-TAGS", "completed"),
+    ]
+    route_run = RouteRunStore(tmp_path).route_run_detail(state.route_run_id or "")
+    assert route_run["state"] == "completed"
+    assert route_run["actions_completed"] == 1
+
+
+def test_dry_run_required_action_failure_stays_failed(tmp_path) -> None:
+    route = EditableRoute(
+        id="ROUTE_REQUIRED_FAIL",
+        label="Route Required Fail",
+        waypoints=[
+            EditableRouteWaypoint(
+                id="WP-REQUIRED",
+                label="Required Waypoint",
+                pose=EditableMapPoint(x=1.0, y=2.0),
+                actions=[EditableRouteAction(id="REQUIRED-QR", kind="scan_qr")],
+            )
+        ],
+    )
+    save_map_authoring(
+        tmp_path,
+        MapAuthoringState(selected_route_id="ROUTE_REQUIRED_FAIL", routes=[route]),
+    )
+
+    state = DogOpsRouteExecutor(tmp_path).follow_route(dry_run=True)
+
+    assert state.state == "failed"
+    assert state.last_error == "QR scan configured without expected payloads"
+    assert load_route_execution(tmp_path).state == "failed"
+    route_run = RouteRunStore(tmp_path).route_run_detail(state.route_run_id or "")
+    assert route_run["state"] == "failed"
+    assert route_run["actions_completed"] == 0
+
+
+def test_skipped_action_state_is_preserved(tmp_path, monkeypatch) -> None:
+    route = EditableRoute(
+        id="ROUTE_SKIPPED",
+        label="Route Skipped",
+        waypoints=[
+            EditableRouteWaypoint(
+                id="WP-SKIPPED",
+                label="Skipped Waypoint",
+                pose=EditableMapPoint(x=1.0, y=2.0),
+                actions=[EditableRouteAction(id="WAIT", kind="wait")],
+            )
+        ],
+    )
+    save_map_authoring(
+        tmp_path,
+        MapAuthoringState(selected_route_id="ROUTE_SKIPPED", routes=[route]),
+    )
+
+    from dimos.experimental.dogops.route_actions import RouteActionResult
+    import dimos.experimental.dogops.route_executor as route_executor_module
+
+    monkeypatch.setattr(
+        route_executor_module,
+        "execute_route_action",
+        lambda *_, **__: RouteActionResult(ok=True, state="skipped", note="not needed"),
+    )
+
+    state = DogOpsRouteExecutor(tmp_path).follow_route(dry_run=True)
+
+    skipped_event = [event for event in state.events if event.action_id == "WAIT"][-1]
+    assert skipped_event.state == "skipped"
+    route_events = RouteRunStore(tmp_path).route_run_events(state.route_run_id or "")
+    assert route_events[-1]["state"] == "skipped"
+
+
+def test_route_action_exception_marks_route_failed(tmp_path) -> None:
+    route = EditableRoute(
+        id="ROUTE_BAD_ACTION",
+        label="Route Bad Action",
+        waypoints=[
+            EditableRouteWaypoint(
+                id="WP-BAD",
+                label="Waypoint",
+                pose=EditableMapPoint(x=1.0, y=2.0),
+                actions=[
+                    EditableRouteAction(
+                        id="BAD-SCAN",
+                        kind="scan_tags",
+                        args={"expected": ["not-an-int"]},
+                    ),
+                ],
+            )
+        ],
+    )
+    save_map_authoring(
+        tmp_path,
+        MapAuthoringState(selected_route_id="ROUTE_BAD_ACTION", routes=[route]),
+    )
+    current_goal = {"x": 0.0, "y": 0.0}
+
+    def publish(x: float, y: float, z: float, frame: str) -> dict[str, object]:
+        current_goal.update({"x": x, "y": y})
+        return {"accepted": True}
+
+    executor = DogOpsRouteExecutor(
+        tmp_path,
+        goal_publisher=CallableGoalPublisher(publish, transport_name="fake_nav"),
+        live_snapshot_reader=lambda: {
+            "robot_pose": {"x": current_goal["x"], "y": current_goal["y"]},
+            "target": {"x": current_goal["x"], "y": current_goal["y"]},
+            "topics": {"odom": {"age_s": 0.1}},
+        },
+        sleep_fn=lambda _: None,
+    )
+
+    state = executor.follow_route()
+
+    assert state.state == "failed"
+    assert state.route_run_id
+    assert "invalid literal" in (state.last_error or "")
+    assert load_route_execution(tmp_path).state == "failed"
+    failed_action = [event for event in state.events if event.action_id == "BAD-SCAN"][-1]
+    assert failed_action.state == "failed"
+    assert failed_action.payload["error"] == "ValueError"
+    route_run = RouteRunStore(tmp_path).route_run_detail(state.route_run_id)
+    assert route_run is not None
+    assert route_run["state"] == "failed"
 
 
 def test_stale_odom_causes_timeout_failure(tmp_path) -> None:
@@ -381,3 +696,6 @@ def test_stop_route_invokes_transport_stop_handler(tmp_path) -> None:
 
     assert stopped.state == "stopped"
     assert calls == ["stop"]
+    events = RouteRunStore(tmp_path).route_run_events(stopped.route_run_id or "")
+    assert events[-1]["state"] == "stopped"
+    assert events[-1]["kind"] == "system"

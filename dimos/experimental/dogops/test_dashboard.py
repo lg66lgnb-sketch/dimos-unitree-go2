@@ -36,6 +36,8 @@ from dimos.experimental.dogops.map_authoring import (
     save_map_authoring,
 )
 from dimos.experimental.dogops.mission_engine import run_offline_simulation
+from dimos.experimental.dogops.route_executor import DogOpsRouteExecutor, save_route_execution
+from dimos.experimental.dogops.route_run_store import RouteRunStore
 
 
 def _get_json(url: str) -> dict[str, object]:
@@ -1484,6 +1486,63 @@ def test_dashboard_route_follow_stop_and_status_endpoints(tmp_path, monkeypatch)
     assert stop_result["hard_stop"]["robot_ip"] == "192.168.12.1"  # type: ignore[index]
 
 
+def test_dashboard_stop_syncs_route_history_when_mcp_stop_fails(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(dashboard, "_run_route_hard_stop", lambda robot_ip: {"robot_ip": robot_ip})
+    monkeypatch.setattr(
+        dashboard,
+        "_run_robot_stop_route",
+        lambda: (_ for _ in ()).throw(ModuleNotFoundError("no dimos")),
+    )
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    save_map_authoring(
+        run_dir,
+        MapAuthoringState(
+            selected_route_id="ROUTE_A",
+            routes=[
+                EditableRoute(
+                    id="ROUTE_A",
+                    label="Route A",
+                    waypoints=[
+                        EditableRouteWaypoint(
+                            id="WP-1",
+                            label="Waypoint 1",
+                            pose=EditableMapPoint(x=1.0, y=2.0),
+                        )
+                    ],
+                )
+            ],
+        ),
+    )
+    route_state = DogOpsRouteExecutor(run_dir).follow_route(dry_run=True)
+    route_state.state = "running"
+    route_state.stop_requested = False
+    save_route_execution(run_dir, route_state)
+    RouteRunStore(run_dir).sync_execution_state(route_state)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        status_stop, stop_result = _post_json(
+            f"{base_url}/api/map/routes/stop",
+            {},
+            headers=_robot_headers(server),
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status_stop == 503
+    assert stop_result["error"] == "dimos_mcp_unavailable"
+    route_run = RouteRunStore(run_dir).route_run_detail(route_state.route_run_id or "")
+    assert route_run["state"] == "stopped"
+    events = RouteRunStore(run_dir).route_run_events(route_state.route_run_id or "")
+    assert events[-1]["state"] == "stopped"
+
+
 def test_dashboard_route_status_requires_token(tmp_path) -> None:
     run_dir = tmp_path / "latest"
     run_offline_simulation(out=run_dir)
@@ -1501,6 +1560,160 @@ def test_dashboard_route_status_requires_token(tmp_path) -> None:
 
     assert status == 403
     assert result["error"] == "map_authoring_forbidden"
+
+
+def test_dashboard_route_run_history_endpoints(tmp_path) -> None:
+    run_dir = tmp_path / ".dogops" / "runs" / "latest"
+    run_offline_simulation(out=run_dir)
+    save_map_authoring(
+        run_dir,
+        MapAuthoringState(
+            selected_route_id="ROUTE_A",
+            routes=[
+                EditableRoute(
+                    id="ROUTE_A",
+                    label="Route A",
+                    waypoints=[
+                        EditableRouteWaypoint(
+                            id="WP-1",
+                            label="Waypoint 1",
+                            pose=EditableMapPoint(x=1.0, y=2.0),
+                        )
+                    ],
+                )
+            ],
+        ),
+    )
+    route_state = DogOpsRouteExecutor(run_dir).follow_route(dry_run=True)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        status_list, route_runs = _get_json_with_status(
+            f"{base_url}/api/route-runs",
+            headers=_robot_headers(server),
+        )
+        status_current, current = _get_json_with_status(
+            f"{base_url}/api/route-runs/current",
+            headers=_robot_headers(server),
+        )
+        status_events, events = _get_json_with_status(
+            f"{base_url}/api/route-runs/{route_state.route_run_id}/events",
+            headers=_robot_headers(server),
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status_list == 200
+    assert route_runs["route_runs"][0]["route_run_id"] == route_state.route_run_id  # type: ignore[index]
+    assert status_current == 200
+    assert current["route_run"]["route_run_id"] == route_state.route_run_id  # type: ignore[index]
+    assert current["events"][0]["state"] == "queued"  # type: ignore[index]
+    timeline_kinds = {row["kind"] for row in current["timeline"]}  # type: ignore[index]
+    assert {"waypoint", "observation", "incident", "work_order", "verification"} <= timeline_kinds
+    assert status_events == 200
+    assert events["events"][0]["route_run_id"] == route_state.route_run_id  # type: ignore[index]
+
+
+def test_dashboard_route_run_detail_uses_historical_run_dir(tmp_path) -> None:
+    first_run_dir = tmp_path / ".dogops" / "runs" / "first"
+    second_run_dir = tmp_path / ".dogops" / "runs" / "second"
+    for run_dir, route_id in ((first_run_dir, "ROUTE_FIRST"), (second_run_dir, "ROUTE_SECOND")):
+        run_offline_simulation(out=run_dir)
+        save_map_authoring(
+            run_dir,
+            MapAuthoringState(
+                selected_route_id=route_id,
+                routes=[
+                    EditableRoute(
+                        id=route_id,
+                        label=route_id,
+                        waypoints=[
+                            EditableRouteWaypoint(
+                                id=f"{route_id}-WP-1",
+                                label="Waypoint 1",
+                                pose=EditableMapPoint(x=1.0, y=2.0),
+                            )
+                        ],
+                    )
+                ],
+            ),
+        )
+    second_report_path = second_run_dir / "report.json"
+    second_report = json.loads(second_report_path.read_text(encoding="utf-8"))
+    second_report["incidents"][0]["title"] = "second-run-only incident"
+    second_report_path.write_text(json.dumps(second_report), encoding="utf-8")
+
+    DogOpsRouteExecutor(first_run_dir).follow_route(dry_run=True)
+    second_route_state = DogOpsRouteExecutor(second_run_dir).follow_route(dry_run=True)
+    server = make_dashboard_server(first_run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        status_detail, detail = _get_json_with_status(
+            f"{base_url}/api/route-runs/{second_route_state.route_run_id}",
+            headers=_robot_headers(server),
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status_detail == 200
+    assert detail["route_run"]["dogops_run_id"] == "second"  # type: ignore[index]
+    timeline_notes = {row["note"] for row in detail["timeline"]}  # type: ignore[index]
+    assert "second-run-only incident" in timeline_notes
+
+
+def test_dashboard_route_run_detail_survives_missing_run_files(tmp_path) -> None:
+    run_dir = tmp_path / ".dogops" / "runs" / "latest"
+    run_offline_simulation(out=run_dir)
+    save_map_authoring(
+        run_dir,
+        MapAuthoringState(
+            selected_route_id="ROUTE_A",
+            routes=[
+                EditableRoute(
+                    id="ROUTE_A",
+                    label="Route A",
+                    waypoints=[
+                        EditableRouteWaypoint(
+                            id="WP-1",
+                            label="Waypoint 1",
+                            pose=EditableMapPoint(x=1.0, y=2.0),
+                        )
+                    ],
+                )
+            ],
+        ),
+    )
+    route_state = DogOpsRouteExecutor(run_dir).follow_route(dry_run=True)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    (run_dir / "state.json").unlink()
+    (run_dir / "report.json").unlink()
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        status_detail, detail = _get_json_with_status(
+            f"{base_url}/api/route-runs/{route_state.route_run_id}",
+            headers=_robot_headers(server),
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status_detail == 200
+    assert detail["route_run"]["route_run_id"] == route_state.route_run_id  # type: ignore[index]
+    assert [row["kind"] for row in detail["timeline"]] == ["waypoint"]  # type: ignore[index]
 
 
 def test_dimos_mcp_call_command_prefers_configured_prefix(monkeypatch) -> None:
