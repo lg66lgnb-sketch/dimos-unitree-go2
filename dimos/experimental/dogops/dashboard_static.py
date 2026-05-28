@@ -1068,6 +1068,62 @@ def render_dashboard_html(
     }}
     .map-panel h2 {{ color: #eef2f8; }}
     .map-shell {{ display: grid; gap: 10px; }}
+    .camera-panel {{
+      background: #07090d;
+      border-color: #1d2430;
+      color: #d8dee9;
+      display: grid;
+      gap: 10px;
+    }}
+    .camera-header {{
+      align-items: center;
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+    }}
+    .camera-header h2 {{ color: #eef2f8; }}
+    .camera-health {{ color: #fbbf24; font-weight: 650; }}
+    .camera-view {{
+      background: #03060b;
+      border: 1px solid #1d2430;
+      border-radius: 8px;
+      display: grid;
+      min-height: 260px;
+      overflow: hidden;
+      place-items: center;
+      position: relative;
+    }}
+    .camera-view img {{
+      background: #03060b;
+      height: 100%;
+      object-fit: contain;
+      width: 100%;
+    }}
+    .camera-view img[hidden] {{ display: none; }}
+    .camera-empty {{
+      align-items: center;
+      background: #03060b;
+      color: #c8d0dc;
+      display: grid;
+      inset: 0;
+      justify-items: center;
+      padding: 18px;
+      position: absolute;
+      text-align: center;
+    }}
+    .camera-empty[hidden] {{ display: none; }}
+    .camera-empty strong {{
+      color: #eef2f8;
+      display: block;
+      margin-bottom: 6px;
+    }}
+    .camera-meta {{
+      color: #c8d0dc;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      font-size: 12px;
+    }}
     .rerun-surface {{
       background: #03060b;
       border: 1px solid #1d2430;
@@ -1655,6 +1711,23 @@ def render_dashboard_html(
       <h2>Mission Map</h2>
       {map_html}
     </section>
+    <section class="camera-panel">
+      <div class="camera-header">
+        <h2>DimOS Camera</h2>
+        <span class="camera-health" data-camera-health>Waiting for /color_image</span>
+      </div>
+      <div class="camera-view">
+        <img src="about:blank" alt="Latest DimOS color_image frame" hidden data-camera-frame>
+        <div class="camera-empty" data-camera-empty>
+          <span><strong>No camera frame yet</strong>Waiting for DimOS color_image on /color_image.</span>
+        </div>
+      </div>
+      <div class="camera-meta">
+        <span data-camera-topic>Topic: /color_image</span>
+        <span data-camera-shape>Frame: pending</span>
+        <span data-camera-age>Age: pending</span>
+      </div>
+    </section>
     <div class="ops-stack">
       <section>
         <h2>Run Summary</h2>
@@ -1821,6 +1894,12 @@ def render_dashboard_html(
       const qrCargoLayer = liveMapSvg ? liveMapSvg.querySelector("[data-qr-cargo-layer]") : null;
       const qrCargoRows = document.querySelector("[data-qr-cargo-events]");
       const qrCargoStatus = document.querySelector("[data-qr-cargo-status]");
+      const cameraFrame = document.querySelector("[data-camera-frame]");
+      const cameraEmpty = document.querySelector("[data-camera-empty]");
+      const cameraHealth = document.querySelector("[data-camera-health]");
+      const cameraTopic = document.querySelector("[data-camera-topic]");
+      const cameraShape = document.querySelector("[data-camera-shape]");
+      const cameraAge = document.querySelector("[data-camera-age]");
       const status = document.querySelector("[data-robot-status]");
       if (!controls || !status) return;
       let motionProfile = "nudge";
@@ -2264,6 +2343,43 @@ def render_dashboard_html(
           setRouteExecutionStatus(`Execution: status unavailable (${{error.message}})`, "error");
         }} finally {{
           routeExecutionPolling = false;
+        }}
+      }};
+      const updateCamera = async () => {{
+        try {{
+          const response = await fetch("/api/camera/status");
+          const camera = await response.json();
+          if (cameraTopic) cameraTopic.textContent = `Topic: ${{camera.topic || "/color_image"}}`;
+          if (cameraShape) {{
+            cameraShape.textContent = camera.received
+              ? `Frame: ${{camera.width}}x${{camera.height}} ${{camera.format || ""}}`
+              : "Frame: pending";
+          }}
+          if (cameraAge) {{
+            cameraAge.textContent = camera.age_s === null || camera.age_s === undefined
+              ? "Age: pending"
+              : `Age: ${{camera.age_s}}s`;
+          }}
+          if (cameraHealth) {{
+            cameraHealth.textContent = camera.received
+              ? "Receiving color_image"
+              : `Waiting for ${{camera.topic || "/color_image"}}`;
+          }}
+          if (cameraFrame && cameraEmpty) {{
+            if (camera.received) {{
+              cameraFrame.src = `/api/camera/frame.jpg?ts=${{Date.now()}}`;
+              cameraFrame.hidden = false;
+              cameraEmpty.hidden = true;
+            }} else {{
+              cameraFrame.hidden = true;
+              cameraFrame.src = "about:blank";
+              cameraEmpty.hidden = false;
+            }}
+          }}
+        }} catch (error) {{
+          if (cameraHealth) cameraHealth.textContent = `Camera unavailable (${{error.message}})`;
+          if (cameraFrame) cameraFrame.hidden = true;
+          if (cameraEmpty) cameraEmpty.hidden = false;
         }}
       }};
       const runSelectedRoute = async (dryRun) => {{
@@ -3287,10 +3403,12 @@ def render_dashboard_html(
       }}
       refreshLiveMap();
       refreshDimOSMap();
+      updateCamera();
       refreshRouteExecution();
       refreshRouteRunHistory();
       window.setInterval(refreshLiveMap, 1000);
       window.setInterval(refreshDimOSMap, 1500);
+      window.setInterval(updateCamera, 750);
       window.setInterval(refreshRouteExecution, 1500);
       window.setInterval(refreshRouteRunHistory, 5000);
     }})();

@@ -127,6 +127,10 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
 
     assert "DogOps SiteOps Agent" in content
     assert "Mission Map" in content
+    assert "DimOS Camera" in content
+    assert "Waiting for /color_image" in content
+    assert 'data-camera-frame' in content
+    assert "/api/camera/frame.jpg" in content
     assert 'data-map-surface' in content
     assert "map-route" in content
     assert "map-free-cell" in content
@@ -463,6 +467,7 @@ def test_dashboard_api_serves_state_report_and_nav(tmp_path) -> None:
         state = _get_json(f"{base_url}/api/state")
         report = _get_json(f"{base_url}/api/report")
         nav = _get_json(f"{base_url}/api/nav")
+        camera_status = _get_json(f"{base_url}/api/camera/status")
         map_data = _get_json(f"{base_url}/api/map")
         authoring = _get_json(f"{base_url}/api/map/authoring")
         route = _get_json(f"{base_url}/api/route")
@@ -479,6 +484,9 @@ def test_dashboard_api_serves_state_report_and_nav(tmp_path) -> None:
     assert report["checkpoint_verifications"][2]["target_id"] == "COOLING_1"  # type: ignore[index]
     assert report["checkpoint_verifications"][2]["expected_tag_id"] == 41  # type: ignore[index]
     assert nav["waypoints_reached"] == 4
+    assert camera_status["source"] == "DimOS color_image"
+    assert camera_status["topic"] == "/color_image"
+    assert "received" in camera_status
     assert [stop["target_id"] for stop in map_data["route"]] == [
         "HOME",
         "INBOUND_DOCK",
@@ -499,6 +507,56 @@ def test_dashboard_api_serves_state_report_and_nav(tmp_path) -> None:
     assert "costmap" in map_data["live"]  # type: ignore[operator]
     assert authoring["schema_version"] == 1
     assert authoring["site_id"] == "dogops_demo_site"
+
+
+def test_dashboard_camera_status_and_frame_proxy(tmp_path, monkeypatch) -> None:
+    jpeg = (
+        b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
+        b"\xff\xdb\x00C\x00" + (b"\x08" * 64) + b"\xff\xd9"
+    )
+
+    class FakeLiveCameraAdapter:
+        def status(self) -> dict[str, object]:
+            return {
+                "ok": True,
+                "source": "DimOS color_image",
+                "topic": "/color_image",
+                "status": "receiving",
+                "error": "",
+                "received": True,
+                "age_s": 0.1,
+                "width": 640,
+                "height": 360,
+                "format": "RGB",
+                "frame_id": "camera_front",
+            }
+
+        def frame_jpeg(self) -> bytes:
+            return jpeg
+
+    monkeypatch.setattr(dashboard, "_LIVE_CAMERA_ADAPTER", FakeLiveCameraAdapter())
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        camera_status = _get_json(f"{base_url}/api/camera/status")
+        with urllib.request.urlopen(f"{base_url}/api/camera/frame.jpg", timeout=5) as response:
+            frame_content_type = response.headers["Content-Type"]
+            frame_payload = response.read()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert camera_status["ok"] is True
+    assert camera_status["width"] == 640
+    assert camera_status["height"] == 360
+    assert frame_content_type == "image/jpeg"
+    assert frame_payload == jpeg
 
 
 def test_dashboard_map_authoring_endpoints_persist_and_compose(tmp_path) -> None:
