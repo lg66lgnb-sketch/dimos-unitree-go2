@@ -425,13 +425,23 @@ class DogOpsRouteExecutor:
             )
             save_route_execution(self.run_dir, state)
             route_run_store.sync_execution_state(state)
-            result = execute_route_action(
-                action,
-                run_dir=self.run_dir,
-                route_run_id=state.route_run_id or "",
-                waypoint_id=waypoint.id,
-            )
-            event_state: RouteExecutionEventState = "completed" if result.ok else "failed"
+            try:
+                result = execute_route_action(
+                    action,
+                    run_dir=self.run_dir,
+                    route_run_id=state.route_run_id or "",
+                    waypoint_id=waypoint.id,
+                )
+                result_ok = result.ok
+                result_note = result.note
+                result_payload = result.payload
+                result_evidence = result.evidence
+            except Exception as exc:
+                result_ok = False
+                result_note = f"action {action.id} failed: {exc}"
+                result_payload = {"error": exc.__class__.__name__, "source": "exception"}
+                result_evidence = []
+            event_state: RouteExecutionEventState = "completed" if result_ok else "failed"
             state.events.append(
                 self._action_event(
                     state,
@@ -439,14 +449,14 @@ class DogOpsRouteExecutor:
                     action,
                     event_state,
                     started_at,
-                    note=result.note,
-                    payload=result.payload,
+                    note=result_note,
+                    payload=result_payload,
                 )
             )
             save_route_execution(self.run_dir, state)
             route_run_store.sync_execution_state(state)
             action_event_id = f"{state.route_run_id}-{state.events[-1].id}" if state.route_run_id else state.events[-1].id
-            for evidence in result.evidence:
+            for evidence in result_evidence:
                 route_run_store.record_evidence(
                     route_run_id=state.route_run_id or "",
                     event_id=action_event_id,
@@ -456,9 +466,9 @@ class DogOpsRouteExecutor:
                     metadata=evidence.get("metadata") or {},
                     mime_type=evidence.get("mime_type"),
                 )
-            if not result.ok and action.required:
+            if not result_ok and action.required:
                 state.state = "failed"
-                state.last_error = result.note or f"required action failed: {action.id}"
+                state.last_error = result_note or f"required action failed: {action.id}"
                 state.completed_at = self.time_fn()
                 save_route_execution(self.run_dir, state)
                 route_run_store.sync_execution_state(state)

@@ -213,6 +213,60 @@ def test_route_actions_record_timeline_and_placeholder_evidence(tmp_path) -> Non
     assert (tmp_path / "route_runs" / state.route_run_id / "evidence" / "WP-ACTION-CAPTURE.svg").exists()
 
 
+def test_route_action_exception_marks_route_failed(tmp_path) -> None:
+    route = EditableRoute(
+        id="ROUTE_BAD_ACTION",
+        label="Route Bad Action",
+        waypoints=[
+            EditableRouteWaypoint(
+                id="WP-BAD",
+                label="Waypoint",
+                pose=EditableMapPoint(x=1.0, y=2.0),
+                actions=[
+                    EditableRouteAction(
+                        id="BAD-SCAN",
+                        kind="scan_tags",
+                        args={"expected": ["not-an-int"]},
+                    ),
+                ],
+            )
+        ],
+    )
+    save_map_authoring(
+        tmp_path,
+        MapAuthoringState(selected_route_id="ROUTE_BAD_ACTION", routes=[route]),
+    )
+    current_goal = {"x": 0.0, "y": 0.0}
+
+    def publish(x: float, y: float, z: float, frame: str) -> dict[str, object]:
+        current_goal.update({"x": x, "y": y})
+        return {"accepted": True}
+
+    executor = DogOpsRouteExecutor(
+        tmp_path,
+        goal_publisher=CallableGoalPublisher(publish, transport_name="fake_nav"),
+        live_snapshot_reader=lambda: {
+            "robot_pose": {"x": current_goal["x"], "y": current_goal["y"]},
+            "target": {"x": current_goal["x"], "y": current_goal["y"]},
+            "topics": {"odom": {"age_s": 0.1}},
+        },
+        sleep_fn=lambda _: None,
+    )
+
+    state = executor.follow_route()
+
+    assert state.state == "failed"
+    assert state.route_run_id
+    assert "invalid literal" in (state.last_error or "")
+    assert load_route_execution(tmp_path).state == "failed"
+    failed_action = [event for event in state.events if event.action_id == "BAD-SCAN"][-1]
+    assert failed_action.state == "failed"
+    assert failed_action.payload["error"] == "ValueError"
+    route_run = RouteRunStore(tmp_path).route_run_detail(state.route_run_id)
+    assert route_run is not None
+    assert route_run["state"] == "failed"
+
+
 def test_stale_odom_causes_timeout_failure(tmp_path) -> None:
     _save_authoring(tmp_path)
     now = 0.0
