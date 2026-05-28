@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 import html
+import os
+import shutil
 import time
 from typing import Any, Literal
 
@@ -51,6 +53,18 @@ def execute_route_action(
             ok=True,
             note=f"tag scan demo result: {len(expected)} expected",
             payload={"expected_tag_ids": expected, "detected_tag_ids": expected, "source": "demo"},
+            evidence=[
+                {
+                    "kind": "tag_detection",
+                    "path": None,
+                    "mime_type": "application/json",
+                    "metadata": {
+                        "source": "demo",
+                        "expected_tag_ids": expected,
+                        "detected_tag_ids": expected,
+                    },
+                }
+            ],
         )
     if action.kind == "scan_qr":
         expected = [str(item) for item in action.args.get("expected", [])]
@@ -68,9 +82,21 @@ def execute_route_action(
             ok=True,
             note=f"QR scan demo result: {len(payloads)} payloads",
             payload={"expected_payloads": payloads, "detected_payloads": payloads, "source": "demo"},
+            evidence=[
+                {
+                    "kind": "qr_detection",
+                    "path": None,
+                    "mime_type": "application/json",
+                    "metadata": {
+                        "source": "demo",
+                        "expected_payloads": payloads,
+                        "detected_payloads": payloads,
+                    },
+                }
+            ],
         )
     if action.kind == "capture_image":
-        image_path = _write_placeholder_image(
+        image_path, source, mime_type = _capture_image_path(
             run_dir=Path(run_dir),
             route_run_id=route_run_id,
             waypoint_id=waypoint_id,
@@ -78,15 +104,19 @@ def execute_route_action(
         )
         return RouteActionResult(
             ok=True,
-            note="placeholder dog-camera image captured",
-            payload={"source": "demo_placeholder", "path": str(image_path)},
+            note=(
+                "configured Go2 camera image captured"
+                if source == "go2_camera_configured"
+                else "placeholder dog-camera image captured"
+            ),
+            payload={"source": source, "path": str(image_path)},
             evidence=[
                 {
                     "kind": "image",
                     "path": str(image_path),
-                    "mime_type": "image/svg+xml",
+                    "mime_type": mime_type,
                     "metadata": {
-                        "source": "demo_placeholder",
+                        "source": source,
                         "waypoint_id": waypoint_id,
                         "action_id": action.id,
                     },
@@ -106,6 +136,45 @@ def execute_route_action(
             payload={"source": "demo", **action.args},
         )
     return RouteActionResult(ok=False, state="failed", note=f"unsupported action: {action.kind}")
+
+
+def _capture_image_path(
+    *,
+    run_dir: Path,
+    route_run_id: str,
+    waypoint_id: str,
+    action: EditableRouteAction,
+) -> tuple[Path, str, str]:
+    configured = action.args.get("image_path") or os.environ.get("DOGOPS_GO2_CAMERA_IMAGE_PATH")
+    if configured:
+        source = Path(str(configured)).expanduser()
+        if source.exists() and source.is_file():
+            evidence_dir = run_dir / "route_runs" / route_run_id / "evidence"
+            evidence_dir.mkdir(parents=True, exist_ok=True)
+            suffix = source.suffix or ".img"
+            destination = evidence_dir / f"{waypoint_id}-{action.id}{suffix}"
+            shutil.copyfile(source, destination)
+            return destination, "go2_camera_configured", _mime_type_for_suffix(suffix)
+    return (
+        _write_placeholder_image(
+            run_dir=run_dir,
+            route_run_id=route_run_id,
+            waypoint_id=waypoint_id,
+            action=action,
+        ),
+        "demo_placeholder",
+        "image/svg+xml",
+    )
+
+
+def _mime_type_for_suffix(suffix: str) -> str:
+    return {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+        ".svg": "image/svg+xml",
+    }.get(suffix.lower(), "application/octet-stream")
 
 
 def _write_placeholder_image(

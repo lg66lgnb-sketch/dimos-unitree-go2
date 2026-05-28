@@ -696,8 +696,11 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
     def _unified_timeline(self, route_events: list[dict[str, Any]]) -> list[dict[str, Any]]:
         state = self._read_json(self.run_dir / "state.json")
         report = self._read_json(self.run_dir / "report.json")
+        route_run_id = str(route_events[0].get("route_run_id")) if route_events else None
         rows = [
             {
+                "event_id": f"TL-{event.get('event_id') or event.get('sequence')}",
+                "route_run_id": event.get("route_run_id"),
                 "ts": event.get("ts") or 0,
                 "sequence": event.get("sequence"),
                 "kind": event.get("kind") or "route",
@@ -710,6 +713,8 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         for observation in state.get("observations") or []:
             rows.append(
                 {
+                    "event_id": f"OBS-{observation.get('id')}",
+                    "route_run_id": route_run_id,
                     "ts": observation.get("ts") or 0,
                     "sequence": "",
                     "kind": "observation",
@@ -721,6 +726,8 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         for incident in report.get("incidents") or []:
             rows.append(
                 {
+                    "event_id": f"INC-{incident.get('id')}",
+                    "route_run_id": route_run_id,
                     "ts": incident.get("ts_open") or 0,
                     "sequence": "",
                     "kind": "incident",
@@ -734,6 +741,8 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
             incident = incidents_by_id.get(work_order.get("incident_id")) or {}
             rows.append(
                 {
+                    "event_id": f"WO-{work_order.get('id')}",
+                    "route_run_id": route_run_id,
                     "ts": incident.get("ts_closed") or incident.get("ts_open") or 0,
                     "sequence": "",
                     "kind": "work_order",
@@ -745,6 +754,8 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         for checkpoint in report.get("checkpoint_verifications") or []:
             rows.append(
                 {
+                    "event_id": f"VER-{checkpoint.get('target_id')}",
+                    "route_run_id": route_run_id,
                     "ts": state.get("run", {}).get("ended_at") or state.get("run", {}).get("started_at") or 0,
                     "sequence": "",
                     "kind": "verification",
@@ -756,7 +767,12 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         rows.sort(key=lambda item: (float(item.get("ts") or 0), str(item.get("kind") or "")))
         for index, row in enumerate(rows, 1):
             row["sequence"] = row.get("sequence") or index
-        return rows
+        store = RouteRunStore(self.run_dir)
+        store.replace_timeline_events(str(state.get("run", {}).get("id") or self.run_dir.name), rows)
+        return store.timeline_events(
+            dogops_run_id=str(state.get("run", {}).get("id") or self.run_dir.name),
+            route_run_id=route_run_id,
+        )
 
     def _route_execution_payload(
         self,

@@ -208,9 +208,61 @@ def test_route_actions_record_timeline_and_placeholder_evidence(tmp_path) -> Non
     ]
     assert action_events[-1].payload["source"] == "demo_placeholder"
     evidence = RouteRunStore(tmp_path).route_run_evidence(state.route_run_id)
-    assert evidence[0]["kind"] == "image"
-    assert evidence[0]["metadata"]["source"] == "demo_placeholder"
+    evidence_kinds = {item["kind"] for item in evidence}
+    assert {"tag_detection", "image"} <= evidence_kinds
+    image_evidence = [item for item in evidence if item["kind"] == "image"][0]
+    assert image_evidence["metadata"]["source"] == "demo_placeholder"
     assert (tmp_path / "route_runs" / state.route_run_id / "evidence" / "WP-ACTION-CAPTURE.svg").exists()
+
+
+def test_capture_image_uses_configured_go2_image(tmp_path) -> None:
+    source_image = tmp_path / "go2-frame.jpg"
+    source_image.write_bytes(b"fake-jpeg")
+    route = EditableRoute(
+        id="ROUTE_IMAGE",
+        label="Route Image",
+        waypoints=[
+            EditableRouteWaypoint(
+                id="WP-IMAGE",
+                label="Waypoint",
+                pose=EditableMapPoint(x=1.0, y=2.0),
+                actions=[
+                    EditableRouteAction(
+                        id="CAPTURE",
+                        kind="capture_image",
+                        args={"image_path": str(source_image)},
+                    ),
+                ],
+            )
+        ],
+    )
+    save_map_authoring(
+        tmp_path,
+        MapAuthoringState(selected_route_id="ROUTE_IMAGE", routes=[route]),
+    )
+    current_goal = {"x": 0.0, "y": 0.0}
+
+    def publish(x: float, y: float, z: float, frame: str) -> dict[str, object]:
+        current_goal.update({"x": x, "y": y})
+        return {"accepted": True}
+
+    state = DogOpsRouteExecutor(
+        tmp_path,
+        goal_publisher=CallableGoalPublisher(publish, transport_name="fake_nav"),
+        live_snapshot_reader=lambda: {
+            "robot_pose": {"x": current_goal["x"], "y": current_goal["y"]},
+            "target": {"x": current_goal["x"], "y": current_goal["y"]},
+            "topics": {"odom": {"age_s": 0.1}},
+        },
+        sleep_fn=lambda _: None,
+    ).follow_route()
+
+    assert state.route_run_id
+    evidence = RouteRunStore(tmp_path).route_run_evidence(state.route_run_id)
+    image_evidence = [item for item in evidence if item["kind"] == "image"][0]
+    assert image_evidence["metadata"]["source"] == "go2_camera_configured"
+    copied_path = tmp_path / "route_runs" / state.route_run_id / "evidence" / "WP-IMAGE-CAPTURE.jpg"
+    assert copied_path.read_bytes() == b"fake-jpeg"
 
 
 def test_route_action_exception_marks_route_failed(tmp_path) -> None:

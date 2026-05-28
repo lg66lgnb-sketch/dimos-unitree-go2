@@ -301,19 +301,7 @@ class DogOpsRouteExecutor:
             target_id = waypoint.target_id or waypoint.id
             actions = []
             for step in steps_by_target.get(target_id, []):
-                kind = _mission_action_kind(step.action)
-                if kind is None:
-                    continue
-                actions.append(
-                    EditableRouteAction(
-                        id=step.id,
-                        kind=kind,
-                        label=step.action,
-                        required=step.required,
-                        timeout_s=step.timeout_s,
-                        args={"target_id": step.target_id, "mission_action": step.action},
-                    )
-                )
+                actions.extend(_mission_step_actions(state, step))
             waypoint.actions = actions
         return route_with_actions
 
@@ -723,13 +711,94 @@ def route_feedback_from_snapshot(snapshot: dict[str, Any]) -> tuple[dict[str, fl
     return {"x": x, "y": y}, age_s
 
 
-def _mission_action_kind(action: str) -> str | None:
-    return {
-        "scan_zone": "scan_tags",
-        "inspect_asset": "inspect_asset",
-        "verify_work_order": "verify_work_order",
-        "wait_for_human_fix": "operator_prompt",
-    }.get(action)
+def _mission_step_actions(state: Any, step: Any) -> list[EditableRouteAction]:
+    base_args = {"target_id": step.target_id, "mission_action": step.action}
+    sim_obs = state.mission.simulation_observations.get(step.id)
+    if step.action == "scan_zone":
+        visible_tags = list(sim_obs.visible_tag_ids) if sim_obs is not None else []
+        qr_payloads = _qr_payloads_for_observation(sim_obs)
+        actions = [
+            EditableRouteAction(
+                id=f"{step.id}_tags",
+                kind="scan_tags",
+                label="scan_tags",
+                required=step.required,
+                timeout_s=step.timeout_s,
+                args={**base_args, "expected": visible_tags},
+            )
+        ]
+        if qr_payloads:
+            actions.append(
+                EditableRouteAction(
+                    id=f"{step.id}_qr",
+                    kind="scan_qr",
+                    label="scan_qr",
+                    required=False,
+                    timeout_s=step.timeout_s,
+                    args={**base_args, "expected": qr_payloads},
+                )
+            )
+        return actions
+    if step.action == "inspect_asset":
+        return [
+            EditableRouteAction(
+                id=f"{step.id}_image",
+                kind="capture_image",
+                label="capture_image",
+                required=False,
+                timeout_s=step.timeout_s,
+                args={**base_args, "target": step.target_id},
+            ),
+            EditableRouteAction(
+                id=step.id,
+                kind="inspect_asset",
+                label=step.action,
+                required=step.required,
+                timeout_s=step.timeout_s,
+                args=base_args,
+            ),
+        ]
+    if step.action == "verify_work_order":
+        return [
+            EditableRouteAction(
+                id=f"{step.id}_image",
+                kind="capture_image",
+                label="capture_image",
+                required=False,
+                timeout_s=step.timeout_s,
+                args={**base_args, "target": step.target_id},
+            ),
+            EditableRouteAction(
+                id=step.id,
+                kind="verify_work_order",
+                label=step.action,
+                required=step.required,
+                timeout_s=step.timeout_s,
+                args=base_args,
+            ),
+        ]
+    if step.action == "wait_for_human_fix":
+        return [
+            EditableRouteAction(
+                id=step.id,
+                kind="operator_prompt",
+                label=step.action,
+                required=step.required,
+                timeout_s=step.timeout_s,
+                args=base_args,
+            )
+        ]
+    return []
+
+
+def _qr_payloads_for_observation(sim_obs: Any) -> list[str]:
+    if sim_obs is None:
+        return []
+    payloads: list[str] = []
+    for key in sim_obs.facts:
+        if key.startswith("PKG-") and key.endswith(".zone_id"):
+            payloads.append(key.removesuffix(".zone_id"))
+    return sorted(set(payloads))
 
 
 def _pose_matches_waypoint(pose: Any, waypoint: EditableRouteWaypoint) -> bool:

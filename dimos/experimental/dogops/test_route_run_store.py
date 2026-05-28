@@ -101,3 +101,35 @@ def test_mission_steps_provide_default_route_actions(tmp_path) -> None:
         for action in waypoint["actions"]
     ]
     assert {"inspect_cooling", "wait_for_human_fix", "verify_cooling"} & set(action_ids)
+    assert "inspect_cooling_image" in action_ids
+
+
+def test_timeline_events_are_persisted_in_sqlite(tmp_path) -> None:
+    run_dir = tmp_path / ".dogops" / "runs" / "latest"
+    store = RouteRunStore(run_dir)
+
+    store.replace_timeline_events(
+        "latest",
+        [
+            {
+                "event_id": "INC-001",
+                "ts": 1.0,
+                "kind": "incident",
+                "state": "open",
+                "target_id": "COOLING_1",
+                "note": "blocked cooling",
+            },
+            {
+                "event_id": "WO-001",
+                "ts": 2.0,
+                "kind": "work_order",
+                "state": "verified_closed",
+                "target_id": "INC-001",
+                "note": "move package",
+            },
+        ],
+    )
+
+    timeline = store.timeline_events(dogops_run_id="latest")
+    assert [event["kind"] for event in timeline] == ["incident", "work_order"]
+    assert timeline[0]["payload"] == {}

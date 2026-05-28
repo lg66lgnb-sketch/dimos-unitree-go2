@@ -277,15 +277,15 @@ Start with deterministic/local handlers:
 
 | Action kind | First implementation |
 |---|---|
-| `scan_tags` | Use existing simulated or image AprilTag detection path; live stream remains optional. |
-| `scan_qr` | Add QR detector wrapper if OpenCV QRCodeDetector is available; record a real detector result or an explicit `not_configured`/failed action. |
-| `capture_image` | Save a deterministic placeholder demo image that looks like dog-captured evidence; wire real Go2 image capture after the camera stream path is validated. |
+| `scan_tags` | Record deterministic demo detections from authored or mission-derived expected tag IDs, with evidence metadata. |
+| `scan_qr` | Record deterministic demo detections from authored or mission-derived expected QR payloads, with evidence metadata. |
+| `capture_image` | Copy a configured Go2 camera image path into evidence when supplied, otherwise save a deterministic placeholder demo image that looks like dog-captured evidence. |
 | `inspect_asset` | Reuse existing `check_clearance`, `read_gauge`, or deterministic fact checks. |
 | `verify_work_order` | Reuse `verify_work_order` and attach current route/evidence context. |
 | `wait` | Deterministic timer with status events. |
 | `operator_prompt` | Dashboard prompt/manual confirmation, marked as guided. |
 
-Do not block the first database/history implementation on real camera capture. Use the placeholder demo image for `capture_image` until the live image path is validated, and store metadata that identifies the evidence as demo-generated.
+Do not block the database/history implementation on live camera capture. `capture_image` accepts an authored `image_path` or `DOGOPS_GO2_CAMERA_IMAGE_PATH` for configured Go2 frame capture, falls back to the placeholder demo image when no frame file exists, and stores metadata identifying the evidence source.
 
 ## Dashboard Changes
 
@@ -434,9 +434,7 @@ uv run dimos mcp list-tools | rg 'follow_route|stop_route|route_status'
 - Export selected route run as JSON/JSONL bundle.
 - Add comparison helpers for repeated route runs if needed.
 
-## Remaining Questions
+## Remaining Hardware Follow-Ups
 
-1. What should the first canonical mission-YAML action set be for the demo route?
-2. What placeholder demo image should `capture_image` use, and should it vary by waypoint/action?
-3. What printed QR payload format should package labels use?
-4. Should `operator_prompt` remain available for safety/guided confirmation, even though image evidence should not be manually attached?
+1. Validate the route-run history path in the foreground full-DimOS runtime against the real Go2.
+2. Wire the live Go2 camera stream or frame-export path into the configured `image_path`/`DOGOPS_GO2_CAMERA_IMAGE_PATH` capture hook.

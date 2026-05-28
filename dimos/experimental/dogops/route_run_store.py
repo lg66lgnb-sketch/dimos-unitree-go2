@@ -178,6 +178,17 @@ class RouteRunStore:
                     created_at,
                 ),
             )
+        self._append_evidence_export(route_run_id, {
+            "evidence_id": evidence_id,
+            "route_run_id": route_run_id,
+            "event_id": event_id,
+            "observation_id": observation_id,
+            "kind": kind,
+            "path": evidence_path,
+            "mime_type": mime_type,
+            "metadata": metadata or {},
+            "created_at": created_at,
+        })
         return {
             "evidence_id": evidence_id,
             "route_run_id": route_run_id,
@@ -189,6 +200,58 @@ class RouteRunStore:
             "metadata": metadata or {},
             "created_at": created_at,
         }
+
+    def replace_timeline_events(self, dogops_run_id: str, rows: list[dict[str, Any]]) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM dogops_timeline_events WHERE dogops_run_id = ?", (dogops_run_id,))
+            for sequence, row in enumerate(rows, 1):
+                event_id = str(row.get("event_id") or f"{dogops_run_id}-TL-{sequence:04d}")
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO dogops_timeline_events (
+                      event_id, dogops_run_id, route_run_id, ts, sequence, kind, state,
+                      target_id, note, payload_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event_id,
+                        dogops_run_id,
+                        row.get("route_run_id"),
+                        float(row.get("ts") or 0.0),
+                        int(row.get("sequence") or sequence),
+                        str(row.get("kind") or "system"),
+                        str(row.get("state") or ""),
+                        row.get("target_id"),
+                        str(row.get("note") or ""),
+                        json.dumps(row.get("payload") or {}, sort_keys=True),
+                    ),
+                )
+
+    def timeline_events(
+        self,
+        *,
+        dogops_run_id: str | None = None,
+        route_run_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        filters = []
+        args: list[Any] = []
+        if dogops_run_id is not None:
+            filters.append("dogops_run_id = ?")
+            args.append(dogops_run_id)
+        if route_run_id is not None:
+            filters.append("(route_run_id = ? OR route_run_id IS NULL)")
+            args.append(route_run_id)
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM dogops_timeline_events
+                {where}
+                ORDER BY ts ASC, sequence ASC, event_id ASC
+                """,
+                args,
+            ).fetchall()
+        return [_row_to_dict(row) for row in rows]
 
     def list_route_runs(self, *, limit: int = 50) -> list[dict[str, Any]]:
         with self._connect() as conn:
@@ -262,6 +325,12 @@ class RouteRunStore:
                 handle.write(json.dumps(event, sort_keys=True) + "\n")
         (run_dir / "evidence").mkdir(exist_ok=True)
 
+    def _append_evidence_export(self, route_run_id: str, payload: dict[str, Any]) -> None:
+        run_dir = self.run_dir / "route_runs" / route_run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        with (run_dir / "evidence.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, sort_keys=True) + "\n")
+
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
@@ -332,6 +401,19 @@ class RouteRunStore:
                   FOREIGN KEY(event_id) REFERENCES route_run_events(event_id)
                 );
 
+                CREATE TABLE IF NOT EXISTS dogops_timeline_events (
+                  event_id TEXT PRIMARY KEY,
+                  dogops_run_id TEXT NOT NULL,
+                  route_run_id TEXT,
+                  ts REAL NOT NULL,
+                  sequence INTEGER NOT NULL,
+                  kind TEXT NOT NULL,
+                  state TEXT NOT NULL,
+                  target_id TEXT,
+                  note TEXT NOT NULL DEFAULT '',
+                  payload_json TEXT NOT NULL DEFAULT '{}'
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_route_runs_started_at
                   ON route_runs(started_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_route_runs_dogops_run_id
@@ -342,6 +424,10 @@ class RouteRunStore:
                   ON route_run_events(route_run_id, sequence);
                 CREATE INDEX IF NOT EXISTS idx_route_run_evidence_run
                   ON route_run_evidence(route_run_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_dogops_timeline_run
+                  ON dogops_timeline_events(dogops_run_id, ts, sequence);
+                CREATE INDEX IF NOT EXISTS idx_dogops_timeline_route_run
+                  ON dogops_timeline_events(route_run_id, ts, sequence);
                 """
             )
 
