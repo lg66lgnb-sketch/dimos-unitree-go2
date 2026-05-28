@@ -13,7 +13,7 @@ import urllib.request
 
 import pytest
 
-from dimos.experimental.dogops import dashboard, dashboard_static
+from dimos.experimental.dogops import dashboard, dashboard_static, live_camera
 from dimos.experimental.dogops.dashboard import DogOpsDashboardModule, make_dashboard_server
 from dimos.experimental.dogops.dashboard_static import (
     build_map_data,
@@ -547,6 +547,10 @@ def test_dashboard_camera_status_and_frame_proxy(tmp_path, monkeypatch) -> None:
         with urllib.request.urlopen(f"{base_url}/api/camera/frame.jpg", timeout=5) as response:
             frame_content_type = response.headers["Content-Type"]
             frame_payload = response.read()
+        forbidden_status, forbidden_result = _get_json_with_status(
+            f"{base_url}/api/camera/status",
+            headers={"Host": "192.0.2.10"},
+        )
     finally:
         server.shutdown()
         server.server_close()
@@ -557,6 +561,32 @@ def test_dashboard_camera_status_and_frame_proxy(tmp_path, monkeypatch) -> None:
     assert camera_status["height"] == 360
     assert frame_content_type == "image/jpeg"
     assert frame_payload == jpeg
+    assert forbidden_status == 403
+    assert forbidden_result["error"] == "local_read_only"
+
+
+def test_live_camera_adapter_marks_stale_frames_pending() -> None:
+    class FakeFrame:
+        width = 640
+        height = 360
+        format = "RGB"
+        frame_id = "camera_front"
+
+        def to_base64(self, *, quality: int = 75) -> str:
+            assert quality == 75
+            return "ZmFrZQ=="
+
+    adapter = live_camera.DogOpsLiveCameraAdapter()
+    adapter._started = True
+    adapter._latest = (time.time() - live_camera.LIVE_CAMERA_MAX_AGE_S - 0.1, FakeFrame())
+
+    status = adapter.status()
+
+    assert status["ok"] is False
+    assert status["received"] is False
+    assert status["stale"] is True
+    assert status["status"] == "stale_frame"
+    assert adapter.frame_jpeg() is None
 
 
 def test_dashboard_map_authoring_endpoints_persist_and_compose(tmp_path) -> None:

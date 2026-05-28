@@ -232,9 +232,11 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
             report = self._read_json(self.run_dir / "report.json")
             self._send_json(report.get("nav_summary") or {})
         elif path == "/api/camera/status":
-            self._send_json(_LIVE_CAMERA_ADAPTER.status())
+            if self._authorize_local_read():
+                self._send_json(_LIVE_CAMERA_ADAPTER.status())
         elif path == "/api/camera/frame.jpg":
-            self._send_camera_frame()
+            if self._authorize_local_read():
+                self._send_camera_frame()
         elif path == "/api/map":
             state = self._read_json(self.run_dir / "state.json")
             report = self._read_json(self.run_dir / "report.json")

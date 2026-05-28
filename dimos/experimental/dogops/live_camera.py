@@ -11,6 +11,7 @@ from typing import Any
 
 DEFAULT_DIMOS_ROOT = os.environ.get("DIMOS_ROOT", "")
 DEFAULT_COLOR_IMAGE_TOPIC = os.environ.get("DOGOPS_CAMERA_TOPIC", "/color_image")
+LIVE_CAMERA_MAX_AGE_S = 5.0
 
 
 class DogOpsLiveCameraAdapter:
@@ -31,15 +32,18 @@ class DogOpsLiveCameraAdapter:
             latest = self._latest
             error = self._error
         now = time.time()
-        frame = latest[1] if latest is not None else None
+        age_s = now - latest[0] if latest is not None else None
+        fresh = age_s is not None and age_s <= LIVE_CAMERA_MAX_AGE_S
+        frame = latest[1] if fresh else None
         return {
-            "ok": latest is not None,
+            "ok": fresh,
             "source": "DimOS color_image",
             "topic": self.topic,
-            "status": "receiving" if latest is not None else "waiting_for_frame",
+            "status": "receiving" if fresh else "stale_frame" if latest is not None else "waiting_for_frame",
             "error": error,
-            "received": latest is not None,
-            "age_s": round(now - latest[0], 3) if latest is not None else None,
+            "received": fresh,
+            "stale": latest is not None and not fresh,
+            "age_s": round(age_s, 3) if age_s is not None else None,
             "width": int(getattr(frame, "width", 0) or 0) if frame is not None else None,
             "height": int(getattr(frame, "height", 0) or 0) if frame is not None else None,
             "format": _format_name(getattr(frame, "format", None)) if frame is not None else None,
@@ -50,7 +54,7 @@ class DogOpsLiveCameraAdapter:
         self.start()
         with self._lock:
             latest = self._latest
-        if latest is None:
+        if latest is None or time.time() - latest[0] > LIVE_CAMERA_MAX_AGE_S:
             return None
         frame = latest[1]
         if hasattr(frame, "to_base64"):
