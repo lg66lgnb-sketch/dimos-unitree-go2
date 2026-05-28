@@ -345,6 +345,34 @@ def test_optional_action_failure_records_and_continues(tmp_path) -> None:
     assert route_run["actions_completed"] == 1
 
 
+def test_dry_run_required_action_failure_stays_failed(tmp_path) -> None:
+    route = EditableRoute(
+        id="ROUTE_REQUIRED_FAIL",
+        label="Route Required Fail",
+        waypoints=[
+            EditableRouteWaypoint(
+                id="WP-REQUIRED",
+                label="Required Waypoint",
+                pose=EditableMapPoint(x=1.0, y=2.0),
+                actions=[EditableRouteAction(id="REQUIRED-QR", kind="scan_qr")],
+            )
+        ],
+    )
+    save_map_authoring(
+        tmp_path,
+        MapAuthoringState(selected_route_id="ROUTE_REQUIRED_FAIL", routes=[route]),
+    )
+
+    state = DogOpsRouteExecutor(tmp_path).follow_route(dry_run=True)
+
+    assert state.state == "failed"
+    assert state.last_error == "QR scan configured without expected payloads"
+    assert load_route_execution(tmp_path).state == "failed"
+    route_run = RouteRunStore(tmp_path).route_run_detail(state.route_run_id or "")
+    assert route_run["state"] == "failed"
+    assert route_run["actions_completed"] == 0
+
+
 def test_skipped_action_state_is_preserved(tmp_path, monkeypatch) -> None:
     route = EditableRoute(
         id="ROUTE_SKIPPED",

@@ -227,11 +227,12 @@ class DogOpsRouteExecutor:
                     break
 
             if dry_run:
-                state.state = "completed"
-                state.active_waypoint_id = None
-                state.completed_at = self.time_fn()
-                save_route_execution(self.run_dir, state)
-                route_run_store.sync_execution_state(state)
+                if state.state == "running":
+                    state.state = "completed"
+                    state.active_waypoint_id = None
+                    state.completed_at = self.time_fn()
+                    save_route_execution(self.run_dir, state)
+                    route_run_store.sync_execution_state(state)
                 return state
 
             if state.state == "running":
@@ -245,7 +246,6 @@ class DogOpsRouteExecutor:
 
     def stop_route(self) -> RouteExecutionState:
         state = request_route_stop(self.run_dir, run_id=self.run_id, now=self.time_fn)
-        self._append_stop_event(state)
         if self.stop_handler is not None:
             try:
                 self.stop_handler()
@@ -470,31 +470,6 @@ class DogOpsRouteExecutor:
         save_route_execution(self.run_dir, state)
         return state
 
-    def _append_stop_event(self, state: RouteExecutionState) -> None:
-        if state.state != "stopped" or any(event.state == "stopped" for event in state.events):
-            return
-        previous = state.events[-1] if state.events else None
-        if previous is None:
-            return
-        state.events.append(
-            RouteExecutionEvent(
-                id=f"RTE-{len(state.events) + 1:03d}",
-                ts=self.time_fn(),
-                route_id=state.route_id,
-                waypoint_id=state.active_waypoint_id or previous.waypoint_id,
-                target_id=previous.target_id,
-                x=previous.x,
-                y=previous.y,
-                state="stopped",
-                elapsed_s=previous.elapsed_s,
-                retries=previous.retries,
-                guided=previous.guided,
-                note="stop requested",
-                kind="system",
-            )
-        )
-        save_route_execution(self.run_dir, state)
-
     def _wait_until_reached(
         self,
         waypoint: EditableRouteWaypoint,
@@ -714,8 +689,35 @@ def request_route_stop(
         state.stop_requested = True
         state.state = "stopped"
         state.completed_at = now()
+        _append_stop_event_to_state(state, now=now)
         save_route_execution(run_dir, state)
+        RouteRunStore(run_dir).sync_execution_state(state)
     return state
+
+
+def _append_stop_event_to_state(state: RouteExecutionState, *, now: Callable[[], float]) -> None:
+    if state.state != "stopped" or any(event.state == "stopped" for event in state.events):
+        return
+    previous = state.events[-1] if state.events else None
+    if previous is None:
+        return
+    state.events.append(
+        RouteExecutionEvent(
+            id=f"RTE-{len(state.events) + 1:03d}",
+            ts=now(),
+            route_id=state.route_id,
+            waypoint_id=state.active_waypoint_id or previous.waypoint_id,
+            target_id=previous.target_id,
+            x=previous.x,
+            y=previous.y,
+            state="stopped",
+            elapsed_s=previous.elapsed_s,
+            retries=previous.retries,
+            guided=previous.guided,
+            note="stop requested",
+            kind="system",
+        )
+    )
 
 
 def route_feedback_from_snapshot(snapshot: dict[str, Any]) -> tuple[dict[str, float] | None, float | None]:

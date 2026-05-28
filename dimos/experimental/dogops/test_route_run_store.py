@@ -64,7 +64,7 @@ def test_every_route_run_gets_distinct_history_record(tmp_path) -> None:
     assert (run_dir / "route_runs" / second.route_run_id / "route_run.json").exists()
 
 
-def test_mission_steps_provide_default_route_actions(tmp_path) -> None:
+def test_mission_steps_provide_default_route_actions_for_full_demo_route(tmp_path) -> None:
     run_dir = tmp_path / ".dogops" / "runs" / "latest"
     from dimos.experimental.dogops.mission_engine import run_offline_simulation
 
@@ -79,10 +79,22 @@ def test_mission_steps_provide_default_route_actions(tmp_path) -> None:
                     label="Route Defaults",
                     waypoints=[
                         EditableRouteWaypoint(
+                            id="WP-INBOUND",
+                            label="Inbound",
+                            target_id="INBOUND_DOCK",
+                            pose=EditableMapPoint(x=0.0, y=1.0),
+                        ),
+                        EditableRouteWaypoint(
                             id="WP-COOLING",
                             label="Cooling",
                             target_id="COOLING_1",
                             pose=EditableMapPoint(x=1.0, y=2.0),
+                        ),
+                        EditableRouteWaypoint(
+                            id="WP-QA",
+                            label="QA Hold",
+                            target_id="QA_HOLD",
+                            pose=EditableMapPoint(x=2.0, y=3.0),
                         )
                     ],
                 )
@@ -95,18 +107,29 @@ def test_mission_steps_provide_default_route_actions(tmp_path) -> None:
 
     assert route_run is not None
     assert route_run["actions_total"] >= 2
-    action_ids = [
-        action["id"]
+    actions_by_target = {
+        waypoint["target_id"]: [(action["id"], action["kind"], action["args"]) for action in waypoint["actions"]]
         for waypoint in route_run["selected_route_snapshot"]["waypoints"]
-        for action in waypoint["actions"]
+    }
+    assert [(action_id, kind) for action_id, kind, _ in actions_by_target["INBOUND_DOCK"]] == [
+        ("scan_inbound_tags", "scan_tags"),
+        ("scan_inbound_qr", "scan_qr"),
     ]
-    assert action_ids == [
-        "inspect_cooling_image",
-        "inspect_cooling",
-        "wait_for_human_fix",
-        "verify_cooling_image",
-        "verify_cooling",
+    assert actions_by_target["INBOUND_DOCK"][0][2]["expected"] == [20, 101, 102]
+    assert actions_by_target["INBOUND_DOCK"][1][2]["expected"] == ["PKG-101", "PKG-102"]
+    assert [(action_id, kind) for action_id, kind, _ in actions_by_target["COOLING_1"]] == [
+        ("inspect_cooling_image", "capture_image"),
+        ("inspect_cooling", "inspect_asset"),
+        ("wait_for_human_fix", "operator_prompt"),
+        ("verify_cooling_image", "capture_image"),
+        ("verify_cooling", "verify_work_order"),
     ]
+    assert [(action_id, kind) for action_id, kind, _ in actions_by_target["QA_HOLD"]] == [
+        ("scan_qa_hold_tags", "scan_tags"),
+        ("scan_qa_hold_qr", "scan_qr"),
+    ]
+    assert actions_by_target["QA_HOLD"][0][2]["expected"] == [30, 104]
+    assert actions_by_target["QA_HOLD"][1][2]["expected"] == ["PKG-104"]
 
 
 def test_timeline_events_are_persisted_in_sqlite(tmp_path) -> None:

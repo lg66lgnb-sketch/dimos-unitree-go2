@@ -36,7 +36,8 @@ from dimos.experimental.dogops.map_authoring import (
     save_map_authoring,
 )
 from dimos.experimental.dogops.mission_engine import run_offline_simulation
-from dimos.experimental.dogops.route_executor import DogOpsRouteExecutor
+from dimos.experimental.dogops.route_executor import DogOpsRouteExecutor, save_route_execution
+from dimos.experimental.dogops.route_run_store import RouteRunStore
 
 
 def _get_json(url: str) -> dict[str, object]:
@@ -1483,6 +1484,63 @@ def test_dashboard_route_follow_stop_and_status_endpoints(tmp_path, monkeypatch)
     assert stop_result["route_execution"]["state"] == "stopped"  # type: ignore[index]
     assert stop_result["hard_stop"]["ok"] is True  # type: ignore[index]
     assert stop_result["hard_stop"]["robot_ip"] == "192.168.12.1"  # type: ignore[index]
+
+
+def test_dashboard_stop_syncs_route_history_when_mcp_stop_fails(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(dashboard, "_run_route_hard_stop", lambda robot_ip: {"robot_ip": robot_ip})
+    monkeypatch.setattr(
+        dashboard,
+        "_run_robot_stop_route",
+        lambda: (_ for _ in ()).throw(ModuleNotFoundError("no dimos")),
+    )
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    save_map_authoring(
+        run_dir,
+        MapAuthoringState(
+            selected_route_id="ROUTE_A",
+            routes=[
+                EditableRoute(
+                    id="ROUTE_A",
+                    label="Route A",
+                    waypoints=[
+                        EditableRouteWaypoint(
+                            id="WP-1",
+                            label="Waypoint 1",
+                            pose=EditableMapPoint(x=1.0, y=2.0),
+                        )
+                    ],
+                )
+            ],
+        ),
+    )
+    route_state = DogOpsRouteExecutor(run_dir).follow_route(dry_run=True)
+    route_state.state = "running"
+    route_state.stop_requested = False
+    save_route_execution(run_dir, route_state)
+    RouteRunStore(run_dir).sync_execution_state(route_state)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        status_stop, stop_result = _post_json(
+            f"{base_url}/api/map/routes/stop",
+            {},
+            headers=_robot_headers(server),
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status_stop == 503
+    assert stop_result["error"] == "dimos_mcp_unavailable"
+    route_run = RouteRunStore(run_dir).route_run_detail(route_state.route_run_id or "")
+    assert route_run["state"] == "stopped"
+    events = RouteRunStore(run_dir).route_run_events(route_state.route_run_id or "")
+    assert events[-1]["state"] == "stopped"
 
 
 def test_dashboard_route_status_requires_token(tmp_path) -> None:
