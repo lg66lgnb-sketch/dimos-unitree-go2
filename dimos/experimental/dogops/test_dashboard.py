@@ -138,7 +138,9 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert 'data-live-target' in content
     assert "refreshDimOSMap" in content
     assert 'data-map-action="gather_heatmap"' in content
+    assert 'data-map-action="scan_zone"' in content
     assert "/api/map/heatmap/gather" in content
+    assert "/api/robot/scan_zone" in content
     assert 'data-map-edit-label-row' in content
     assert 'data-map-edit-route-row' in content
     assert 'data-map-edit-action="dry_run_route"' in content
@@ -153,6 +155,15 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert 'data-route-action-kind="inspect_asset"' in content
     assert 'data-route-action-kind="verify_work_order"' in content
     assert 'data-route-action-kind="operator_prompt"' in content
+    assert "Saved Routes" in content
+    assert 'data-route-table' in content
+    assert 'data-route-table-action="select"' in content
+    assert 'data-route-table-action="rename"' in content
+    assert 'data-route-table-action="duplicate"' in content
+    assert 'data-route-table-action="delete"' in content
+    assert "route-actions-subrow" in content
+    assert "routeActionRows(route)" in content
+    assert "handleRouteTableAction" in content
     assert 'class="map-route-stop-marker"' in content
     assert 'circle.setAttribute("r", "18")' in content
     assert 'circle.setAttribute("r", "9")' in content
@@ -218,7 +229,12 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert "Route Stops" in content
     assert "POI Evidence" in content
     assert "Robot Control" in content
-    assert "Checkpoint Sign-In" in content
+    assert "Checkpoint Sign-In" not in content
+    assert "Mission Timeline" not in content
+    assert "What Changed" not in content
+    assert "Current Run Timeline" in content
+    assert "Current Timeline" not in content
+    assert 'class="scan-strip"' not in content
     assert "Tag Sign-In" in content
     assert "OBS-005" in content
     assert 'data-command="forward"' in content
@@ -328,6 +344,7 @@ def test_dashboard_map_controls_are_grouped_near_legend(tmp_path) -> None:
     assert 'data-map-edit-action="route_add_action"' not in route_row.group(1)
     assert 'data-map-edit-action="route_down"' in route_row.group(1)
     assert 'data-map-route-summary' in route_row.group(1)
+    assert '<th>Last Run</th>' in content
 
     svg_end = content.index("</svg>")
     layer_controls = content.index('<div class="map-layer-controls"', svg_end)
@@ -338,6 +355,68 @@ def test_dashboard_map_controls_are_grouped_near_legend(tmp_path) -> None:
     assert "const nextRouteId" in content
     assert "new id creates a route" in content
     assert "label: routeId" in content
+    assert "routeTable.addEventListener(\"click\"" in content
+    assert "mapEditControls.addEventListener(\"click\"" in content
+    assert ".map-route-table {" in content
+    assert ".route-run-history, .route-run-timeline {" in content
+    assert "background: #ffffff;" in content
+    assert "color: #111827;" in content
+
+
+def test_dashboard_saved_routes_table_renders_selected_actions_and_escapes(tmp_path) -> None:
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    save_map_authoring(
+        run_dir,
+        MapAuthoringState(
+            selected_route_id='ROUTE_"A"&',
+            routes=[
+                EditableRoute(
+                    id='ROUTE_"A"&',
+                    label='Route <A> "quoted"',
+                    waypoints=[
+                        EditableRouteWaypoint(
+                            id="WP-1",
+                            label="Waypoint <One>",
+                            pose=EditableMapPoint(x=1.0, y=2.0),
+                            actions=[
+                                EditableRouteAction(
+                                    id="ACT-1",
+                                    kind="scan_qr",
+                                    label='Scan <QR> "now"',
+                                    args={"expected": ['PAYLOAD<1>&"']},
+                                )
+                            ],
+                        )
+                    ],
+                ),
+                EditableRoute(
+                    id="ROUTE_B",
+                    label="Route B",
+                    waypoints=[
+                        EditableRouteWaypoint(
+                            id="WP-2",
+                            label="Waypoint 2",
+                            pose=EditableMapPoint(x=2.0, y=3.0),
+                        )
+                    ],
+                ),
+            ],
+        ),
+    )
+
+    html_path = write_dashboard_html(run_dir)
+    content = html_path.read_text(encoding="utf-8")
+
+    assert "Saved Routes" in content
+    assert "Route &lt;A&gt; &quot;quoted&quot;" in content
+    assert 'data-route-id="ROUTE_&quot;A&quot;&amp;"' in content
+    assert '<tr class="route-actions-subrow">' in content
+    assert "Waypoint &lt;One&gt;" in content
+    assert "Scan &lt;QR&gt; &quot;now&quot;" in content
+    assert "PAYLOAD&lt;1&gt;&amp;\\&quot;" in content
+    assert "<td>1</td><td>1</td>" in content
+    assert "Route B" in content
 
 
 def test_dashboard_rerun_web_url_stays_loopback_only() -> None:
@@ -1643,6 +1722,51 @@ def test_dashboard_robot_go_to_calls_dimos_bridge(tmp_path, monkeypatch) -> None
     assert result["transport"] == "dimos_mcp"
     assert result["skill"] == "go_to"
     assert calls == [(1.25, -0.5)]
+
+
+def test_dashboard_robot_scan_zone_calls_dimos_bridge(tmp_path, monkeypatch) -> None:
+    calls: list[str] = []
+
+    def fake_scan(zone_id: str) -> dict[str, object]:
+        calls.append(zone_id)
+        return {
+            "transport": "dimos_mcp",
+            "skill": "scan_zone",
+            "mcp_result": {
+                "ok": True,
+                "source": "camera",
+                "visible_tag_ids": [104],
+                "package_ids": ["PKG-104"],
+            },
+        }
+
+    monkeypatch.setattr(dashboard, "_run_robot_scan_zone", fake_scan)
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        status, result = _post_json(
+            f"{base_url}/api/robot/scan_zone",
+            {"command": "scan_zone", "zone_id": "QA_HOLD"},
+            headers=_robot_headers(server),
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 200
+    assert result["ok"] is True
+    assert result["command"] == "scan_zone"
+    assert result["zone_id"] == "QA_HOLD"
+    assert result["transport"] == "dimos_mcp"
+    assert result["skill"] == "scan_zone"
+    assert result["mcp_result"]["source"] == "camera"  # type: ignore[index]
+    assert calls == ["QA_HOLD"]
 
 
 def test_dashboard_robot_go_to_rejects_bad_target(tmp_path, monkeypatch) -> None:

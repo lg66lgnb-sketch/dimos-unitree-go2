@@ -89,6 +89,9 @@ CI=1 uv run pytest -q -o addopts='' dimos/robot/test_all_blueprints_generation.p
 uv run dimos list | rg dogops
 uv run dimos --replay --viewer none run unitree-go2-dogops --daemon || true
 uv run dimos status || true
+uv run dimos stop --force || true
+uv run dimos --replay --rerun-web --rerun-open web run unitree-go2-dogops --daemon || true
+uv run dimos status || true
 uv run dimos mcp list-tools | rg 'run_mission|go_to|scan_zone|read_gauge|check_clearance|detect_blocked_aisle|scan_receiving_manifest|verify_work_order|nav_eval_report'
 uv run dimos stop --force || true
 ```
@@ -111,7 +114,7 @@ Only run after the route is physically clear and the stop command is known.
 
 ```bash
 uv run dimos stop --force || true
-uv run dimos --viewer none run unitree-go2-dogops -o "go2connection.ip=${GO2_IP}" --daemon
+uv run dimos --rerun-web --rerun-open web run unitree-go2-dogops -o "go2connection.ip=${GO2_IP}" --daemon
 uv run dimos status
 uv run dimos mcp list-tools | rg 'run_mission|go_to|scan_zone|read_gauge|check_clearance|detect_blocked_aisle|scan_receiving_manifest|verify_work_order|nav_eval_report'
 uv run dimos mcp call run_mission --json-args '{"mission_id":"receiving_sre_demo"}'

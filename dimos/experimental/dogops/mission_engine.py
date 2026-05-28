@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import time
 from pathlib import Path
+import time
 
 from dimos.experimental.dogops.config_loader import load_dogops_config
 from dimos.experimental.dogops.models import (
