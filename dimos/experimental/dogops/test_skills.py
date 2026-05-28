@@ -26,6 +26,26 @@ class _FakePointPublisher:
         self.points.append(point)
 
 
+class _FakeHeatmapAdapter:
+    def snapshot(self) -> dict[str, object]:
+        return {
+            "ok": True,
+            "source": "DimOS live LCM topics",
+            "status": "receiving",
+            "topics": {"navigation_costmap": {"received": True}},
+            "costmap": {
+                "source": "DimOS live costmap",
+                "columns": 1,
+                "rows": 1,
+                "cells": [{"x": 0.0, "y": 0.0, "width": 0.5, "height": 0.5, "cost": 0.25}],
+            },
+            "path": [],
+            "route": [],
+            "robot_pose": None,
+            "target": None,
+        }
+
+
 def test_skill_container_runs_closed_loop_and_reports_state(tmp_path) -> None:
     skills = DogOpsSkillContainer(run_dir=tmp_path / "latest")
 
@@ -70,6 +90,21 @@ def test_skill_container_runs_closed_loop_and_reports_state(tmp_path) -> None:
 
     nav = _payload(skills.nav_eval_report())
     assert nav["nav_summary"]["waypoints_reached"] == 4  # type: ignore[index]
+
+
+def test_skill_container_gather_heatmap_records_costmap_run(tmp_path) -> None:
+    skills = DogOpsSkillContainer(
+        run_dir=tmp_path / ".dogops" / "runs" / "latest",
+        live_map_adapter=_FakeHeatmapAdapter(),  # type: ignore[arg-type]
+    )
+
+    result = _payload(skills.gather_heatmap(area_id="AISLE_1", duration_s=0.0))
+
+    assert result["ok"] is True
+    assert result["skill"] == "gather_heatmap"
+    assert result["run_kind"] == "gather_heatmap"
+    assert result["heatmap"]["area_id"] == "AISLE_1"  # type: ignore[index]
+    assert (tmp_path / ".dogops" / "runs" / "latest" / "heatmaps" / "latest_heatmap.json").is_file()
 
 
 def test_skill_container_go_to_publishes_clicked_point(tmp_path) -> None:

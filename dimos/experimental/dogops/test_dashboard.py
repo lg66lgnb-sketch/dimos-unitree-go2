@@ -37,6 +37,7 @@ from dimos.experimental.dogops.map_authoring import (
 )
 from dimos.experimental.dogops.mission_engine import run_offline_simulation
 from dimos.experimental.dogops.route_executor import DogOpsRouteExecutor, save_route_execution
+from dimos.experimental.dogops.route_actions import EditableRouteAction
 from dimos.experimental.dogops.route_run_store import RouteRunStore
 
 
@@ -136,12 +137,38 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert 'data-live-path' in content
     assert 'data-live-target' in content
     assert "refreshDimOSMap" in content
+    assert 'data-map-action="gather_heatmap"' in content
+    assert "/api/map/heatmap/gather" in content
+    assert 'data-map-edit-label-row' in content
+    assert 'data-map-edit-route-row' in content
+    assert 'data-map-edit-action="dry_run_route"' in content
     assert 'data-map-edit-action="run_route"' in content
     assert 'data-map-edit-action="stop_route"' in content
+    assert 'data-map-edit-action="heatmap_run"' in content
+    assert 'data-route-action-row' in content
+    assert 'data-route-action-kind="capture_image"' in content
+    assert 'data-route-action-kind="scan_qr"' in content
+    assert 'data-route-action-kind="scan_tags"' in content
+    assert 'data-route-action-kind="wait"' in content
+    assert 'data-route-action-kind="inspect_asset"' in content
+    assert 'data-route-action-kind="verify_work_order"' in content
+    assert 'data-route-action-kind="operator_prompt"' in content
+    assert 'class="map-route-stop-marker"' in content
+    assert 'circle.setAttribute("r", "18")' in content
+    assert 'circle.setAttribute("r", "9")' in content
+    assert 'run.route_id === "GATHER_HEATMAP"' in content
+    assert "Costmap snapshot" in content
+    assert "new Set(Object.keys(routeActionLabels))" in content
+    assert "routeActionArgs(kind, waypoint)" in content
     assert 'data-route-execution-status' in content
     assert "/api/map/routes/follow" in content
     assert "/api/map/routes/stop" in content
     assert "/api/map/routes/status" in content
+    assert "runSelectedRoute(true)" in content
+    assert "runSelectedRoute(false)" in content
+    assert "addActionToSelectedRouteWaypoint" in content
+    assert "Dry run" in content
+    assert "Live" in content
     assert "map-point" in content
     assert "map-robot-core" in content
     assert "free grid" in content
@@ -297,6 +324,8 @@ def test_dashboard_map_controls_are_grouped_near_legend(tmp_path) -> None:
     assert 'data-map-edit-mode="route"' in route_row.group(1)
     assert 'data-map-edit-action="route_select"' in route_row.group(1)
     assert 'data-map-edit-action="run_route"' in route_row.group(1)
+    assert 'data-map-edit-action="heatmap_run"' in route_row.group(1)
+    assert 'data-map-edit-action="route_add_action"' not in route_row.group(1)
     assert 'data-map-edit-action="route_down"' in route_row.group(1)
     assert 'data-map-route-summary' in route_row.group(1)
 
@@ -807,6 +836,225 @@ def test_dashboard_map_data_includes_dimos_live_layers(tmp_path, monkeypatch) ->
     assert map_data["live"]["target"]["source"] == "target"  # type: ignore[index]
     assert map_data["layers"]["heatmap"] is True  # type: ignore[index]
     assert map_data["layers"]["path"] is True  # type: ignore[index]
+
+
+def test_dashboard_gather_heatmap_persists_snapshot_and_history(tmp_path, monkeypatch) -> None:
+    class FakeLiveMapAdapter:
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "ok": True,
+                "source": "DimOS live LCM topics",
+                "status": "receiving",
+                "error": "",
+                "topics": {"navigation_costmap": {"received": True}},
+                "costmap": {
+                    "source": "DimOS live costmap",
+                    "columns": 1,
+                    "rows": 1,
+                    "cells": [{"x": 1.0, "y": 2.0, "width": 0.5, "height": 0.5, "cost": 0.75}],
+                },
+                "path": [],
+                "route": [],
+                "robot_pose": {"x": 1.2, "y": 2.1, "theta_deg": 45.0, "source": "odom"},
+                "target": None,
+            }
+
+    monkeypatch.setattr(dashboard, "_LIVE_MAP_ADAPTER", FakeLiveMapAdapter())
+    run_dir = tmp_path / ".dogops" / "runs" / "latest"
+    run_offline_simulation(out=run_dir)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        status, result = _post_json(
+            f"{base_url}/api/map/heatmap/gather",
+            {"area_id": "AISLE_1", "duration_s": 0},
+            headers=_robot_headers(server),
+        )
+        map_data = _get_json(f"{base_url}/api/map")
+        status_runs, route_runs = _get_json_with_status(
+            f"{base_url}/api/route-runs",
+            headers=_robot_headers(server),
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 200
+    assert status_runs == 200
+    assert result["ok"] is True
+    assert result["run_kind"] == "gather_heatmap"
+    assert result["heatmap"]["area_id"] == "AISLE_1"  # type: ignore[index]
+    assert (run_dir / "heatmaps" / "latest_heatmap.json").is_file()
+    assert map_data["layers"]["heatmap"] is True  # type: ignore[index]
+    assert map_data["gathered_heatmap"]["area_id"] == "AISLE_1"  # type: ignore[index]
+    assert map_data["live"]["costmap"]["source"].startswith("Gathered heatmap")  # type: ignore[index]
+    assert route_runs["route_runs"][0]["route_id"] == "GATHER_HEATMAP"  # type: ignore[index]
+    assert route_runs["route_runs"][0]["transport"] == "dimos_costmap_snapshot"  # type: ignore[index]
+
+
+def test_dashboard_gather_heatmap_without_costmap_records_failed_history(tmp_path, monkeypatch) -> None:
+    class FakeLiveMapAdapter:
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "ok": False,
+                "source": "DimOS live LCM topics",
+                "status": "waiting",
+                "error": "no_costmap",
+                "topics": {"navigation_costmap": {"received": False}},
+                "costmap": {"source": "DimOS live costmap", "cells": []},
+                "path": [],
+                "route": [],
+                "robot_pose": None,
+                "target": None,
+            }
+
+    monkeypatch.setattr(dashboard, "_LIVE_MAP_ADAPTER", FakeLiveMapAdapter())
+    run_dir = tmp_path / ".dogops" / "runs" / "latest"
+    run_offline_simulation(out=run_dir)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        status, result = _post_json(
+            f"{base_url}/api/map/heatmap/gather",
+            {"area_id": "AISLE_1", "duration_s": 0},
+            headers=_robot_headers(server),
+        )
+        map_data = _get_json(f"{base_url}/api/map")
+        status_runs, route_runs = _get_json_with_status(
+            f"{base_url}/api/route-runs",
+            headers=_robot_headers(server),
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 409
+    assert status_runs == 200
+    assert result["ok"] is False
+    assert result["error"] == "heatmap_unavailable"
+    assert not (run_dir / "heatmaps" / "latest_heatmap.json").exists()
+    assert map_data["gathered_heatmap"] is None
+    assert route_runs["route_runs"][0]["route_id"] == "GATHER_HEATMAP"  # type: ignore[index]
+    assert route_runs["route_runs"][0]["state"] == "failed"  # type: ignore[index]
+    assert route_runs["route_runs"][0]["last_error"] == result["message"]  # type: ignore[index]
+
+
+def test_dashboard_route_action_authoring_persists_valid_actions(tmp_path) -> None:
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+    route_payload = EditableRoute(
+        id="ROUTE_A",
+        label="Route A",
+        waypoints=[
+            EditableRouteWaypoint(
+                id="WP-1",
+                label="Waypoint 1",
+                pose=EditableMapPoint(x=1.0, y=2.0),
+                actions=[
+                    EditableRouteAction(
+                        id="ACT-CAPTURE",
+                        kind="capture_image",
+                        label="Take picture",
+                        required=True,
+                        timeout_s=5.0,
+                        args={},
+                    ),
+                    EditableRouteAction(
+                        id="ACT-TAGS",
+                        kind="scan_tags",
+                        label="Scan AprilTags",
+                        required=True,
+                        timeout_s=5.0,
+                        args={"expected": [101, 102]},
+                    ),
+                    EditableRouteAction(
+                        id="ACT-QR",
+                        kind="scan_qr",
+                        label="Scan QR",
+                        required=True,
+                        timeout_s=5.0,
+                        args={"expected": ["QR-1"]},
+                    ),
+                    EditableRouteAction(
+                        id="ACT-WAIT",
+                        kind="wait",
+                        label="Wait",
+                        required=True,
+                        timeout_s=5.0,
+                        args={"seconds": 2.0},
+                    ),
+                    EditableRouteAction(
+                        id="ACT-ASSET",
+                        kind="inspect_asset",
+                        label="Inspect asset",
+                        required=True,
+                        timeout_s=5.0,
+                        args={"target": "ASSET_1"},
+                    ),
+                    EditableRouteAction(
+                        id="ACT-WO",
+                        kind="verify_work_order",
+                        label="Verify work order",
+                        required=True,
+                        timeout_s=5.0,
+                        args={"target": "WO-001"},
+                    ),
+                    EditableRouteAction(
+                        id="ACT-PROMPT",
+                        kind="operator_prompt",
+                        label="Operator prompt",
+                        required=True,
+                        timeout_s=5.0,
+                        args={"target": "WP-1"},
+                    ),
+                ],
+            )
+        ],
+    ).model_dump(mode="json")
+
+    try:
+        status, _ = _post_json(
+            f"{base_url}/api/map/routes",
+            route_payload,
+            headers=_robot_headers(server),
+        )
+        authoring = _get_json(f"{base_url}/api/map/authoring")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 200
+    routes = authoring["routes"]  # type: ignore[index]
+    actions = routes[0]["waypoints"][0]["actions"]  # type: ignore[index]
+    assert [action["kind"] for action in actions] == [
+        "capture_image",
+        "scan_tags",
+        "scan_qr",
+        "wait",
+        "inspect_asset",
+        "verify_work_order",
+        "operator_prompt",
+    ]
+    assert actions[0]["required"] is True
+    assert actions[1]["args"] == {"expected": [101, 102]}
+    assert actions[2]["args"] == {"expected": ["QR-1"]}
+    assert actions[3]["args"] == {"seconds": 2.0}
+    assert actions[4]["args"] == {"target": "ASSET_1"}
+    assert actions[5]["args"] == {"target": "WO-001"}
+    assert actions[6]["args"] == {"target": "WP-1"}
 
 
 def test_dashboard_map_data_bounds_include_live_overlay(tmp_path) -> None:
@@ -1521,6 +1769,54 @@ def test_dashboard_route_follow_stop_and_status_endpoints(tmp_path, monkeypatch)
     assert stop_result["route_execution"]["state"] == "stopped"  # type: ignore[index]
     assert stop_result["hard_stop"]["ok"] is True  # type: ignore[index]
     assert stop_result["hard_stop"]["robot_ip"] == "192.168.12.1"  # type: ignore[index]
+
+
+def test_dashboard_route_follow_reports_mcp_unavailable(tmp_path, monkeypatch) -> None:
+    def fail_follow(route_id: str | None, dry_run: bool) -> dict[str, object]:
+        raise RuntimeError("dimos mcp call follow_route failed: no running MCP server")
+
+    monkeypatch.setattr(dashboard, "_run_robot_follow_route", fail_follow)
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    save_map_authoring(
+        run_dir,
+        MapAuthoringState(
+            selected_route_id="ROUTE_A",
+            routes=[
+                EditableRoute(
+                    id="ROUTE_A",
+                    label="Route A",
+                    waypoints=[
+                        EditableRouteWaypoint(
+                            id="WP-1",
+                            label="Waypoint 1",
+                            pose=EditableMapPoint(x=1.0, y=2.0),
+                        )
+                    ],
+                )
+            ],
+        ),
+    )
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        status, result = _post_json(
+            f"{base_url}/api/map/routes/follow",
+            {"route_id": "ROUTE_A", "dry_run": True},
+            headers=_robot_headers(server),
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 503
+    assert result["ok"] is False
+    assert result["error"] == "dimos_mcp_unavailable"
+    assert "no running MCP server" in result["message"]
 
 
 def test_dashboard_stop_syncs_route_history_when_mcp_stop_fails(tmp_path, monkeypatch) -> None:
