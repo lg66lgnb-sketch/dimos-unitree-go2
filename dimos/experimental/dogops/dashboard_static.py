@@ -779,7 +779,6 @@ def render_site_map(
     bounds = map_data["bounds"]
     bounds_attr = escape(json.dumps(bounds, separators=(",", ":")), quote=True)
     authoring_attr = escape(json.dumps(authoring or {}, separators=(",", ":")), quote=True)
-    route_table_rows = _render_saved_route_rows(authoring or {})
     projector = _MapProjector(bounds)
     route_points = " ".join(
         f"{projector.x(point['x']):.1f},{projector.y(point['y']):.1f}"
@@ -812,7 +811,6 @@ def render_site_map(
             + "".join(_render_route_stop(projector, stop, index) for index, stop in enumerate(map_data["route"], 1))
         )
     robot = _render_live_robot_pose()
-    scan_items = "".join(_render_scan_item(observation) for observation in map_data["observations"])
     rerun_web_url = _trusted_rerun_web_url(os.environ.get("DOGOPS_RERUN_WEB_URL"))
     rerun_web_url_attr = escape(rerun_web_url, quote=True)
     legend = (
@@ -882,15 +880,6 @@ def render_site_map(
         '<button type="button" data-route-action-kind="verify_work_order">Verify Work Order</button>'
         '<button type="button" data-route-action-kind="operator_prompt">Operator Prompt</button>'
         "</div>"
-        '<div class="map-route-table" data-route-table-panel>'
-        "<strong>Saved Routes</strong>"
-        "<table>"
-        "<thead>"
-        "<tr><th>Route</th><th>Selected</th><th>Waypoints</th><th>Actions</th><th>Last Run</th><th>Manage</th></tr>"
-        "</thead>"
-        f'<tbody data-route-table>{route_table_rows}</tbody>'
-        "</table>"
-        "</div>"
         "</div>"
     )
     return f"""
@@ -944,30 +933,7 @@ def render_site_map(
         </div>
         <div class="map-authoring-status" data-map-authoring-status>Map authoring idle</div>
         <div class="map-route-execution-status" data-route-execution-status>Execution: idle</div>
-        <div class="route-run-history">
-          <strong>Route Run History</strong>
-          <table>
-            <thead>
-              <tr><th>Time</th><th>Run</th><th>Route</th><th>Mode</th><th>State</th><th>Progress</th></tr>
-            </thead>
-            <tbody data-route-run-history>
-              <tr><td colspan="6">No route runs recorded</td></tr>
-            </tbody>
-          </table>
-        </div>
-        <div class="route-run-timeline">
-          <strong>Current Timeline</strong>
-          <table>
-            <thead>
-              <tr><th>#</th><th>Kind</th><th>State</th><th>Target</th><th>Note</th></tr>
-            </thead>
-            <tbody data-route-run-timeline>
-              <tr><td colspan="5">No active route timeline</td></tr>
-            </tbody>
-          </table>
-        </div>
         <div class="map-live-status" data-live-map-status>Live odom: waiting for Go2</div>
-        <ol class="scan-strip">{scan_items}</ol>
       </div>
     """
 
@@ -985,8 +951,6 @@ def render_dashboard_html(
     packages = report.get("packages") or []
     incidents = report.get("incidents") or []
     work_orders = report.get("work_orders") or []
-    checkpoints = report.get("checkpoint_verifications") or []
-    what_changed = report.get("what_changed") or []
     packages_metric = f"{report['packages_observed']}/{report['packages_expected']}"
     nav_metric = f"{nav.get('waypoints_reached', 0)}/{nav.get('waypoints_total', 0)}"
     checkpoint_metric = f"{report.get('checkpoints_verified', 0)}/{report.get('checkpoints_total', 0)}"
@@ -998,6 +962,7 @@ def render_dashboard_html(
     route_coverage_metric = f"{float(nav.get('route_coverage', 0.0)) * 100:.0f}%"
     qr_events = qr_events or []
     map_html = render_site_map(state, report, authoring=authoring, qr_events=qr_events)
+    route_table_rows = _render_saved_route_rows(authoring or {})
     qr_map_data = build_map_data(state, report, authoring=authoring, qr_events=qr_events)
     route_data = build_route_data(state, report, authoring=authoring)
     poi_data = build_poi_data(state, report)
@@ -1491,23 +1456,6 @@ def render_dashboard_html(
       font-size: 10px;
       text-transform: uppercase;
     }}
-    .scan-strip {{
-      color: #b8c4d4;
-      display: grid;
-      gap: 6px;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      list-style: none;
-      margin: 0;
-      padding: 0;
-    }}
-    .scan-strip li {{
-      background: #0d1119;
-      border: 1px solid #1d2430;
-      border-radius: 6px;
-      min-height: 36px;
-      padding: 7px 9px;
-    }}
-    .scan-strip strong {{ color: #eef2f8; }}
     .map-empty {{
       align-items: center;
       background: #101721;
@@ -1673,7 +1621,6 @@ def render_dashboard_html(
       .metric-row {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       .evidence-grid {{ grid-template-columns: 1fr; }}
       .site-map {{ min-height: 330px; }}
-      .scan-strip {{ grid-template-columns: 1fr; }}
     }}
   </style>
 </head>
@@ -1748,22 +1695,41 @@ def render_dashboard_html(
         <div class="robot-status" data-robot-status>Idle</div>
       </section>
       <section>
-        <h2>Checkpoint Sign-In</h2>
-        {checkpoint_table(checkpoints)}
-      </section>
-      <section>
-        <h2>Mission Timeline</h2>
-        <div class="timeline">
-          <div>Inbound scan completed</div>
-          <div>COOLING_1 inspected</div>
-          <div>INC-001 / WO-001 opened</div>
-          <div>Human remediation simulated</div>
-          <div>Verification completed</div>
+        <h2>Saved Routes</h2>
+        <div class="map-route-table" data-route-table-panel>
+          <table>
+            <thead>
+              <tr><th>Route</th><th>Selected</th><th>Waypoints</th><th>Actions</th><th>Last Run</th><th>Manage</th></tr>
+            </thead>
+            <tbody data-route-table>{route_table_rows}</tbody>
+          </table>
         </div>
       </section>
       <section>
-        <h2>What Changed</h2>
-        <ul>{''.join(f"<li>{escape(str(item))}</li>" for item in what_changed)}</ul>
+        <h2>Route Run History</h2>
+        <div class="route-run-history">
+          <table>
+            <thead>
+              <tr><th>Time</th><th>Run</th><th>Route</th><th>Mode</th><th>State</th><th>Progress</th></tr>
+            </thead>
+            <tbody data-route-run-history>
+              <tr><td colspan="6">No route runs recorded</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+      <section>
+        <h2>Current Run Timeline</h2>
+        <div class="route-run-timeline">
+          <table>
+            <thead>
+              <tr><th>#</th><th>Kind</th><th>State</th><th>Target</th><th>Note</th></tr>
+            </thead>
+            <tbody data-route-run-timeline>
+              <tr><td colspan="5">No active route timeline</td></tr>
+            </tbody>
+          </table>
+        </div>
       </section>
     </div>
     <section class="wide">

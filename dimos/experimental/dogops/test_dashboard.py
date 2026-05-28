@@ -227,7 +227,12 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert "Route Stops" in content
     assert "POI Evidence" in content
     assert "Robot Control" in content
-    assert "Checkpoint Sign-In" in content
+    assert "Checkpoint Sign-In" not in content
+    assert "Mission Timeline" not in content
+    assert "What Changed" not in content
+    assert "Current Run Timeline" in content
+    assert "Current Timeline" not in content
+    assert 'class="scan-strip"' not in content
     assert "Tag Sign-In" in content
     assert "OBS-005" in content
     assert 'data-command="forward"' in content
