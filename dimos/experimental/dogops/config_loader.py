@@ -13,7 +13,6 @@ from dimos.experimental.dogops.models import (
     SiteConfig,
 )
 
-
 DEFAULT_SITE = Path("examples/dogops/site_demo.yaml")
 DEFAULT_MANIFEST = Path("examples/dogops/manifest_demo.yaml")
 DEFAULT_POLICY = Path("examples/dogops/policy_demo.yaml")

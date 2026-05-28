@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import inspect
 import json
 from typing import Any
+
+import pytest
 
 from dimos.experimental.dogops.map_authoring import (
     EditableMapPoint,
@@ -16,6 +19,15 @@ from dimos.experimental.dogops.skills import DogOpsSkillContainer
 
 def _payload(raw: str) -> dict[str, object]:
     return json.loads(raw)
+
+
+class _ImageLike:
+    def __init__(self, image, *, frame_id: str = "camera_optical") -> None:
+        self._image = image
+        self.frame_id = frame_id
+
+    def to_opencv(self):
+        return self._image
 
 
 class _FakePointPublisher:
@@ -149,6 +161,42 @@ def test_skill_container_go_to_reports_missing_navigation_stream(tmp_path) -> No
     assert result["error"] == "navigation_stream_unavailable"
 
 
+def test_skill_container_reports_missing_camera_frame(tmp_path) -> None:
+    skills = DogOpsSkillContainer(run_dir=tmp_path / "latest")
+
+    result = _payload(skills.camera_stream_status())
+
+    assert result["ok"] is False
+    assert result["mode"] == "not_subscribed"
+
+
+def test_skill_container_scan_zone_uses_latest_camera_frame(tmp_path) -> None:
+    cv2 = pytest.importorskip("cv2")
+    np = pytest.importorskip("numpy")
+    if not hasattr(cv2, "aruco"):
+        pytest.skip("OpenCV aruco is unavailable")
+    aruco = cv2.aruco
+    dictionary = aruco.getPredefinedDictionary(aruco.DICT_APRILTAG_36h11)
+    if hasattr(aruco, "generateImageMarker"):
+        marker = aruco.generateImageMarker(dictionary, 104, 240)
+    else:
+        marker = aruco.drawMarker(dictionary, 104, 240)
+    canvas = np.full((320, 320), 255, dtype=marker.dtype)
+    canvas[40:280, 40:280] = marker
+    skills = DogOpsSkillContainer(run_dir=tmp_path / "latest")
+    skills.ingest_camera_image(_ImageLike(canvas))
+
+    status = _payload(skills.camera_stream_status())
+    result = _payload(skills.scan_zone("QA_HOLD"))
+
+    assert status["ok"] is True
+    assert result["ok"] is True
+    assert result["source"] == "camera"
+    assert result["visible_tag_ids"] == [104]
+    assert result["package_ids"] == ["PKG-104"]
+    assert result["evidence_observation_ids"] == []
+
+
 def test_skill_container_route_skills_validate_and_report_dry_run(tmp_path) -> None:
     save_map_authoring(
         tmp_path / "latest",
@@ -278,3 +326,14 @@ def test_skill_container_stretch_skills_are_simulated_without_cloud_keys(tmp_pat
 
     stopped = _payload(skills.stop_mission())
     assert stopped["state"] == "not_started"
+
+
+def test_skill_container_mcp_skills_have_docstrings() -> None:
+    skill_methods = [
+        method
+        for _, method in inspect.getmembers(DogOpsSkillContainer, predicate=callable)
+        if getattr(method, "__dogops_skill__", False) or getattr(method, "__skill__", False)
+    ]
+
+    assert skill_methods
+    assert all(inspect.getdoc(method) for method in skill_methods)

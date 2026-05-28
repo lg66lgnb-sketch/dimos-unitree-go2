@@ -1593,6 +1593,7 @@ def render_dashboard_html(
         <div class="map-controls" data-map-controls>
           <button type="button" data-map-action="start">Start Live Map</button>
           <button type="button" data-map-action="gather_heatmap">Gather Heatmap</button>
+          <button type="button" data-map-action="scan_zone">Scan Zone</button>
           <button type="button" data-map-action="origin">Set Map Origin</button>
           <button type="button" data-map-action="arm_go_to" aria-pressed="false">Arm Go To</button>
         </div>
@@ -2775,6 +2776,37 @@ def render_dashboard_html(
           setBusy(false);
         }}
       }};
+      const scanSelectedZone = async () => {{
+        if (robotBusy) return;
+        const defaultZone = selectedMapObject && selectedMapObject.kind === "zone"
+          ? selectedMapObject.id
+          : "INBOUND_DOCK";
+        const zoneId = (window.prompt("Zone id to scan", defaultZone) || "").trim();
+        if (!zoneId) return;
+        setMapCommandStatus(`Scanning ${{zoneId}}...`, "");
+        const result = await sendRobotAction(
+          "/api/robot/scan_zone",
+          {{command: "scan_zone", zone_id: zoneId}},
+          (response) => {{
+            const mcp = response.mcp_result || {{}};
+            const tags = Array.isArray(mcp.visible_tag_ids) ? mcp.visible_tag_ids.join(",") : "";
+            const packages = Array.isArray(mcp.package_ids) ? mcp.package_ids.join(",") : "";
+            const source = mcp.source || response.transport || "mcp";
+            return `Scan ${{zoneId}} via ${{source}} / tags=${{tags || "none"}} packages=${{packages || "none"}}`;
+          }}
+        );
+        if (result) {{
+          const mcp = result.mcp_result || {{}};
+          setMapCommandStatus(
+            `Scan ${{zoneId}}: ${{mcp.source || result.transport || "mcp"}} tags=${{(mcp.visible_tag_ids || []).join(",") || "none"}}`,
+            "ok"
+          );
+          await refreshDimOSMap();
+          await refreshRouteRunHistory();
+        }} else {{
+          setMapCommandStatus(`Scan ${{zoneId}} failed`, "error");
+        }}
+      }};
       const sendRobotAction = async (url, body, successText) => {{
         robotBusy = true;
         setBusy(true);
@@ -2913,6 +2945,8 @@ def render_dashboard_html(
             );
           }} else if (action === "gather_heatmap") {{
             await gatherHeatmap();
+          }} else if (action === "scan_zone") {{
+            await scanSelectedZone();
           }} else if (action === "arm_go_to") {{
             setGoToArmed(!goToArmed);
           }}
