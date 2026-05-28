@@ -658,6 +658,7 @@ def render_site_map(
         '<button type="button" data-map-edit-action="stop_route">Stop Route</button>'
         '<button type="button" data-map-edit-action="route_up">Route Up</button>'
         '<button type="button" data-map-edit-action="route_down">Route Down</button>'
+        '<span class="map-route-summary" data-map-route-summary>Selected route: none. Next: Route1</span>'
         "</div>"
         "</div>"
     )
@@ -1084,6 +1085,7 @@ def render_dashboard_html(
       gap: 8px;
     }}
     .map-edit-row {{
+      align-items: center;
       display: flex;
       flex-wrap: wrap;
       gap: 8px;
@@ -1103,6 +1105,13 @@ def render_dashboard_html(
       border-color: #52e0c4;
       color: #d8fff6;
       font-weight: 700;
+    }}
+    .map-route-summary {{
+      color: #a9b4c4;
+      font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace;
+      min-height: 30px;
+      display: inline-flex;
+      align-items: center;
     }}
     .map-live-status {{
       color: #f7d75d;
@@ -1430,6 +1439,7 @@ def render_dashboard_html(
       const mapCommandStatus = document.querySelector("[data-map-command-status]");
       const mapAuthoringStatus = document.querySelector("[data-map-authoring-status]");
       const routeExecutionStatus = document.querySelector("[data-route-execution-status]");
+      const routeSummary = document.querySelector("[data-map-route-summary]");
       const liveHeatmap = liveMapSvg ? liveMapSvg.querySelector("[data-live-heatmap]") : null;
       const livePath = liveMapSvg ? liveMapSvg.querySelector("[data-live-path]") : null;
       const liveTrace = liveMapSvg ? liveMapSvg.querySelector("[data-live-trace]") : null;
@@ -1506,6 +1516,32 @@ def render_dashboard_html(
         routeExecutionStatus.textContent = text;
         routeExecutionStatus.className = `map-route-execution-status ${{state || ""}}`;
       }};
+      const routeList = () => {{
+        const current = mapAuthoring || {{}};
+        return Array.isArray(current.routes) ? current.routes : [];
+      }};
+      const nextRouteId = (routes = routeList()) => {{
+        const used = new Set(routes.map((route) => String(route.id || "")));
+        let index = 1;
+        while (used.has(`Route${{index}}`)) index += 1;
+        return `Route${{index}}`;
+      }};
+      const updateRouteSummary = () => {{
+        if (!routeSummary) return;
+        const current = mapAuthoring || {{}};
+        const routes = routeList();
+        if (!routes.length) {{
+          routeSummary.textContent = `Selected route: none. Next: ${{nextRouteId(routes)}}`;
+          return;
+        }}
+        const selected = routes.find((route) => route.id === current.selected_route_id) || null;
+        const selectedText = selected
+          ? `${{selected.id}} (${{(selected.waypoints || []).length}} waypoint${{(selected.waypoints || []).length === 1 ? "" : "s"}})`
+          : "none";
+        const routeIds = routes.map((route) => route.id).join(", ");
+        routeSummary.textContent = `Selected route: ${{selectedText}}. Routes: ${{routeIds}}. Next: ${{nextRouteId(routes)}}`;
+      }};
+      updateRouteSummary();
       const setRerunStatus = (text) => {{
         if (rerunStatus) rerunStatus.textContent = text;
       }};
@@ -1588,6 +1624,7 @@ def render_dashboard_html(
             throw new Error(result.message || result.error || "map_authoring_failed");
           }}
           mapAuthoring = result.authoring || mapAuthoring;
+          updateRouteSummary();
           setMapAuthoringStatus("Map edit saved; refreshing", "ok");
           await refreshDimOSMap();
           window.setTimeout(() => window.location.reload(), 150);
@@ -1657,7 +1694,7 @@ def render_dashboard_html(
       }};
       const selectedRoute = () => {{
         const current = mapAuthoring || {{}};
-        const routes = Array.isArray(current.routes) ? current.routes : [];
+        const routes = routeList();
         if (!routes.length) return null;
         if (!current.selected_route_id) return null;
         return routes.find((route) => route.id === current.selected_route_id) || null;
@@ -1783,10 +1820,20 @@ def render_dashboard_html(
       }};
       const selectRouteByPrompt = async () => {{
         const current = mapAuthoring || {{}};
-        const routes = Array.isArray(current.routes) ? current.routes : [];
-        const routeId = window.prompt("Route id", current.selected_route_id || (routes[0] && routes[0].id) || "AUTHORED_ROUTE");
+        const routes = routeList();
+        const existingRouteIds = routes.map((route) => route.id).join(", ") || "none";
+        const routeIdInput = window.prompt(
+          `Route id (existing: ${{existingRouteIds}}; new id creates a route)`,
+          current.selected_route_id || (routes[0] && routes[0].id) || nextRouteId(routes)
+        );
+        const routeId = routeIdInput ? routeIdInput.trim() : "";
         if (!routeId) return;
-        await postAuthoring(`/api/map/routes/${{encodeURIComponent(routeId)}}/select`, {{}});
+        const existing = routes.find((route) => route.id === routeId);
+        if (existing) {{
+          await postAuthoring(`/api/map/routes/${{encodeURIComponent(routeId)}}/select`, {{}});
+        }} else {{
+          await saveRoutes([...routes, {{id: routeId, label: routeId, waypoints: [], mission_id: null}}], routeId);
+        }}
       }};
       const mapEditId = (prefix) => `${{prefix}}-${{Date.now().toString(36)}}`;
       const applyMapEditAt = async (target) => {{
@@ -1836,8 +1883,9 @@ def render_dashboard_html(
           }});
         }} else if (mapEditMode === "route") {{
           const current = mapAuthoring || {{}};
-          const routes = Array.isArray(current.routes) ? [...current.routes] : [];
-          const route = routes.find((item) => item.id === current.selected_route_id) || routes[0] || {{id: "AUTHORED_ROUTE", label: "Authored Route", waypoints: [], mission_id: null}};
+          const routes = [...routeList()];
+          const newRouteId = nextRouteId(routes);
+          const route = routes.find((item) => item.id === current.selected_route_id) || routes[0] || {{id: newRouteId, label: newRouteId, waypoints: [], mission_id: null}};
           const routeIndex = routes.indexOf(route);
           route.waypoints = [...(route.waypoints || []), {{
             id: mapEditId("WP"),

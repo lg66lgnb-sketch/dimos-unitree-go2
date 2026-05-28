@@ -165,6 +165,9 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert 'data-map-edit-action="export"' in content
     assert 'data-map-edit-label-row' in content
     assert 'data-map-edit-route-row' in content
+    assert 'data-map-route-summary' in content
+    assert "Selected route: none. Next: Route1" in content
+    assert "AUTHORED_ROUTE" not in content
     assert 'data-map-authoring-status' in content
     assert "/api/map/authoring" in content
     assert "/api/map/entities" in content
@@ -293,6 +296,7 @@ def test_dashboard_map_controls_are_grouped_near_legend(tmp_path) -> None:
     assert 'data-map-edit-action="route_select"' in route_row.group(1)
     assert 'data-map-edit-action="run_route"' in route_row.group(1)
     assert 'data-map-edit-action="route_down"' in route_row.group(1)
+    assert 'data-map-route-summary' in route_row.group(1)
 
     svg_end = content.index("</svg>")
     layer_controls = content.index('<div class="map-layer-controls"', svg_end)
@@ -300,6 +304,9 @@ def test_dashboard_map_controls_are_grouped_near_legend(tmp_path) -> None:
     assert svg_end < layer_controls < legend
     assert '<i class="legend-heatmap"></i>Heatmap' in content
     assert ".map-legend, .map-layer-controls" in content
+    assert "const nextRouteId" in content
+    assert "new id creates a route" in content
+    assert "label: routeId" in content
 
 
 def test_dashboard_rerun_web_url_stays_loopback_only() -> None:
