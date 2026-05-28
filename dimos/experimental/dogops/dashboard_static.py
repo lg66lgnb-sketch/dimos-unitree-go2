@@ -870,6 +870,9 @@ def render_site_map(
         '<button type="button" data-map-edit-action="route_down">Route Down</button>'
         '<span class="map-route-summary" data-map-route-summary>Selected route: none. Next: Route1</span>'
         "</div>"
+        "</div>"
+    )
+    route_action_controls = (
         '<div class="map-edit-row map-route-action-row" data-route-action-row hidden>'
         '<span class="map-route-summary" data-route-action-summary>Select a waypoint to add actions</span>'
         '<button type="button" data-route-action-kind="capture_image">Capture Image</button>'
@@ -880,7 +883,6 @@ def render_site_map(
         '<button type="button" data-route-action-kind="inspect_asset">Inspect Asset</button>'
         '<button type="button" data-route-action-kind="verify_work_order">Verify Work Order</button>'
         '<button type="button" data-route-action-kind="operator_prompt">Operator Prompt</button>'
-        "</div>"
         "</div>"
     )
     return f"""
@@ -926,6 +928,7 @@ def render_site_map(
             {robot}
           </g>
         </svg>
+        {route_action_controls}
         {layer_controls}
         {legend}
         <div class="map-workflow">
