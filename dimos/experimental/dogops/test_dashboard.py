@@ -408,9 +408,10 @@ def test_dashboard_map_controls_are_grouped_near_legend(tmp_path) -> None:
     assert '<th>Last Run</th>' in content
 
     svg_end = content.index("</svg>")
-    layer_controls = content.index('<div class="map-layer-controls"', svg_end)
+    route_action_row = content.index('<div class="map-edit-row map-route-action-row"', svg_end)
+    layer_controls = content.index('<div class="map-layer-controls"', route_action_row)
     legend = content.index('<div class="map-legend">', layer_controls)
-    assert svg_end < layer_controls < legend
+    assert svg_end < route_action_row < layer_controls < legend
     assert '<i class="legend-heatmap"></i>Heatmap' in content
     assert ".map-legend, .map-layer-controls" in content
     assert "const nextRouteId" in content
