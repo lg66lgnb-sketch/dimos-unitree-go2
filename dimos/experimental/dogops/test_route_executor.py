@@ -356,6 +356,49 @@ def test_qr_route_action_uses_scan_zone_handler_when_target_is_zone(tmp_path) ->
     assert evidence[0]["metadata"]["scan_zone_source"] == "camera"
 
 
+def test_qr_route_action_fails_when_scan_zone_handler_fails(tmp_path) -> None:
+    route = EditableRoute(
+        id="ROUTE_CAMERA_QR_FAIL",
+        label="Route Camera QR Fail",
+        waypoints=[
+            EditableRouteWaypoint(
+                id="WP-QA",
+                label="QA",
+                target_id="QA_HOLD",
+                pose=EditableMapPoint(x=1.0, y=2.0),
+                actions=[
+                    EditableRouteAction(
+                        id="SCAN-QR",
+                        kind="scan_qr",
+                        args={"expected": ["PKG-104"]},
+                    ),
+                ],
+            )
+        ],
+    )
+    save_map_authoring(
+        tmp_path,
+        MapAuthoringState(selected_route_id="ROUTE_CAMERA_QR_FAIL", routes=[route]),
+    )
+
+    def scan_zone(zone_id: str) -> dict[str, object]:
+        return {
+            "ok": False,
+            "skill": "scan_zone",
+            "zone_id": zone_id,
+            "error": "camera_detector_unavailable",
+        }
+
+    state = DogOpsRouteExecutor(tmp_path, scan_zone_handler=scan_zone).follow_route(dry_run=True)
+
+    assert state.state == "failed"
+    assert state.last_error == "QR scan zone failed: camera_detector_unavailable"
+    failed = [event for event in state.events if event.action_id == "SCAN-QR"][-1]
+    assert failed.state == "failed"
+    assert failed.payload["source"] == "scan_zone"
+    assert failed.payload["scan_zone"]["error"] == "camera_detector_unavailable"
+
+
 def test_optional_action_failure_records_and_continues(tmp_path) -> None:
     route = EditableRoute(
         id="ROUTE_OPTIONAL",

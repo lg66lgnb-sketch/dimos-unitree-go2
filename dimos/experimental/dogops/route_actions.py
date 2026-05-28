@@ -80,13 +80,12 @@ def execute_route_action(
             scan_result = _call_scan_zone(scan_zone_handler, zone_id)
             if scan_result.get("ok") is True:
                 return _qr_result_from_scan_zone(expected, scan_result)
-            if not expected:
-                return RouteActionResult(
-                    ok=False,
-                    state="failed",
-                    note=f"QR scan zone failed: {scan_result.get('error') or 'scan_zone_failed'}",
-                    payload={"source": "scan_zone", "zone_id": zone_id, "scan_zone": scan_result},
-                )
+            return RouteActionResult(
+                ok=False,
+                state="failed",
+                note=f"QR scan zone failed: {scan_result.get('error') or 'scan_zone_failed'}",
+                payload={"source": "scan_zone", "zone_id": zone_id, "scan_zone": scan_result},
+            )
         payloads = expected
         if not payloads and action.args.get("payload"):
             payloads = [str(action.args["payload"])]
