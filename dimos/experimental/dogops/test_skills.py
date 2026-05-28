@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import time
 from typing import Any
 
 import pytest
@@ -23,12 +24,22 @@ def _payload(raw: str) -> dict[str, object]:
 
 
 class _ImageLike:
-    def __init__(self, image, *, frame_id: str = "camera_optical") -> None:
+    def __init__(self, image, *, frame_id: str = "camera_optical", encoding: str = "bgr8") -> None:
         self._image = image
         self.frame_id = frame_id
+        self.encoding = encoding
 
     def to_opencv(self):
         return self._image
+
+
+class _ArrayLike:
+    def __init__(self, rows: list[list[list[int]]]) -> None:
+        self._rows = rows
+        self.shape = (len(rows), len(rows[0]), len(rows[0][0]))
+
+    def __getitem__(self, index: int) -> list[list[int]]:
+        return self._rows[index]
 
 
 class _FakePointPublisher:
@@ -196,6 +207,130 @@ def test_skill_container_scan_zone_uses_latest_camera_frame(tmp_path) -> None:
     assert result["visible_tag_ids"] == [104]
     assert result["package_ids"] == ["PKG-104"]
     assert result["evidence_observation_ids"] == []
+
+
+def test_skill_container_capture_image_uses_latest_camera_frame(tmp_path) -> None:
+    save_map_authoring(
+        tmp_path / "latest",
+        MapAuthoringState(
+            selected_route_id="ROUTE_CAMERA_CAPTURE",
+            routes=[
+                EditableRoute(
+                    id="ROUTE_CAMERA_CAPTURE",
+                    label="Route Camera Capture",
+                    waypoints=[
+                        EditableRouteWaypoint(
+                            id="WP-CAMERA",
+                            label="Camera",
+                            target_id="COOLING_1",
+                            pose=EditableMapPoint(x=1.0, y=2.0),
+                            actions=[
+                                EditableRouteAction(
+                                    id="CAPTURE",
+                                    kind="capture_image",
+                                    args={"target": "COOLING_1"},
+                                )
+                            ],
+                        ),
+                    ],
+                )
+            ],
+        ),
+    )
+    frame = _ArrayLike(
+        [
+            [[0, 0, 255], [0, 255, 0]],
+            [[255, 0, 0], [255, 255, 255]],
+        ]
+    )
+    skills = DogOpsSkillContainer(run_dir=tmp_path / "latest")
+    skills.ingest_camera_image(_ImageLike(frame, frame_id="front-camera"))
+
+    result = _payload(skills.follow_route(dry_run=True))
+
+    assert result["ok"] is True
+    events = result["route_execution"]["events"]  # type: ignore[index]
+    completed = [event for event in events if event.get("action_id") == "CAPTURE"][-1]
+    assert completed["payload"]["source"] == "go2_camera_live"
+    evidence = completed["payload"]["evidence"][0]
+    assert evidence["metadata"]["source"] == "go2_camera_live"
+    assert evidence["metadata"]["camera_frame_id"] == "front-camera"
+    image_path = tmp_path / "latest" / "route_runs" / result["route_execution"]["route_run_id"] / "evidence" / "WP-CAMERA-CAPTURE.png"  # type: ignore[index]
+    assert image_path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def test_skill_container_capture_image_fails_without_live_camera_frame(tmp_path) -> None:
+    save_map_authoring(
+        tmp_path / "latest",
+        MapAuthoringState(
+            selected_route_id="ROUTE_CAMERA_CAPTURE_MISSING",
+            routes=[
+                EditableRoute(
+                    id="ROUTE_CAMERA_CAPTURE_MISSING",
+                    label="Route Camera Capture Missing",
+                    waypoints=[
+                        EditableRouteWaypoint(
+                            id="WP-CAMERA",
+                            label="Camera",
+                            pose=EditableMapPoint(x=1.0, y=2.0),
+                            actions=[
+                                EditableRouteAction(
+                                    id="CAPTURE",
+                                    kind="capture_image",
+                                )
+                            ],
+                        ),
+                    ],
+                )
+            ],
+        ),
+    )
+    skills = DogOpsSkillContainer(run_dir=tmp_path / "latest")
+
+    result = _payload(skills.follow_route(dry_run=True))
+
+    assert result["ok"] is False
+    assert result["state"] == "failed"
+    assert "no live Go2 camera frame is available" in str(result["last_error"])
+
+
+def test_skill_container_capture_image_rejects_stale_camera_frame(tmp_path) -> None:
+    save_map_authoring(
+        tmp_path / "latest",
+        MapAuthoringState(
+            selected_route_id="ROUTE_CAMERA_CAPTURE_STALE",
+            routes=[
+                EditableRoute(
+                    id="ROUTE_CAMERA_CAPTURE_STALE",
+                    label="Route Camera Capture Stale",
+                    waypoints=[
+                        EditableRouteWaypoint(
+                            id="WP-CAMERA",
+                            label="Camera",
+                            pose=EditableMapPoint(x=1.0, y=2.0),
+                            actions=[
+                                EditableRouteAction(
+                                    id="CAPTURE",
+                                    kind="capture_image",
+                                    args={"max_camera_frame_age_s": 0.5},
+                                )
+                            ],
+                        ),
+                    ],
+                )
+            ],
+        ),
+    )
+    frame = _ArrayLike([[[0, 0, 255]]])
+    skills = DogOpsSkillContainer(run_dir=tmp_path / "latest")
+    skills.ingest_camera_image(_ImageLike(frame, frame_id="front-camera"))
+    skills._latest_camera_received_at = time.time() - 2.0
+
+    result = _payload(skills.follow_route(dry_run=True))
+
+    assert result["ok"] is False
+    assert result["state"] == "failed"
+    assert "latest Go2 camera frame is stale" in str(result["last_error"])
 
 
 def test_skill_container_route_skills_validate_and_report_dry_run(tmp_path) -> None:

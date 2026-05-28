@@ -4,8 +4,10 @@ from collections.abc import Callable
 import json
 import math
 from pathlib import Path
+import struct
 import time
 from typing import Any, TypeVar
+import zlib
 
 from dimos.experimental.dogops.config_loader import (
     DEFAULT_MANIFEST,
@@ -293,6 +295,7 @@ class DogOpsSkillContainer(Module):
             goal_publisher=publisher,
             stop_handler=self._route_stop_handler,
             scan_zone_handler=self.scan_zone,
+            capture_image_handler=self._capture_latest_camera_image,
             live_snapshot_reader=live_adapter.snapshot if not dry_run else None,
         )
         try:
@@ -405,6 +408,35 @@ class DogOpsSkillContainer(Module):
     def camera_stream_status(self) -> str:
         """Return whether DogOps has received a live camera frame."""
         return _json(skill="camera_stream_status", **self._camera_stream_status())
+
+    def _capture_latest_camera_image(self, context: dict[str, Any]) -> dict[str, Any] | None:
+        if self._latest_camera_image is None:
+            raise RuntimeError("no live Go2 camera frame is available for capture_image")
+        action = context.get("action") if isinstance(context.get("action"), dict) else {}
+        action_args = action.get("args") if isinstance(action, dict) and isinstance(action.get("args"), dict) else {}
+        max_age_s = _positive_float(action_args.get("max_camera_frame_age_s"), default=2.0)
+        frame_age_s = self._camera_frame_age_s()
+        if frame_age_s is None or frame_age_s > max_age_s:
+            raise RuntimeError(
+                f"latest Go2 camera frame is stale for capture_image: age={frame_age_s}s max={max_age_s}s"
+            )
+        evidence_dir = Path(context["evidence_dir"])
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        waypoint_id = str(context["waypoint_id"])
+        action_id = str(context["action_id"])
+        path = evidence_dir / f"{waypoint_id}-{action_id}.png"
+        _write_camera_frame_png(path, self._latest_camera_image)
+        return {
+            "path": str(path),
+            "source": "go2_camera_live",
+            "mime_type": "image/png",
+            "metadata": {
+                "camera_frame_age_s": frame_age_s,
+                "camera_frame_id": getattr(self._latest_camera_image, "frame_id", None),
+                "camera_shape": _image_shape(self._latest_camera_image),
+                "camera_encoding": getattr(self._latest_camera_image, "encoding", None),
+            },
+        }
 
     @skill
     def read_gauge(self, asset_id: str = "TEMP_1") -> str:
@@ -999,6 +1031,78 @@ def _image_shape(image: object) -> list[int] | None:
     if shape is None:
         return None
     return [int(item) for item in shape]
+
+
+def _write_camera_frame_png(path: Path, image: object) -> None:
+    array = _camera_array_from_image(image)
+    shape = getattr(array, "shape", None)
+    if shape is None and hasattr(image, "shape"):
+        shape = getattr(image, "shape")
+    if shape is None or len(shape) < 2:
+        raise RuntimeError("latest camera frame does not expose a 2D image shape")
+
+    height = int(shape[0])
+    width = int(shape[1])
+    channels = int(shape[2]) if len(shape) > 2 else 1
+    encoding = str(getattr(image, "encoding", "") or "").lower()
+    rows = []
+    for y in range(height):
+        row = bytearray()
+        for x in range(width):
+            row.extend(_rgb_pixel(array[y][x], channels=channels, encoding=encoding))
+        rows.append(b"\x00" + bytes(row))
+    raw = b"".join(rows)
+    path.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + _png_chunk(b"tEXt", b"Description\x00DogOps live Go2 camera frame")
+        + _png_chunk(b"IDAT", zlib.compress(raw, level=6))
+        + _png_chunk(b"IEND", b"")
+    )
+
+
+def _camera_array_from_image(image: object) -> Any:
+    if hasattr(image, "to_opencv"):
+        return image.to_opencv()  # type: ignore[attr-defined]
+    data = getattr(image, "data", None)
+    if data is not None and hasattr(data, "shape"):
+        return data
+    return image
+
+
+def _rgb_pixel(pixel: object, *, channels: int, encoding: str) -> bytes:
+    if channels <= 1:
+        value = _uint8(pixel)
+        return bytes((value, value, value))
+    values = [_uint8(pixel[index]) for index in range(min(channels, 4))]  # type: ignore[index]
+    if len(values) < 3:
+        value = values[0] if values else 0
+        return bytes((value, value, value))
+    if "rgb" in encoding and "bgr" not in encoding:
+        red, green, blue = values[:3]
+    else:
+        blue, green, red = values[:3]
+    return bytes((red, green, blue))
+
+
+def _uint8(value: object) -> int:
+    result = int(value)  # type: ignore[arg-type]
+    return max(0, min(255, result))
+
+
+def _positive_float(value: object, *, default: float) -> float:
+    try:
+        result = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(result) or result <= 0:
+        return default
+    return result
+
+
+def _png_chunk(kind: bytes, data: bytes) -> bytes:
+    checksum = zlib.crc32(kind + data) & 0xFFFFFFFF
+    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", checksum)
 
 
 def _format_point(point: tuple[float, float] | None) -> str:

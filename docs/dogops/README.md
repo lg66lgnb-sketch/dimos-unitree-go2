@@ -7,6 +7,7 @@ Start here for the build and real-Go2 demo:
 - [SITEOPS_SKILLS_VALIDATION.md](SITEOPS_SKILLS_VALIDATION.md): deterministic SiteOps skill and MCP validation.
 - [TAGS.md](TAGS.md): AprilTag IDs and mounting notes.
 - [HARDWARE_HANDOFF.md](HARDWARE_HANDOFF.md): Mac + Go2 checklist, video capture, evidence.
+- [GEMINI_IMAGE_COMPARISON_IMPLEMENTATION_PLAN.md](GEMINI_IMAGE_COMPARISON_IMPLEMENTATION_PLAN.md): optional Gemini image interpretation and same-waypoint comparison plan.
 - [../ARENA.md](../ARENA.md): physical layout.
 - [../SAFETY.md](../SAFETY.md): safety and stop commands.
 - [../RUNBOOK_MAC_GO2.md](../RUNBOOK_MAC_GO2.md): full Mac DimOS runbook.

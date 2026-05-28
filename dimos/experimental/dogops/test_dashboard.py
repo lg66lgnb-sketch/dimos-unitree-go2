@@ -157,6 +157,8 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert 'data-map-edit-action="heatmap_run"' in content
     assert 'data-route-action-row' in content
     assert 'data-route-action-kind="capture_image"' in content
+    assert 'data-route-action-kind="gemini_inspect_image"' in content
+    assert 'data-saved-images' in content
     assert 'data-route-action-kind="scan_qr"' in content
     assert 'data-route-action-kind="scan_tags"' in content
     assert 'data-route-action-kind="wait"' in content
@@ -1155,6 +1157,14 @@ def test_dashboard_route_action_authoring_persists_valid_actions(tmp_path) -> No
                         args={},
                     ),
                     EditableRouteAction(
+                        id="ACT-GEMINI",
+                        kind="gemini_inspect_image",
+                        label="Gemini inspect",
+                        required=True,
+                        timeout_s=5.0,
+                        args={"target": "WP-1"},
+                    ),
+                    EditableRouteAction(
                         id="ACT-TAGS",
                         kind="scan_tags",
                         label="Scan AprilTags",
@@ -1224,6 +1234,7 @@ def test_dashboard_route_action_authoring_persists_valid_actions(tmp_path) -> No
     actions = routes[0]["waypoints"][0]["actions"]  # type: ignore[index]
     assert [action["kind"] for action in actions] == [
         "capture_image",
+        "gemini_inspect_image",
         "scan_tags",
         "scan_qr",
         "wait",
@@ -1232,12 +1243,13 @@ def test_dashboard_route_action_authoring_persists_valid_actions(tmp_path) -> No
         "operator_prompt",
     ]
     assert actions[0]["required"] is True
-    assert actions[1]["args"] == {"expected": [101, 102]}
-    assert actions[2]["args"] == {"expected": ["QR-1"]}
-    assert actions[3]["args"] == {"seconds": 2.0}
-    assert actions[4]["args"] == {"target": "ASSET_1"}
-    assert actions[5]["args"] == {"target": "WO-001"}
-    assert actions[6]["args"] == {"target": "WP-1"}
+    assert actions[1]["args"] == {"target": "WP-1"}
+    assert actions[2]["args"] == {"expected": [101, 102]}
+    assert actions[3]["args"] == {"expected": ["QR-1"]}
+    assert actions[4]["args"] == {"seconds": 2.0}
+    assert actions[5]["args"] == {"target": "ASSET_1"}
+    assert actions[6]["args"] == {"target": "WO-001"}
+    assert actions[7]["args"] == {"target": "WP-1"}
 
 
 def test_dashboard_map_data_bounds_include_live_overlay(tmp_path) -> None:
@@ -2185,6 +2197,71 @@ def test_dashboard_route_run_history_endpoints(tmp_path) -> None:
     assert status_detail == 200
     assert detail["map"]["route"][0]["target_id"] == "WP-1"  # type: ignore[index]
     assert detail["map"]["route"][0]["x"] == 1.0  # type: ignore[index]
+
+
+def test_dashboard_route_run_images_api_serves_saved_image_files(tmp_path) -> None:
+    run_dir = tmp_path / ".dogops" / "runs" / "latest"
+    run_offline_simulation(out=run_dir)
+    save_map_authoring(
+        run_dir,
+        MapAuthoringState(
+            selected_route_id="ROUTE_IMAGE",
+            routes=[
+                EditableRoute(
+                    id="ROUTE_IMAGE",
+                    label="Route Image",
+                    waypoints=[
+                        EditableRouteWaypoint(
+                            id="WP-IMAGE",
+                            label="Waypoint Image",
+                            pose=EditableMapPoint(x=1.0, y=2.0),
+                            actions=[
+                                EditableRouteAction(
+                                    id="CAPTURE",
+                                    kind="capture_image",
+                                    args={"target": "COOLING_1"},
+                                )
+                            ],
+                        )
+                    ],
+                )
+            ],
+        ),
+    )
+    route_state = DogOpsRouteExecutor(run_dir).follow_route(dry_run=True)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        status_images, image_list = _get_json_with_status(
+            f"{base_url}/api/route-runs/images",
+            headers=_robot_headers(server),
+        )
+        image = image_list["images"][0]  # type: ignore[index]
+        request = urllib.request.Request(
+            f"{base_url}{image['url']}",  # type: ignore[index]
+            headers=_robot_headers(server),
+            method="GET",
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            image_status = response.status
+            image_type = response.headers["Content-Type"]
+            image_bytes = response.read()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert route_state.route_run_id
+    assert status_images == 200
+    assert image["route_run_id"] == route_state.route_run_id  # type: ignore[index]
+    assert image["dogops_run_id"] == "latest"  # type: ignore[index]
+    assert image["metadata"]["waypoint_id"] == "WP-IMAGE"  # type: ignore[index]
+    assert image_status == 200
+    assert image_type == "image/png"
+    assert image_bytes.startswith(b"\x89PNG\r\n\x1a\n")
 
 
 def test_dashboard_route_run_detail_uses_historical_run_dir(tmp_path) -> None:

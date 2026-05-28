@@ -326,6 +326,107 @@ class RouteRunStore:
             ).fetchall()
         return [_row_to_dict(row) for row in rows]
 
+    def image_evidence_for_route_run_waypoint(
+        self,
+        *,
+        route_run_id: str,
+        waypoint_id: str,
+    ) -> dict[str, Any] | None:
+        rows = [
+            row
+            for row in self._image_evidence_rows()
+            if row["route_run_id"] == route_run_id
+            and row.get("metadata", {}).get("waypoint_id") == waypoint_id
+        ]
+        if not rows:
+            return None
+        return max(rows, key=lambda row: float(row.get("created_at") or 0.0))
+
+    def latest_image_evidence_for_waypoint(
+        self,
+        *,
+        waypoint_id: str,
+        exclude_route_run_id: str,
+        route_id: str | None = None,
+        target_id: str | None = None,
+        pose: dict[str, Any] | None = None,
+        pose_tolerance_m: float = 0.3,
+        baseline_policy: str = "same_waypoint_latest_previous",
+    ) -> dict[str, Any] | None:
+        current_started_at = self._route_run_started_at(exclude_route_run_id)
+        rows = [
+            row
+            for row in self._image_evidence_rows()
+            if row["route_run_id"] != exclude_route_run_id
+            and (
+                current_started_at is None
+                or float(row.get("started_at") or 0.0) < current_started_at
+            )
+        ]
+        same_waypoint = [
+            row for row in rows if row.get("metadata", {}).get("waypoint_id") == waypoint_id
+        ]
+        if same_waypoint:
+            same_route_waypoint = [
+                row for row in same_waypoint if route_id and row.get("route_id") == route_id
+            ]
+            result = _select_same_waypoint_baseline(
+                same_route_waypoint or same_waypoint,
+                exclude_route_run_id=exclude_route_run_id,
+                route_id=route_id,
+                baseline_policy=baseline_policy,
+                current_started_at=current_started_at,
+            )
+            if not result.get("baseline_match"):
+                result["baseline_match"] = (
+                    "same_route_waypoint"
+                    if route_id and result.get("route_id") == route_id
+                    else "same_waypoint"
+                )
+            return result
+
+        if target_id:
+            same_target = [
+                row for row in rows if row.get("metadata", {}).get("target") == target_id
+            ]
+            if same_target:
+                result = max(same_target, key=_evidence_sort_key)
+                result["baseline_match"] = "same_target"
+                return result
+
+        if pose:
+            nearest = _nearest_pose_evidence(rows, pose=pose, tolerance_m=pose_tolerance_m)
+            if nearest is not None:
+                nearest["baseline_match"] = "nearest_pose"
+                return nearest
+        return None
+
+    def _image_evidence_rows(self) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT route_run_evidence.*, route_runs.route_id, route_runs.started_at
+                FROM route_run_evidence
+                JOIN route_runs ON route_runs.route_run_id = route_run_evidence.route_run_id
+                WHERE route_run_evidence.kind = 'image'
+                ORDER BY route_runs.started_at DESC, route_run_evidence.created_at DESC
+                """
+            ).fetchall()
+        return [_row_to_dict(row) for row in rows]
+
+    def _route_run_started_at(self, route_run_id: str) -> float | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT started_at FROM route_runs WHERE route_run_id = ?",
+                (route_run_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            return float(row["started_at"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
     def _write_route_run_exports(self, route_run_id: str, state: Any) -> None:
         run_dir = self.run_dir / "route_runs" / route_run_id
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -470,3 +571,95 @@ def _row_to_dict(row: sqlite3.Row | None) -> dict[str, Any]:
             except json.JSONDecodeError:
                 result[target] = {}
     return result
+
+
+def _evidence_sort_key(row: dict[str, Any]) -> tuple[float, float, str]:
+    return (
+        float(row.get("started_at") or 0.0),
+        float(row.get("created_at") or 0.0),
+        str(row.get("evidence_id") or ""),
+    )
+
+
+def _nearest_pose_evidence(
+    rows: list[dict[str, Any]],
+    *,
+    pose: dict[str, Any],
+    tolerance_m: float,
+) -> dict[str, Any] | None:
+    try:
+        x = float(pose["x"])
+        y = float(pose["y"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    candidates: list[tuple[float, dict[str, Any]]] = []
+    for row in rows:
+        metadata_pose = row.get("metadata", {}).get("pose")
+        if not isinstance(metadata_pose, dict):
+            continue
+        try:
+            dx = float(metadata_pose["x"]) - x
+            dy = float(metadata_pose["y"]) - y
+        except (KeyError, TypeError, ValueError):
+            continue
+        distance = (dx * dx + dy * dy) ** 0.5
+        if distance <= tolerance_m:
+            candidates.append((distance, row))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item[0], -_evidence_sort_key(item[1])[0]))
+    return candidates[0][1]
+
+
+def _select_same_waypoint_baseline(
+    rows: list[dict[str, Any]],
+    *,
+    exclude_route_run_id: str,
+    route_id: str | None,
+    baseline_policy: str,
+    current_started_at: float | None,
+) -> dict[str, Any]:
+    if baseline_policy in {"yesterday", "previous_calendar_day"} and current_started_at is not None:
+        previous_day = time.localtime(current_started_at - 24 * 60 * 60)
+        previous_day_rows = [
+            row
+            for row in rows
+            if _same_local_day(float(row.get("started_at") or 0.0), previous_day)
+        ]
+        if previous_day_rows:
+            result = max(previous_day_rows, key=_evidence_sort_key)
+            result["baseline_match"] = (
+                "previous_day_same_route_waypoint"
+                if route_id and result.get("route_id") == route_id
+                else "previous_day_same_waypoint"
+            )
+            return result
+
+        window_start = current_started_at - 36 * 60 * 60
+        window_end = current_started_at - 12 * 60 * 60
+        window_rows = [
+            row
+            for row in rows
+            if window_start <= float(row.get("started_at") or 0.0) <= window_end
+        ]
+        if window_rows:
+            result = max(window_rows, key=_evidence_sort_key)
+            result["baseline_match"] = (
+                "previous_day_window_same_route_waypoint"
+                if route_id and result.get("route_id") == route_id
+                else "previous_day_window_same_waypoint"
+            )
+            return result
+
+    result = max(rows, key=_evidence_sort_key)
+    if baseline_policy in {"yesterday", "previous_calendar_day"}:
+        result["baseline_match"] = "latest_previous_same_waypoint"
+    return result
+
+
+def _same_local_day(timestamp: float, target_day: time.struct_time) -> bool:
+    candidate = time.localtime(timestamp)
+    return (
+        candidate.tm_year == target_day.tm_year
+        and candidate.tm_yday == target_day.tm_yday
+    )

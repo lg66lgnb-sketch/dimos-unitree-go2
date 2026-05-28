@@ -873,6 +873,7 @@ def render_site_map(
         '<div class="map-edit-row map-route-action-row" data-route-action-row hidden>'
         '<span class="map-route-summary" data-route-action-summary>Select a waypoint to add actions</span>'
         '<button type="button" data-route-action-kind="capture_image">Capture Image</button>'
+        '<button type="button" data-route-action-kind="gemini_inspect_image">Gemini Inspect</button>'
         '<button type="button" data-route-action-kind="scan_qr">Scan QR</button>'
         '<button type="button" data-route-action-kind="scan_tags">Scan Tags</button>'
         '<button type="button" data-route-action-kind="wait">Wait</button>'
@@ -1046,6 +1047,30 @@ def render_dashboard_html(
       display: grid;
       gap: 12px;
       grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    }}
+    .saved-image-grid {{
+      display: grid;
+      gap: 12px;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    }}
+    .saved-image {{
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fbfcfd;
+      overflow: hidden;
+    }}
+    .saved-image img {{
+      display: block;
+      width: 100%;
+      aspect-ratio: 4 / 3;
+      object-fit: cover;
+      background: #111827;
+    }}
+    .saved-image figcaption {{
+      padding: 7px 9px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
     }}
     .compact-list {{
       display: grid;
@@ -1838,6 +1863,19 @@ def render_dashboard_html(
           </table>
         </div>
       </section>
+      <section>
+        <h2>Gemini Vision Evidence</h2>
+        <div class="route-run-timeline">
+          <table>
+            <thead>
+              <tr><th>Waypoint</th><th>Summary</th><th>Change</th><th>Severity</th><th>Confidence</th><th>Baseline</th></tr>
+            </thead>
+            <tbody data-gemini-evidence>
+              <tr><td colspan="6">No Gemini analysis recorded</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
     </div>
     <section class="wide">
       <h2>Package Reconciliation</h2>
@@ -1875,6 +1913,12 @@ def render_dashboard_html(
         </div>
       </div>
     </section>
+    <section class="wide">
+      <h2>Saved Images</h2>
+      <div class="saved-image-grid" data-saved-images>
+        <p class="muted">No saved route images yet</p>
+      </div>
+    </section>
   </main>
   <script>
     (() => {{
@@ -1900,6 +1944,8 @@ def render_dashboard_html(
       const routeSummary = document.querySelector("[data-map-route-summary]");
       const routeRunHistory = document.querySelector("[data-route-run-history]");
       const routeRunTimeline = document.querySelector("[data-route-run-timeline]");
+      const geminiEvidence = document.querySelector("[data-gemini-evidence]");
+      const savedImages = document.querySelector("[data-saved-images]");
       const liveHeatmap = liveMapSvg ? liveMapSvg.querySelector("[data-live-heatmap]") : null;
       const livePath = liveMapSvg ? liveMapSvg.querySelector("[data-live-path]") : null;
       const liveTrace = liveMapSvg ? liveMapSvg.querySelector("[data-live-trace]") : null;
@@ -1931,6 +1977,7 @@ def render_dashboard_html(
       let liveMapBounds = null;
       let liveOverlayBounds = null;
       let latestRouteRuns = [];
+      let savedImageUrls = [];
       let selectedRouteRunId = "";
       let latestQrEventsById = new Map();
       try {{
@@ -2318,6 +2365,54 @@ def render_dashboard_html(
           return `<tr><td>${{htmlEscape(event.sequence || "")}}</td><td>${{htmlEscape(event.kind || "-")}}</td><td>${{htmlEscape(event.state || "-")}}</td><td>${{htmlEscape(target)}}</td><td>${{htmlEscape(event.note || "")}}</td></tr>`;
         }}).join("");
       }};
+      const renderGeminiEvidence = (evidence) => {{
+        if (!geminiEvidence) return;
+        const rows = Array.isArray(evidence)
+          ? evidence.filter((item) => item.kind === "gemini_vision_analysis")
+          : [];
+        if (!rows.length) {{
+          geminiEvidence.innerHTML = '<tr><td colspan="6">No Gemini analysis recorded</td></tr>';
+          return;
+        }}
+        geminiEvidence.innerHTML = rows.slice(-6).map((item) => {{
+          const metadata = item.metadata || {{}};
+          const changed = metadata.changed === true ? "Changed" : metadata.changed === false ? "No change" : "-";
+          const confidence = Number.isFinite(Number(metadata.confidence)) ? Number(metadata.confidence).toFixed(2) : "-";
+          const baseline = `${{metadata.baseline_match || "none"}}${{metadata.baseline_evidence_id ? ` / ${{metadata.baseline_evidence_id}}` : ""}}`;
+          const summary = metadata.summary || metadata.change_summary || item.path || "-";
+          return `<tr><td>${{htmlEscape(metadata.waypoint_id || "-")}}</td><td>${{htmlEscape(summary)}}</td><td>${{htmlEscape(changed)}}</td><td>${{htmlEscape(metadata.severity || "-")}}</td><td>${{htmlEscape(confidence)}}</td><td>${{htmlEscape(baseline)}}</td></tr>`;
+        }}).join("");
+      }};
+      const renderSavedImages = async (images) => {{
+        if (!savedImages) return;
+        savedImageUrls.forEach((url) => URL.revokeObjectURL(url));
+        savedImageUrls = [];
+        const rows = Array.isArray(images) ? images.filter((item) => item.url) : [];
+        if (!rows.length) {{
+          savedImages.innerHTML = '<p class="muted">No saved route images yet</p>';
+          return;
+        }}
+        const cards = await Promise.all(rows.slice(0, 12).map(async (item) => {{
+          try {{
+            const response = await fetch(item.url, {{
+              cache: "no-store",
+              headers: {{"X-DogOps-Control-Token": robotControlToken}},
+            }});
+            if (!response.ok) throw new Error("image_fetch_failed");
+            const blob = await response.blob();
+            const url = URL.createObjectURL(blob);
+            savedImageUrls.push(url);
+            const metadata = item.metadata || {{}};
+            const runLabel = item.dogops_run_id || item.route_run_id || "-";
+            const waypoint = metadata.waypoint_id || "-";
+            const source = metadata.source || "image";
+            return `<figure class="saved-image"><img src="${{url}}" alt="Saved route image"><figcaption>Run ${{htmlEscape(runLabel)}}<br>${{htmlEscape(waypoint)}} / ${{htmlEscape(source)}}</figcaption></figure>`;
+          }} catch (_) {{
+            return "";
+          }}
+        }}));
+        savedImages.innerHTML = cards.filter(Boolean).join("") || '<p class="muted">No saved route images available</p>';
+      }};
       const selectRouteRunOnMap = async (routeRunId) => {{
         if (!routeRunId) return;
         try {{
@@ -2356,6 +2451,7 @@ def render_dashboard_html(
           const current = await currentResponse.json();
           if (currentResponse.ok && current.ok !== false) {{
             renderRouteRunTimeline(current.timeline || current.events || []);
+            renderGeminiEvidence(current.evidence || []);
           }}
           const listResponse = await fetch("/api/route-runs", {{
             cache: "no-store",
@@ -2366,6 +2462,14 @@ def render_dashboard_html(
             latestRouteRuns = Array.isArray(list.route_runs) ? list.route_runs : [];
             renderRouteRunHistory(list.route_runs || []);
             renderRouteTable();
+          }}
+          const imagesResponse = await fetch("/api/route-runs/images", {{
+            cache: "no-store",
+            headers: {{"X-DogOps-Control-Token": robotControlToken}},
+          }});
+          const imageList = await imagesResponse.json();
+          if (imagesResponse.ok && imageList.ok !== false) {{
+            await renderSavedImages(imageList.images || []);
           }}
         }} catch (_) {{
           // Keep the latest rendered history visible if polling fails.
@@ -2593,6 +2697,16 @@ def render_dashboard_html(
         if (kind === "capture_image") {{
           return {{target: waypoint.target_id || waypoint.id}};
         }}
+        if (kind === "gemini_inspect_image") {{
+          return {{
+            target: waypoint.target_id || waypoint.id,
+            prompt: "Inspect this waypoint for physical changes, safety issues, package changes, and work-order evidence.",
+            baseline_policy: "same_waypoint_latest_previous",
+            require_baseline: false,
+            model: "gemini-2.5-flash",
+            max_image_bytes_inline: 20000000,
+          }};
+        }}
         if (kind === "wait") {{
           const seconds = Number(window.prompt("Wait seconds", "2") || 2);
           return {{seconds: Number.isFinite(seconds) ? seconds : 2}};
@@ -2601,6 +2715,7 @@ def render_dashboard_html(
       }};
       const routeActionLabels = {{
         capture_image: "Capture Image",
+        gemini_inspect_image: "Gemini Inspect",
         scan_qr: "Scan QR",
         scan_tags: "Scan Tags",
         wait: "Wait",

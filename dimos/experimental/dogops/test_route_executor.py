@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+
 import pytest
 
 from dimos.experimental.dogops.map_authoring import (
@@ -10,6 +12,7 @@ from dimos.experimental.dogops.map_authoring import (
     MapAuthoringState,
     save_map_authoring,
 )
+from dimos.experimental.dogops.gemini_vision import GeminiImageInspection, GeminiVisionResult
 from dimos.experimental.dogops.mission_engine import run_offline_simulation
 from dimos.experimental.dogops.route_actions import EditableRouteAction
 from dimos.experimental.dogops.route_executor import (
@@ -213,7 +216,8 @@ def test_route_actions_record_timeline_and_placeholder_evidence(tmp_path) -> Non
     assert {"tag_detection", "image"} <= evidence_kinds
     image_evidence = [item for item in evidence if item["kind"] == "image"][0]
     assert image_evidence["metadata"]["source"] == "demo_placeholder"
-    assert (tmp_path / "route_runs" / state.route_run_id / "evidence" / "WP-ACTION-CAPTURE.svg").exists()
+    assert image_evidence["mime_type"] == "image/png"
+    assert (tmp_path / "route_runs" / state.route_run_id / "evidence" / "WP-ACTION-CAPTURE.png").exists()
 
 
 def test_capture_image_uses_configured_go2_image(tmp_path) -> None:
@@ -266,20 +270,19 @@ def test_capture_image_uses_configured_go2_image(tmp_path) -> None:
     assert copied_path.read_bytes() == b"fake-jpeg"
 
 
-def test_dry_run_executes_route_actions_and_records_qr_evidence(tmp_path) -> None:
+def test_capture_image_uses_live_camera_handler_when_available(tmp_path) -> None:
     route = EditableRoute(
-        id="ROUTE_QR",
-        label="Route QR",
+        id="ROUTE_LIVE_IMAGE",
+        label="Route Live Image",
         waypoints=[
             EditableRouteWaypoint(
-                id="WP-QR",
-                label="QR Waypoint",
+                id="WP-LIVE-IMAGE",
+                label="Waypoint",
                 pose=EditableMapPoint(x=1.0, y=2.0),
                 actions=[
                     EditableRouteAction(
-                        id="SCAN-QR",
-                        kind="scan_qr",
-                        args={"expected": ["PKG-101"]},
+                        id="CAPTURE",
+                        kind="capture_image",
                     ),
                 ],
             )
@@ -287,19 +290,37 @@ def test_dry_run_executes_route_actions_and_records_qr_evidence(tmp_path) -> Non
     )
     save_map_authoring(
         tmp_path,
-        MapAuthoringState(selected_route_id="ROUTE_QR", routes=[route]),
+        MapAuthoringState(selected_route_id="ROUTE_LIVE_IMAGE", routes=[route]),
     )
 
-    state = DogOpsRouteExecutor(tmp_path).follow_route(dry_run=True)
+    def capture_image(context: dict[str, object]) -> dict[str, object]:
+        evidence_dir = context["evidence_dir"]
+        assert isinstance(evidence_dir, Path)
+        path = evidence_dir / "live-camera.png"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"live-camera")
+        return {
+            "path": str(path),
+            "source": "go2_camera_live",
+            "mime_type": "image/png",
+            "metadata": {
+                "camera_frame_id": "front-1",
+                "camera_frame_age_s": 0.25,
+            },
+        }
 
-    assert state.state == "completed"
-    action_events = [event for event in state.events if event.kind == "action"]
-    assert [event.state for event in action_events] == ["started", "completed"]
-    assert action_events[-1].payload["detected_payloads"] == ["PKG-101"]
-    assert RouteRunStore(tmp_path).route_run_detail(state.route_run_id or "")["actions_completed"] == 1
-    evidence = RouteRunStore(tmp_path).route_run_evidence(state.route_run_id or "")
-    assert evidence[0]["kind"] == "qr_detection"
-    assert evidence[0]["metadata"]["detected_payloads"] == ["PKG-101"]
+    state = DogOpsRouteExecutor(
+        tmp_path,
+        capture_image_handler=capture_image,
+    ).follow_route(dry_run=True)
+
+    assert state.route_run_id
+    evidence = RouteRunStore(tmp_path).route_run_evidence(state.route_run_id)
+    image_evidence = [item for item in evidence if item["kind"] == "image"][0]
+    assert image_evidence["metadata"]["source"] == "go2_camera_live"
+    assert image_evidence["metadata"]["camera_frame_id"] == "front-1"
+    assert image_evidence["metadata"]["camera_frame_age_s"] == 0.25
+    assert Path(image_evidence["path"]).read_bytes() == b"live-camera"
 
 
 def test_qr_route_action_uses_scan_zone_handler_when_target_is_zone(tmp_path) -> None:
@@ -397,6 +418,239 @@ def test_qr_route_action_fails_when_scan_zone_handler_fails(tmp_path) -> None:
     assert failed.state == "failed"
     assert failed.payload["source"] == "scan_zone"
     assert failed.payload["scan_zone"]["error"] == "camera_detector_unavailable"
+
+
+def test_gemini_inspect_without_api_key_skips_without_analysis_evidence(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    source_image = tmp_path / "go2-frame.jpg"
+    source_image.write_bytes(b"fake-jpeg")
+    route = EditableRoute(
+        id="ROUTE_GEMINI_SKIP",
+        label="Route Gemini Skip",
+        waypoints=[
+            EditableRouteWaypoint(
+                id="WP-GEMINI",
+                label="Gemini Waypoint",
+                pose=EditableMapPoint(x=1.0, y=2.0),
+                actions=[
+                    EditableRouteAction(
+                        id="CAPTURE",
+                        kind="capture_image",
+                        args={"image_path": str(source_image)},
+                    ),
+                    EditableRouteAction(
+                        id="GEMINI",
+                        kind="gemini_inspect_image",
+                    ),
+                ],
+            )
+        ],
+    )
+    save_map_authoring(
+        tmp_path,
+        MapAuthoringState(selected_route_id="ROUTE_GEMINI_SKIP", routes=[route]),
+    )
+
+    state = DogOpsRouteExecutor(tmp_path).follow_route(dry_run=True)
+
+    assert state.state == "completed"
+    gemini_events = [event for event in state.events if event.action_id == "GEMINI"]
+    assert [event.state for event in gemini_events] == ["started", "skipped"]
+    assert gemini_events[-1].payload["status"] == "gemini_unavailable"
+    evidence = RouteRunStore(tmp_path).route_run_evidence(state.route_run_id or "")
+    assert {item["kind"] for item in evidence} == {"image"}
+
+
+def test_gemini_inspect_records_analysis_evidence_with_baseline(tmp_path, monkeypatch) -> None:
+    source_image = tmp_path / "go2-frame.jpg"
+    source_image.write_bytes(b"fake-jpeg")
+    baseline_route = EditableRoute(
+        id="ROUTE_GEMINI",
+        label="Route Gemini",
+        waypoints=[
+            EditableRouteWaypoint(
+                id="WP-GEMINI",
+                label="Gemini Waypoint",
+                target_id="COOLING_1",
+                pose=EditableMapPoint(x=1.0, y=2.0),
+                actions=[
+                    EditableRouteAction(
+                        id="CAPTURE",
+                        kind="capture_image",
+                        args={"image_path": str(source_image), "target": "COOLING_1"},
+                    )
+                ],
+            )
+        ],
+    )
+    inspect_route = baseline_route.model_copy(deep=True)
+    inspect_route.waypoints[0].actions.append(
+        EditableRouteAction(
+            id="GEMINI",
+            kind="gemini_inspect_image",
+            args={"target": "COOLING_1"},
+        )
+    )
+    save_map_authoring(
+        tmp_path,
+        MapAuthoringState(selected_route_id="ROUTE_GEMINI", routes=[baseline_route]),
+    )
+    first = DogOpsRouteExecutor(tmp_path).follow_route(dry_run=True)
+    save_map_authoring(
+        tmp_path,
+        MapAuthoringState(selected_route_id="ROUTE_GEMINI", routes=[inspect_route]),
+    )
+
+    def fake_inspect(**kwargs):
+        assert kwargs["baseline_image_path"]
+        assert kwargs["baseline_evidence_id"]
+        return GeminiVisionResult(
+            ok=True,
+            status="completed",
+            message="No visible change",
+            model=kwargs["model"],
+            inspection=GeminiImageInspection(
+                ok=True,
+                summary="No visible change",
+                current_description="Cooling area is clear.",
+                baseline_description="Cooling area was clear.",
+                changed=False,
+                change_summary="No material change.",
+                change_type="no_change",
+                severity="info",
+                confidence=0.91,
+                observations=["clearance visible"],
+                possible_incident=False,
+                recommended_action="Continue route.",
+            ),
+        )
+
+    monkeypatch.setattr(
+        "dimos.experimental.dogops.gemini_vision.inspect_images_with_gemini",
+        fake_inspect,
+    )
+
+    second = DogOpsRouteExecutor(tmp_path).follow_route(dry_run=True)
+
+    assert first.route_run_id
+    assert second.route_run_id
+    evidence = RouteRunStore(tmp_path).route_run_evidence(second.route_run_id)
+    analysis = [item for item in evidence if item["kind"] == "gemini_vision_analysis"]
+    assert len(analysis) == 1
+    assert analysis[0]["metadata"]["baseline_route_run_id"] == first.route_run_id
+    assert analysis[0]["metadata"]["baseline_match"] == "same_route_waypoint"
+    assert analysis[0]["metadata"]["changed"] is False
+    assert (tmp_path / "route_runs" / second.route_run_id / "evidence" / "WP-GEMINI-GEMINI-gemini.json").exists()
+    gemini_events = [event for event in second.events if event.action_id == "GEMINI"]
+    assert gemini_events[-1].payload["analysis_evidence_id"] == analysis[0]["evidence_id"]
+
+
+def test_gemini_inspect_can_analyze_default_placeholder_capture(tmp_path, monkeypatch) -> None:
+    route = EditableRoute(
+        id="ROUTE_GEMINI_PLACEHOLDER",
+        label="Route Gemini Placeholder",
+        waypoints=[
+            EditableRouteWaypoint(
+                id="WP-GEMINI-PLACEHOLDER",
+                label="Gemini Waypoint",
+                target_id="PLACEHOLDER_TARGET",
+                pose=EditableMapPoint(x=1.0, y=2.0),
+                actions=[
+                    EditableRouteAction(
+                        id="CAPTURE",
+                        kind="capture_image",
+                        args={"target": "PLACEHOLDER_TARGET"},
+                    ),
+                    EditableRouteAction(
+                        id="GEMINI",
+                        kind="gemini_inspect_image",
+                        args={"target": "PLACEHOLDER_TARGET"},
+                    ),
+                ],
+            )
+        ],
+    )
+    save_map_authoring(
+        tmp_path,
+        MapAuthoringState(selected_route_id="ROUTE_GEMINI_PLACEHOLDER", routes=[route]),
+    )
+
+    gemini_calls: list[dict[str, object]] = []
+
+    def fake_inspect(**kwargs):
+        gemini_calls.append(kwargs)
+        return GeminiVisionResult(
+            ok=True,
+            status="completed",
+            message="Placeholder inspected",
+            model=kwargs["model"],
+            inspection=GeminiImageInspection(
+                ok=True,
+                summary="Placeholder inspected",
+                current_description="Demo placeholder image.",
+                changed=False,
+                change_summary="No baseline available.",
+                change_type="unclear",
+                severity="info",
+                confidence=0.5,
+                observations=["demo placeholder"],
+                possible_incident=False,
+                recommended_action="Use real camera evidence for final validation.",
+            ),
+        )
+
+    monkeypatch.setattr(
+        "dimos.experimental.dogops.gemini_vision.inspect_images_with_gemini",
+        fake_inspect,
+    )
+
+    state = DogOpsRouteExecutor(tmp_path).follow_route(dry_run=True)
+
+    evidence = RouteRunStore(tmp_path).route_run_evidence(state.route_run_id or "")
+    image = [item for item in evidence if item["kind"] == "image"][0]
+    analysis = [item for item in evidence if item["kind"] == "gemini_vision_analysis"][0]
+    assert gemini_calls
+    assert gemini_calls[0]["current_mime_type"] == "image/png"
+    assert str(gemini_calls[0]["current_image_path"]).endswith(".png")
+    assert image["mime_type"] == "image/png"
+    assert image["metadata"]["source"] == "demo_placeholder"
+    assert analysis["metadata"]["summary"] == "Placeholder inspected"
+
+
+def test_dry_run_executes_route_actions_and_records_qr_evidence(tmp_path) -> None:
+    route = EditableRoute(
+        id="ROUTE_QR",
+        label="Route QR",
+        waypoints=[
+            EditableRouteWaypoint(
+                id="WP-QR",
+                label="QR Waypoint",
+                pose=EditableMapPoint(x=1.0, y=2.0),
+                actions=[
+                    EditableRouteAction(
+                        id="SCAN-QR",
+                        kind="scan_qr",
+                        args={"expected": ["PKG-101"]},
+                    ),
+                ],
+            )
+        ],
+    )
+    save_map_authoring(
+        tmp_path,
+        MapAuthoringState(selected_route_id="ROUTE_QR", routes=[route]),
+    )
+
+    state = DogOpsRouteExecutor(tmp_path).follow_route(dry_run=True)
+
+    assert state.state == "completed"
+    action_events = [event for event in state.events if event.kind == "action"]
+    assert [event.state for event in action_events] == ["started", "completed"]
+    assert action_events[-1].payload["detected_payloads"] == ["PKG-101"]
+    assert RouteRunStore(tmp_path).route_run_detail(state.route_run_id or "")["actions_completed"] == 1
+    evidence = RouteRunStore(tmp_path).route_run_evidence(state.route_run_id or "")
+    assert evidence[0]["kind"] == "qr_detection"
+    assert evidence[0]["metadata"]["detected_payloads"] == ["PKG-101"]
 
 
 def test_optional_action_failure_records_and_continues(tmp_path) -> None:
