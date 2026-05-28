@@ -143,6 +143,7 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert 'data-map-edit-action="dry_run_route"' in content
     assert 'data-map-edit-action="run_route"' in content
     assert 'data-map-edit-action="stop_route"' in content
+    assert 'data-map-edit-action="heatmap_run"' in content
     assert 'data-map-edit-action="route_add_action"' in content
     assert 'data-route-execution-status' in content
     assert "/api/map/routes/follow" in content
@@ -308,6 +309,7 @@ def test_dashboard_map_controls_are_grouped_near_legend(tmp_path) -> None:
     assert 'data-map-edit-mode="route"' in route_row.group(1)
     assert 'data-map-edit-action="route_select"' in route_row.group(1)
     assert 'data-map-edit-action="run_route"' in route_row.group(1)
+    assert 'data-map-edit-action="heatmap_run"' in route_row.group(1)
     assert 'data-map-edit-action="route_down"' in route_row.group(1)
     assert 'data-map-route-summary' in route_row.group(1)
 

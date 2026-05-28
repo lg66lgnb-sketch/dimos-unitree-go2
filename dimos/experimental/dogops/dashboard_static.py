@@ -791,6 +791,7 @@ def render_site_map(
         '<button type="button" data-map-edit-action="dry_run_route">Dry Run Route</button>'
         '<button type="button" data-map-edit-action="run_route">Run Live Route</button>'
         '<button type="button" data-map-edit-action="stop_route">Stop Route</button>'
+        '<button type="button" data-map-edit-action="heatmap_run">Heatmap Run</button>'
         '<button type="button" data-map-edit-action="route_add_action">Add Action</button>'
         '<button type="button" data-map-edit-action="route_up">Route Up</button>'
         '<button type="button" data-map-edit-action="route_down">Route Down</button>'
@@ -2894,6 +2895,8 @@ def render_dashboard_html(
             await runSelectedRoute(false);
           }} else if (action === "stop_route") {{
             await stopRouteExecution();
+          }} else if (action === "heatmap_run") {{
+            await gatherHeatmap();
           }} else if (action === "route_add_action") {{
             await addActionToSelectedRouteWaypoint();
           }} else if (action === "route_up") {{
