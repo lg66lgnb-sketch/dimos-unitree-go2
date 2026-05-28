@@ -807,6 +807,15 @@ def render_site_map(
         '<button type="button" data-route-action-kind="verify_work_order">Verify Work Order</button>'
         '<button type="button" data-route-action-kind="operator_prompt">Operator Prompt</button>'
         "</div>"
+        '<div class="map-route-table" data-route-table-panel>'
+        "<strong>Saved Routes</strong>"
+        "<table>"
+        "<thead>"
+        "<tr><th>Route</th><th>Selected</th><th>Waypoints</th><th>Actions</th><th>Last Run</th><th>Manage</th></tr>"
+        "</thead>"
+        '<tbody data-route-table><tr><td colspan="6">No saved routes</td></tr></tbody>'
+        "</table>"
+        "</div>"
         "</div>"
     )
     return f"""
@@ -1318,6 +1327,46 @@ def render_dashboard_html(
       border-color: #52e0c4;
       color: #d8fff6;
     }}
+    .map-route-table {{
+      border: 1px solid #243244;
+      border-radius: 8px;
+      overflow: hidden;
+    }}
+    .map-route-table strong {{
+      display: block;
+      padding: 8px 10px;
+    }}
+    .map-route-table table {{
+      border-collapse: collapse;
+      width: 100%;
+    }}
+    .map-route-table th,
+    .map-route-table td {{
+      border-top: 1px solid #243244;
+      padding: 6px 8px;
+      text-align: left;
+      vertical-align: top;
+    }}
+    .map-route-table th {{
+      color: #a9b4c4;
+      font-size: 11px;
+      text-transform: uppercase;
+    }}
+    .map-route-table tr.is-selected-route > td {{
+      background: rgba(20, 92, 82, 0.28);
+    }}
+    .route-table-actions {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }}
+    .route-actions-subrow td {{
+      background: rgba(8, 13, 22, 0.58);
+    }}
+    .route-actions-list {{
+      margin: 0;
+      padding-left: 18px;
+    }}
     .map-route-summary {{
       color: #a9b4c4;
       font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -1689,6 +1738,7 @@ def render_dashboard_html(
       const mapEditControls = document.querySelector("[data-map-edit-controls]");
       const routeActionRow = document.querySelector("[data-route-action-row]");
       const routeActionSummary = document.querySelector("[data-route-action-summary]");
+      const routeTable = document.querySelector("[data-route-table]");
       const rerunSurface = document.querySelector("[data-rerun-surface]");
       const rerunConnect = document.querySelector("[data-rerun-connect]");
       const rerunFrame = document.querySelector("[data-rerun-frame]");
@@ -1726,6 +1776,7 @@ def render_dashboard_html(
       let dragMapObject = null;
       let liveMapBounds = null;
       let liveOverlayBounds = null;
+      let latestRouteRuns = [];
       let latestQrEventsById = new Map();
       try {{
         liveMapBounds = liveMapSvg ? JSON.parse(liveMapSvg.dataset.mapBounds || "{{}}") : null;
@@ -1786,6 +1837,65 @@ def render_dashboard_html(
         const current = mapAuthoring || {{}};
         return Array.isArray(current.routes) ? current.routes : [];
       }};
+      const escapeCell = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({{
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;",
+      }}[char]));
+      const routeActionCount = (route) => (route.waypoints || []).reduce(
+        (total, waypoint) => total + ((waypoint.actions || []).length),
+        0
+      );
+      const lastRunForRoute = (routeId) => latestRouteRuns.find((run) => run.route_id === routeId);
+      const formatRouteTableTime = (seconds) => {{
+        if (!seconds) return "-";
+        try {{
+          return new Date(Number(seconds) * 1000).toLocaleTimeString();
+        }} catch (_) {{
+          return "-";
+        }}
+      }};
+      const routeActionRows = (route) => {{
+        const rows = [];
+        for (const waypoint of route.waypoints || []) {{
+          for (const action of waypoint.actions || []) {{
+            rows.push({{
+              waypoint: waypoint.label || waypoint.id || "-",
+              kind: action.kind || "-",
+              label: action.label || action.kind || "-",
+              args: action.args || {{}},
+            }});
+          }}
+        }}
+        return rows;
+      }};
+      const renderRouteTable = () => {{
+        if (!routeTable) return;
+        const current = mapAuthoring || {{}};
+        const routes = routeList();
+        if (!routes.length) {{
+          routeTable.innerHTML = '<tr><td colspan="6">No saved routes</td></tr>';
+          return;
+        }}
+        routeTable.innerHTML = routes.map((route) => {{
+          const selected = route.id === current.selected_route_id;
+          const waypoints = (route.waypoints || []).length;
+          const actions = routeActionCount(route);
+          const lastRun = lastRunForRoute(route.id);
+          const lastRunText = lastRun
+            ? `${{formatRouteTableTime(lastRun.started_at)}} / ${{lastRun.state || "-"}}`
+            : "-";
+          const mainRow = `<tr class="${{selected ? "is-selected-route" : ""}}"><td><strong>${{escapeCell(route.label || route.id)}}</strong><br><span>${{escapeCell(route.id || "-")}}</span></td><td>${{selected ? "Yes" : ""}}</td><td>${{waypoints}}</td><td>${{actions}}</td><td>${{escapeCell(lastRunText)}}</td><td><div class="route-table-actions"><button type="button" data-route-table-action="select" data-route-id="${{escapeCell(route.id)}}">Select</button><button type="button" data-route-table-action="rename" data-route-id="${{escapeCell(route.id)}}">Rename</button><button type="button" data-route-table-action="duplicate" data-route-id="${{escapeCell(route.id)}}">Duplicate</button><button type="button" data-route-table-action="delete" data-route-id="${{escapeCell(route.id)}}">Delete</button></div></td></tr>`;
+          if (!selected) return mainRow;
+          const actionRows = routeActionRows(route);
+          const detail = actionRows.length
+            ? `<ol class="route-actions-list">${{actionRows.map((action) => `<li><strong>${{escapeCell(action.waypoint)}}</strong>: ${{escapeCell(action.label)}} <span>(${{escapeCell(action.kind)}})</span> <code>${{escapeCell(JSON.stringify(action.args))}}</code></li>`).join("")}}</ol>`
+            : "No actions saved for this route";
+          return `${{mainRow}}<tr class="route-actions-subrow"><td colspan="6">${{detail}}</td></tr>`;
+        }}).join("");
+      }};
       const nextRouteId = (routes = routeList()) => {{
         const used = new Set(routes.map((route) => String(route.id || "")));
         let index = 1;
@@ -1793,11 +1903,11 @@ def render_dashboard_html(
         return `Route${{index}}`;
       }};
       const updateRouteSummary = () => {{
-        if (!routeSummary) return;
         const current = mapAuthoring || {{}};
         const routes = routeList();
         if (!routes.length) {{
-          routeSummary.textContent = `Selected route: none. Next: ${{nextRouteId(routes)}}`;
+          if (routeSummary) routeSummary.textContent = `Selected route: none. Next: ${{nextRouteId(routes)}}`;
+          renderRouteTable();
           return;
         }}
         const selected = routes.find((route) => route.id === current.selected_route_id) || null;
@@ -1805,7 +1915,8 @@ def render_dashboard_html(
           ? `${{selected.id}} (${{(selected.waypoints || []).length}} waypoint${{(selected.waypoints || []).length === 1 ? "" : "s"}})`
           : "none";
         const routeIds = routes.map((route) => route.id).join(", ");
-        routeSummary.textContent = `Selected route: ${{selectedText}}. Routes: ${{routeIds}}. Next: ${{nextRouteId(routes)}}`;
+        if (routeSummary) routeSummary.textContent = `Selected route: ${{selectedText}}. Routes: ${{routeIds}}. Next: ${{nextRouteId(routes)}}`;
+        renderRouteTable();
       }};
       updateRouteSummary();
       const setRerunStatus = (text) => {{
@@ -2066,7 +2177,9 @@ def render_dashboard_html(
           }});
           const list = await listResponse.json();
           if (listResponse.ok && list.ok !== false) {{
+            latestRouteRuns = Array.isArray(list.route_runs) ? list.route_runs : [];
             renderRouteRunHistory(list.route_runs || []);
+            renderRouteTable();
           }}
         }} catch (_) {{
           // Keep the latest rendered history visible if polling fails.
@@ -2148,13 +2261,72 @@ def render_dashboard_html(
         if (!route || !Array.isArray(route.waypoints)) return -1;
         return route.waypoints.findIndex((waypoint) => waypoint.id === targetId || waypoint.target_id === targetId);
       }};
-      const saveRoutes = async (routes, selectedRouteId = null) => {{
+      const saveRoutes = async (routes, selectedRouteId = undefined) => {{
         const current = mapAuthoring || {{}};
         await postAuthoring("/api/map/authoring", {{
           ...current,
           routes,
-          selected_route_id: selectedRouteId || current.selected_route_id || (routes[0] && routes[0].id) || null,
+          selected_route_id: selectedRouteId !== undefined ? selectedRouteId : current.selected_route_id || (routes[0] && routes[0].id) || null,
         }}, "PUT");
+      }};
+      const routeById = (routeId) => routeList().find((route) => route.id === routeId);
+      const selectRouteFromTable = async (routeId) => {{
+        if (!routeById(routeId)) return;
+        await postAuthoring(`/api/map/routes/${{encodeURIComponent(routeId)}}/select`, {{}});
+      }};
+      const renameRouteFromTable = async (routeId) => {{
+        const routes = routeList();
+        const route = routes.find((item) => item.id === routeId);
+        if (!route) return;
+        const newId = (window.prompt("Route id", route.id) || "").trim();
+        if (!newId) return;
+        if (newId !== route.id && routes.some((item) => item.id === newId)) {{
+          setMapAuthoringStatus("Route id already exists", "error");
+          return;
+        }}
+        const newLabel = (window.prompt("Route label", route.label || newId) || newId).trim() || newId;
+        const renamed = routes.map((item) => item.id === routeId ? {{...item, id: newId, label: newLabel}} : item);
+        const selectedRouteId = (mapAuthoring || {{}}).selected_route_id === routeId ? newId : (mapAuthoring || {{}}).selected_route_id;
+        await saveRoutes(renamed, selectedRouteId);
+      }};
+      const duplicateRouteFromTable = async (routeId) => {{
+        const routes = routeList();
+        const route = routes.find((item) => item.id === routeId);
+        if (!route) return;
+        const defaultId = `${{route.id || "Route"}}_COPY`;
+        const newId = (window.prompt("New route id", defaultId) || "").trim();
+        if (!newId) return;
+        if (routes.some((item) => item.id === newId)) {{
+          setMapAuthoringStatus("Route id already exists", "error");
+          return;
+        }}
+        const copy = JSON.parse(JSON.stringify(route));
+        copy.id = newId;
+        copy.label = `${{route.label || route.id || "Route"}} Copy`;
+        await saveRoutes([...routes, copy], newId);
+      }};
+      const deleteRouteFromTable = async (routeId) => {{
+        const routes = routeList();
+        const route = routes.find((item) => item.id === routeId);
+        if (!route) return;
+        if (!window.confirm(`Delete route ${{routeId}}?`)) return;
+        const remaining = routes.filter((item) => item.id !== routeId);
+        const currentSelected = (mapAuthoring || {{}}).selected_route_id;
+        const selectedRouteId = currentSelected === routeId ? ((remaining[0] && remaining[0].id) || null) : currentSelected;
+        await saveRoutes(remaining, selectedRouteId);
+      }};
+      const handleRouteTableAction = async (button) => {{
+        const routeId = button.getAttribute("data-route-id") || "";
+        const action = button.getAttribute("data-route-table-action") || "";
+        if (action === "select") {{
+          await selectRouteFromTable(routeId);
+        }} else if (action === "rename") {{
+          await renameRouteFromTable(routeId);
+        }} else if (action === "duplicate") {{
+          await duplicateRouteFromTable(routeId);
+        }} else if (action === "delete") {{
+          await deleteRouteFromTable(routeId);
+        }}
       }};
       const removeRouteWaypoint = async (targetId) => {{
         const current = mapAuthoring || {{}};
@@ -2921,6 +3093,12 @@ def render_dashboard_html(
       }}
       if (mapEditControls) {{
         mapEditControls.addEventListener("click", async (event) => {{
+          const routeTableButton = event.target.closest("button[data-route-table-action]");
+          if (routeTableButton) {{
+            routeTableButton.blur();
+            await handleRouteTableAction(routeTableButton);
+            return;
+          }}
           const routeActionButton = event.target.closest("button[data-route-action-kind]");
           if (routeActionButton) {{
             routeActionButton.blur();

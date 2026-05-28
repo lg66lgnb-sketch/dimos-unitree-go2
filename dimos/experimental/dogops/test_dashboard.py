@@ -153,6 +153,15 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert 'data-route-action-kind="inspect_asset"' in content
     assert 'data-route-action-kind="verify_work_order"' in content
     assert 'data-route-action-kind="operator_prompt"' in content
+    assert "Saved Routes" in content
+    assert 'data-route-table' in content
+    assert 'data-route-table-action="select"' in content
+    assert 'data-route-table-action="rename"' in content
+    assert 'data-route-table-action="duplicate"' in content
+    assert 'data-route-table-action="delete"' in content
+    assert "route-actions-subrow" in content
+    assert "routeActionRows(route)" in content
+    assert "handleRouteTableAction" in content
     assert 'class="map-route-stop-marker"' in content
     assert 'circle.setAttribute("r", "18")' in content
     assert 'circle.setAttribute("r", "9")' in content
@@ -328,6 +337,7 @@ def test_dashboard_map_controls_are_grouped_near_legend(tmp_path) -> None:
     assert 'data-map-edit-action="route_add_action"' not in route_row.group(1)
     assert 'data-map-edit-action="route_down"' in route_row.group(1)
     assert 'data-map-route-summary' in route_row.group(1)
+    assert '<th>Last Run</th>' in content
 
     svg_end = content.index("</svg>")
     layer_controls = content.index('<div class="map-layer-controls"', svg_end)
