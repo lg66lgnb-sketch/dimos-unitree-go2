@@ -65,9 +65,17 @@ Replay logs show DogOps modules and `McpServer` deploying, but `dimos status` re
 Observed on 2026-05-27 in the full DimOS checkout:
 normal replay was blocked by non-interactive sudo for `route add -net 224.0.0.0/4 -interface lo0`.
 Using `PYTEST_VERSION=8.3.5` skipped the configurator and deployed the DogOps modules plus `McpServer`, but daemon discovery still returned no running instance.
+Later Ubuntu-side verification showed the minimal MCP control plane works after adding docstrings to all DogOps `@skill` methods:
+`dimos --viewer none run dog-ops-skill-container mcp-server --daemon`,
+`dimos mcp list-tools`, and
+`dimos mcp call go_to --json-args '{"x":1.25,"y":-0.5}'`
+all succeeded, returning `transport: clicked_point`.
+After fixing `DogOpsDashboardModule`, `DogOpsObservationModule`, and `DogOpsNavEvalModule` to initialize the DimOS `Module` base when worker kwargs are injected, the full DogOps blueprint with `--disable go2-connection` daemonized and MCP `go_to` returned `transport: clicked_point`.
+Running without `--disable go2-connection` then failed in `GO2Connection.start()` while opening replay SQLite data because `/tmp/dimos-full-dogops-venv/lib/python3.12/site-packages/sqlite_vec/vec0.so` had `wrong ELF class: ELFCLASS32` on Ubuntu aarch64. Inspection showed the `sqlite-vec==0.1.6` wheel installed a 32-bit ARM shared object. Installing `sqlite-vec==0.1.9` into the same temp venv installed a 64-bit AArch64 shared object and unblocked full replay.
+With that temp-venv fix, `dimos --replay --viewer none run unitree-go2-dogops --daemon` started all 14 modules, `dimos status` reported run `20260527-175301-unitree-go2-dogops`, and `dimos mcp call go_to --json-args '{"x":0.5,"y":0.75}'` returned `{"ok": true, "transport": "clicked_point"}`.
 
 Fallback:
-Do not claim MCP validation. Try a different documented DimOS launch mode or real hardware run, check for lingering replay processes, stop with `uv run dimos stop --force`, and ask before killing OS processes directly. Use direct DogOps CLI/skill tests and dashboard/report output as fallback evidence.
+On Ubuntu aarch64, do not retry full replay with `sqlite-vec==0.1.6`; use a clean temp venv with `sqlite-vec==0.1.9` or persist the dependency bump before rerunning. After `dimos stop`, check for lingering temp-venv forkserver/resource-tracker processes and clean only the processes created by the run.
 
 ### Localhost dashboard or MCP calls use a proxy
 

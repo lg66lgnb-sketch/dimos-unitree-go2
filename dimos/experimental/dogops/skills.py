@@ -16,6 +16,7 @@ from dimos.experimental.dogops.config_loader import (
     load_mission as read_mission,
     load_site_config as read_site_config,
 )
+from dimos.experimental.dogops.detector import DetectedTag, DogOpsTagDetector
 from dimos.experimental.dogops.heatmap_runs import gather_heatmap_run
 from dimos.experimental.dogops.mission_engine import run_offline_simulation
 from dimos.experimental.dogops.models import (
@@ -26,6 +27,7 @@ from dimos.experimental.dogops.models import (
     IncidentType,
     MissionState,
     Observation,
+    PackageState,
     Severity,
     WorkOrder,
     WorkOrderState,
@@ -39,6 +41,11 @@ from dimos.experimental.dogops.route_executor import (
     RouteExecutionError,
 )
 from dimos.experimental.dogops.store import DogOpsStore
+
+try:  # pragma: no cover - exercised only inside a full DimOS checkout.
+    from reactivex.disposable import Disposable as RxDisposable
+except ModuleNotFoundError:  # pragma: no cover - local project-pack fallback.
+    RxDisposable = None
 
 try:  # pragma: no cover - exercised only inside a full DimOS checkout.
     from dimos.agents.annotation import skill
@@ -61,15 +68,29 @@ try:  # pragma: no cover - exercised only inside a full DimOS checkout.
 except ModuleNotFoundError:
 
     class Module:
+        def __init__(self, **_: object) -> None:
+            pass
+
         @classmethod
         def blueprint(cls, **kwargs: object) -> dict[str, object]:
             return {"module": cls.__name__, "kwargs": kwargs}
 
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
 
 try:  # pragma: no cover - exercised only inside a full DimOS checkout.
-    from dimos.core.stream import Out
+    from dimos.core.stream import In, Out
     from dimos.msgs.geometry_msgs.PointStamped import PointStamped
+    from dimos.msgs.sensor_msgs.Image import Image
 except ModuleNotFoundError:  # pragma: no cover - local project-pack fallback.
+
+    class In:
+        def __class_getitem__(cls, _: object) -> type[In]:
+            return cls
 
     class Out:
         def __class_getitem__(cls, _: object) -> type[Out]:
@@ -91,10 +112,13 @@ except ModuleNotFoundError:  # pragma: no cover - local project-pack fallback.
             self.y = y
             self.z = z
 
+    Image = Any  # type: ignore[misc, assignment]
+
 
 class DogOpsSkillContainer(Module):
     """Deterministic SiteOps skills exposed through DimOS MCP or direct tests."""
 
+    color_image: In[Image]
     clicked_point: Out[PointStamped]
 
     def __init__(
@@ -120,6 +144,19 @@ class DogOpsSkillContainer(Module):
         self._go_to_handler = go_to_handler
         self._route_stop_handler = route_stop_handler
         self._live_map_adapter = live_map_adapter
+        self._latest_camera_image: object | None = None
+        self._latest_camera_received_at: float | None = None
+
+    def start(self) -> None:  # pragma: no cover - lifecycle exercised in full DimOS.
+        super().start()
+        color_image = getattr(self, "color_image", None)
+        if color_image is not None and hasattr(color_image, "subscribe"):
+            subscription = color_image.subscribe(self.ingest_camera_image)
+            _register_subscription(self, subscription)
+
+    def ingest_camera_image(self, image: object) -> None:
+        self._latest_camera_image = image
+        self._latest_camera_received_at = time.time()
 
     @skill
     def load_site_config(self, path: str = str(DEFAULT_SITE)) -> str:
@@ -336,7 +373,11 @@ class DogOpsSkillContainer(Module):
 
     @skill
     def scan_zone(self, zone_id: str) -> str:
-        """Scan a configured site zone and return visible tags and packages."""
+        """Scan a zone using the live camera when available, otherwise deterministic fixtures."""
+        camera_result = self._scan_zone_with_latest_camera(zone_id)
+        if camera_result is not None:
+            return camera_result
+
         mission = read_mission(self.mission_path)
         observations = [
             obs for obs in mission.simulation_observations.values() if obs.zone_id == zone_id
@@ -356,7 +397,13 @@ class DogOpsSkillContainer(Module):
             zone_id=zone_id,
             visible_tag_ids=visible_tag_ids,
             package_ids=package_ids,
+            source="simulation",
         )
+
+    @skill
+    def camera_stream_status(self) -> str:
+        """Return whether DogOps has received a live camera frame."""
+        return _json(skill="camera_stream_status", **self._camera_stream_status())
 
     @skill
     def read_gauge(self, asset_id: str = "TEMP_1") -> str:
@@ -765,6 +812,94 @@ class DogOpsSkillContainer(Module):
         assert store.state is not None
         return store.state
 
+    def _scan_zone_with_latest_camera(self, zone_id: str) -> str | None:
+        if self._latest_camera_image is None:
+            return None
+
+        site = read_site_config(self.site_path)
+        if zone_id not in site.zone_by_id():
+            return _json(ok=False, skill="scan_zone", error="unknown_zone", zone_id=zone_id)
+
+        try:
+            detections = DogOpsTagDetector(site).detect_dimos_image(self._latest_camera_image)
+        except RuntimeError as exc:
+            return _json(
+                ok=False,
+                skill="scan_zone",
+                error="camera_detector_unavailable",
+                message=str(exc),
+                zone_id=zone_id,
+                source="camera",
+            )
+
+        visible_tag_ids = sorted({detection.tag_id for detection in detections})
+        package_ids = _package_ids_from_detections(detections)
+        evidence_observation_ids = self._persist_camera_observations(
+            detections,
+            zone_id=zone_id,
+        )
+        return _json(
+            ok=True,
+            skill="scan_zone",
+            zone_id=zone_id,
+            visible_tag_ids=visible_tag_ids,
+            package_ids=package_ids,
+            source="camera",
+            detection_count=len(detections),
+            camera_frame_age_s=self._camera_frame_age_s(),
+            evidence_observation_ids=evidence_observation_ids,
+        )
+
+    def _persist_camera_observations(
+        self,
+        detections: list[DetectedTag],
+        *,
+        zone_id: str,
+    ) -> list[str]:
+        if not detections or not self._state_file().exists():
+            return []
+
+        store = DogOpsStore.load_existing(self.run_dir)
+        state = store.state
+        assert state is not None
+        evidence_ids: list[str] = []
+        observed_at = time.time()
+        for index, detection in enumerate(detections, start=1):
+            observation = _camera_observation(
+                detection,
+                zone_id=zone_id,
+                run_id=state.run.id,
+                observed_at=observed_at,
+                index=index,
+            )
+            store.append_observation(observation)
+            _apply_observation_package_facts(state, observation)
+            evidence_ids.append(observation.id)
+
+        store.write_state(state.run.id)
+        store.write_report(state.run.id)
+        return evidence_ids
+
+    def _camera_stream_status(self) -> dict[str, object]:
+        if self._latest_camera_image is None:
+            return {
+                "ok": False,
+                "mode": "not_subscribed",
+                "fallback": "scan_zone uses deterministic fixtures until a camera frame arrives",
+            }
+        return {
+            "ok": True,
+            "mode": "latest_frame",
+            "frame_age_s": self._camera_frame_age_s(),
+            "frame_id": getattr(self._latest_camera_image, "frame_id", None),
+            "shape": _image_shape(self._latest_camera_image),
+        }
+
+    def _camera_frame_age_s(self) -> float | None:
+        if self._latest_camera_received_at is None:
+            return None
+        return round(time.time() - self._latest_camera_received_at, 3)
+
     def _require_store(self, skill_name: str) -> DogOpsStore | str:
         if not self._state_file().exists():
             return _json(ok=False, skill=skill_name, error="missing_run", run_dir=str(self.run_dir))
@@ -784,6 +919,101 @@ def _find_incident(incidents: list[Incident], incident_id: str) -> Incident | No
         if incident.id == incident_id:
             return incident
     return None
+
+
+def _camera_observation(
+    detection: DetectedTag,
+    *,
+    zone_id: str,
+    run_id: str,
+    observed_at: float,
+    index: int,
+) -> Observation:
+    facts = _camera_detection_facts(detection, zone_id)
+    return Observation(
+        id=f"CAM-{int(observed_at * 1000)}-{index:02d}-{detection.tag_id}",
+        ts=observed_at,
+        run_id=run_id,
+        entity_id=detection.entity_id,
+        tag_id=detection.tag_id,
+        zone_id=zone_id,
+        facts=facts,
+        confidence=detection.confidence,
+        source=detection.source,
+    )
+
+
+def _camera_detection_facts(
+    detection: DetectedTag,
+    zone_id: str,
+) -> dict[str, bool | str | int | float]:
+    facts: dict[str, bool | str | int | float] = {
+        "entity_kind": detection.entity_kind or "unknown",
+        "detection_source": detection.source,
+        "frame_id": detection.frame_id or "",
+        "visible_tag_ids": str(detection.tag_id),
+        "center_px": _format_point(detection.center_px),
+        "area_px": round(detection.area_px, 3) if detection.area_px is not None else 0.0,
+    }
+    if detection.entity_id and detection.entity_id.startswith("PKG-"):
+        facts[f"{detection.entity_id}.zone_id"] = zone_id
+    return facts
+
+
+def _apply_observation_package_facts(state: DogOpsState, obs: Observation) -> None:
+    for key, value in obs.facts.items():
+        if not key.endswith(".zone_id"):
+            continue
+        package_id = key.removesuffix(".zone_id")
+        status = state.package_statuses.get(package_id)
+        if status is None or not isinstance(value, str):
+            continue
+        previous_zone = status.observed_zone_id
+        status.observed_zone_id = value
+        if value == status.expected_zone_id:
+            status.state = PackageState.found_ok
+            status.blocks_asset_id = None
+        else:
+            status.state = PackageState.wrong_zone
+        if package_id == "PKG-104" and previous_zone in {"RACK_ROW_A", "COOLING_1"}:
+            if value == "QA_HOLD":
+                state.what_changed.append(
+                    "PKG-104 moved from COOLING_1/RACK_ROW_A to QA_HOLD; INC-001 resolved."
+                )
+
+
+def _package_ids_from_detections(detections: list[DetectedTag]) -> list[str]:
+    return sorted(
+        detection.entity_id
+        for detection in detections
+        if detection.entity_id is not None and detection.entity_id.startswith("PKG-")
+    )
+
+
+def _image_shape(image: object) -> list[int] | None:
+    shape = getattr(image, "shape", None)
+    data = getattr(image, "data", None)
+    if shape is None and data is not None:
+        shape = getattr(data, "shape", None)
+    if shape is None:
+        return None
+    return [int(item) for item in shape]
+
+
+def _format_point(point: tuple[float, float] | None) -> str:
+    if point is None:
+        return ""
+    return f"{point[0]:.1f},{point[1]:.1f}"
+
+
+def _register_subscription(owner: object, subscription: object) -> None:
+    register = getattr(owner, "register_disposable", None)
+    if not callable(register):
+        return
+    if callable(subscription) and RxDisposable is not None:
+        register(RxDisposable(subscription))
+        return
+    register(subscription)
 
 
 def _find_work_order(work_orders: list[WorkOrder], work_order_id: str) -> WorkOrder | None:

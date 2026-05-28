@@ -12,6 +12,9 @@ try:  # pragma: no cover - exercised only inside a full DimOS checkout.
 except ModuleNotFoundError:
 
     class Module:
+        def __init__(self, **_: object) -> None:
+            pass
+
         @classmethod
         def blueprint(cls, **kwargs: object) -> dict[str, object]:
             return {"module": cls.__name__, "kwargs": kwargs}
