@@ -1368,8 +1368,10 @@ def render_dashboard_html(
       color: #d8fff6;
     }}
     .map-route-table {{
-      border: 1px solid #243244;
+      background: #ffffff;
+      border: 1px solid #d1d5db;
       border-radius: 8px;
+      color: #111827;
       overflow: hidden;
     }}
     .map-route-table strong {{
@@ -1382,26 +1384,37 @@ def render_dashboard_html(
     }}
     .map-route-table th,
     .map-route-table td {{
-      border-top: 1px solid #243244;
+      border-top: 1px solid #d1d5db;
+      color: #111827;
       padding: 6px 8px;
       text-align: left;
       vertical-align: top;
     }}
     .map-route-table th {{
-      color: #a9b4c4;
+      background: #f3f4f6;
+      color: #111827;
       font-size: 11px;
       text-transform: uppercase;
     }}
     .map-route-table tr.is-selected-route > td {{
-      background: rgba(20, 92, 82, 0.28);
+      background: #dbeafe;
     }}
     .route-table-actions {{
       display: flex;
       flex-wrap: wrap;
       gap: 6px;
     }}
+    .route-table-actions button {{
+      background: #ffffff;
+      border: 1px solid #9ca3af;
+      border-radius: 999px;
+      color: #111827;
+      cursor: pointer;
+      font: inherit;
+      padding: 4px 8px;
+    }}
     .route-actions-subrow td {{
-      background: rgba(8, 13, 22, 0.58);
+      background: #f9fafb;
     }}
     .route-actions-list {{
       margin: 0;
@@ -1434,25 +1447,30 @@ def render_dashboard_html(
     .map-route-execution-status.ok {{ color: #86efac; }}
     .map-route-execution-status.error {{ color: #fca5a5; }}
     .route-run-history, .route-run-timeline {{
-      color: #cbd5e1;
+      background: #ffffff;
+      border: 1px solid #d1d5db;
+      border-radius: 8px;
+      color: #111827;
       display: grid;
       gap: 6px;
       font-size: 12px;
+      overflow: hidden;
     }}
-    .route-run-history strong, .route-run-timeline strong {{ color: #eef2f8; }}
     .route-run-history table, .route-run-timeline table {{
       border-collapse: collapse;
       width: 100%;
     }}
     .route-run-history th, .route-run-history td,
     .route-run-timeline th, .route-run-timeline td {{
-      border-bottom: 1px solid #1d2430;
+      border-bottom: 1px solid #d1d5db;
+      color: #111827;
       padding: 5px 4px;
       text-align: left;
       vertical-align: top;
     }}
     .route-run-history th, .route-run-timeline th {{
-      color: #93a4b8;
+      background: #f3f4f6;
+      color: #111827;
       font-size: 10px;
       text-transform: uppercase;
     }}

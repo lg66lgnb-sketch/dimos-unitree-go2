@@ -357,6 +357,10 @@ def test_dashboard_map_controls_are_grouped_near_legend(tmp_path) -> None:
     assert "label: routeId" in content
     assert "routeTable.addEventListener(\"click\"" in content
     assert "mapEditControls.addEventListener(\"click\"" in content
+    assert ".map-route-table {" in content
+    assert ".route-run-history, .route-run-timeline {" in content
+    assert "background: #ffffff;" in content
+    assert "color: #111827;" in content
 
 
 def test_dashboard_saved_routes_table_renders_selected_actions_and_escapes(tmp_path) -> None:
