@@ -203,6 +203,30 @@ def gather_heatmap_run(
 
 def latest_heatmap_snapshot(run_dir: str | Path) -> dict[str, Any] | None:
     path = Path(run_dir) / HEATMAP_DIRNAME / LATEST_HEATMAP_FILENAME
+    return _read_heatmap_snapshot(path)
+
+
+def heatmap_snapshot_for_route_run(
+    run_dir: str | Path,
+    route_run_id: str,
+    *,
+    evidence: list[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    root = Path(run_dir)
+    candidates = [
+        Path(str(item.get("path")))
+        for item in evidence or []
+        if item.get("kind") == "costmap_snapshot" and item.get("path")
+    ]
+    candidates.append(root / HEATMAP_DIRNAME / f"{route_run_id}.json")
+    for path in candidates:
+        snapshot = _read_heatmap_snapshot(path)
+        if snapshot is not None:
+            return snapshot
+    return None
+
+
+def _read_heatmap_snapshot(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
     try:

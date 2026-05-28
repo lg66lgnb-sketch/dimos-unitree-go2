@@ -1499,6 +1499,18 @@ def render_dashboard_html(
       font-size: 10px;
       text-transform: uppercase;
     }}
+    .route-run-history tr.is-selected-route > td {{
+      background: #ecfeff;
+    }}
+    .route-run-history button {{
+      background: #ffffff;
+      border: 1px solid #9ca3af;
+      border-radius: 999px;
+      color: #111827;
+      cursor: pointer;
+      font: inherit;
+      padding: 4px 8px;
+    }}
     .map-empty {{
       align-items: center;
       background: #101721;
@@ -1754,10 +1766,10 @@ def render_dashboard_html(
         <div class="route-run-history">
           <table>
             <thead>
-              <tr><th>Time</th><th>Run</th><th>Route</th><th>Mode</th><th>State</th><th>Progress</th></tr>
+              <tr><th>Time</th><th>Run</th><th>Route</th><th>Mode</th><th>State</th><th>Progress</th><th>Map</th></tr>
             </thead>
             <tbody data-route-run-history>
-              <tr><td colspan="6">No route runs recorded</td></tr>
+              <tr><td colspan="7">No route runs recorded</td></tr>
             </tbody>
           </table>
         </div>
@@ -1884,6 +1896,7 @@ def render_dashboard_html(
       let liveOverlayBounds = null;
       let latestRouteRuns = [];
       let savedImageUrls = [];
+      let selectedRouteRunId = "";
       let latestQrEventsById = new Map();
       try {{
         liveMapBounds = liveMapSvg ? JSON.parse(liveMapSvg.dataset.mapBounds || "{{}}") : null;
@@ -2242,13 +2255,15 @@ def render_dashboard_html(
       const renderRouteRunHistory = (runs) => {{
         if (!routeRunHistory) return;
         if (!Array.isArray(runs) || !runs.length) {{
-          routeRunHistory.innerHTML = '<tr><td colspan="6">No route runs recorded</td></tr>';
+          routeRunHistory.innerHTML = '<tr><td colspan="7">No route runs recorded</td></tr>';
           return;
         }}
         routeRunHistory.innerHTML = runs.slice(0, 8).map((run) => {{
           const progress = `${{Number(run.waypoints_reached || 0)}}/${{Number(run.waypoints_total || 0)}} wp, ${{Number(run.actions_completed || 0)}}/${{Number(run.actions_total || 0)}} act`;
           const mode = routeRunMode(run);
-          return `<tr><td>${{htmlEscape(formatRouteRunTime(run.started_at))}}</td><td>${{htmlEscape(run.dogops_run_id || "-")}}</td><td>${{htmlEscape(run.route_id || "-")}}</td><td>${{htmlEscape(mode)}}</td><td>${{htmlEscape(run.state || "-")}}</td><td>${{htmlEscape(progress)}}</td></tr>`;
+          const routeRunId = htmlEscape(run.route_run_id || "");
+          const selectedClass = selectedRouteRunId && selectedRouteRunId === run.route_run_id ? ' class="is-selected-route"' : "";
+          return `<tr${{selectedClass}}><td>${{htmlEscape(formatRouteRunTime(run.started_at))}}</td><td>${{htmlEscape(run.dogops_run_id || "-")}}</td><td>${{htmlEscape(run.route_id || "-")}}</td><td>${{htmlEscape(mode)}}</td><td>${{htmlEscape(run.state || "-")}}</td><td>${{htmlEscape(progress)}}</td><td><button type="button" data-route-run-select="${{routeRunId}}">Show</button></td></tr>`;
         }}).join("");
       }};
       const routeRunMode = (run) => {{
@@ -2315,6 +2330,35 @@ def render_dashboard_html(
           }}
         }}));
         savedImages.innerHTML = cards.filter(Boolean).join("") || '<p class="muted">No saved route images available</p>';
+      }};
+      const selectRouteRunOnMap = async (routeRunId) => {{
+        if (!routeRunId) return;
+        try {{
+          const response = await fetch("/api/route-runs/" + encodeURIComponent(routeRunId), {{
+            cache: "no-store",
+            headers: {{"X-DogOps-Control-Token": robotControlToken}},
+          }});
+          const detail = await response.json();
+          if (!response.ok || detail.ok === false) {{
+            throw new Error(routeApiErrorText(detail, "route_run_detail_failed"));
+          }}
+          selectedRouteRunId = routeRunId;
+          renderRouteRunTimeline(detail.timeline || detail.events || []);
+          if (detail.map) {{
+            updateDimOSMapLayers(detail.map);
+            const heatmap = detail.map.gathered_heatmap;
+            const cells = heatmap ? Number(heatmap.cells || 0) : 0;
+            setMapCommandStatus(
+              `Showing route run ${{routeRunId}}${{cells ? ` with saved heatmap (${{cells}} cells)` : ""}}`,
+              "ok"
+            );
+          }} else {{
+            setMapCommandStatus(`Route run ${{routeRunId}} has no saved map files`, "error");
+          }}
+          renderRouteRunHistory(latestRouteRuns);
+        }} catch (error) {{
+          setMapCommandStatus(`Route run load failed: ${{error.message}}`, "error");
+        }}
       }};
       const refreshRouteRunHistory = async () => {{
         try {{
@@ -2943,7 +2987,12 @@ def render_dashboard_html(
         if (!live) return;
         if (data.bounds) liveOverlayBounds = data.bounds;
         const heatmapCells = renderLiveHeatmap(live.costmap);
-        const pathPoints = renderDimOSPath(live.path || live.route || []);
+        const overlayPath = Array.isArray(live.path) && live.path.length
+          ? live.path
+          : Array.isArray(live.route) && live.route.length
+            ? live.route
+            : data.route || [];
+        const pathPoints = renderDimOSPath(overlayPath);
         renderDimOSTarget(live.target);
         const qrEvents = Array.isArray(data.qr_cargo_events) ? data.qr_cargo_events : [];
         renderQrCargoMarkers(qrEvents);
@@ -3305,6 +3354,14 @@ def render_dashboard_html(
           if (!routeTableButton) return;
           routeTableButton.blur();
           await handleRouteTableAction(routeTableButton);
+        }});
+      }}
+      if (routeRunHistory) {{
+        routeRunHistory.addEventListener("click", async (event) => {{
+          const routeRunButton = event.target.closest("button[data-route-run-select]");
+          if (!routeRunButton) return;
+          routeRunButton.blur();
+          await selectRouteRunOnMap(routeRunButton.getAttribute("data-route-run-select") || "");
         }});
       }}
       if (mapEditControls) {{

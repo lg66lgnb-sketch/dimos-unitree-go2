@@ -29,6 +29,7 @@ from dimos.experimental.dogops.dashboard_static import (
 )
 from dimos.experimental.dogops.heatmap_runs import (
     gather_heatmap_run,
+    heatmap_snapshot_for_route_run,
     latest_heatmap_snapshot,
 )
 from dimos.experimental.dogops.live_map import DogOpsLiveMapAdapter
@@ -774,13 +775,15 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
             self._send_route_run_evidence_file(store, route_run, parts[4])
             return
         route_events = store.route_run_events(route_run_id)
+        evidence = store.route_run_evidence(route_run_id)
         self._send_json(
             {
                 "ok": True,
                 "route_run": route_run,
                 "events": route_events,
                 "timeline": self._unified_timeline(route_events, route_run),
-                "evidence": store.route_run_evidence(route_run_id),
+                "evidence": evidence,
+                "map": self._route_run_map(route_run, evidence),
             }
         )
 
@@ -814,6 +817,45 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": "evidence_path_outside_run"}, HTTPStatus.FORBIDDEN)
             return
         self._send_file(resolved, mime_type)
+
+    def _route_run_map(
+        self,
+        route_run: dict[str, Any],
+        evidence: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        timeline_run_dir = Path(str(route_run.get("run_dir") or self.run_dir))
+        state_path = timeline_run_dir / "state.json"
+        report_path = timeline_run_dir / "report.json"
+        if not state_path.exists() or not report_path.exists():
+            return None
+        state = self._read_json(state_path)
+        report = self._read_json(report_path)
+        authoring = load_map_authoring(
+            timeline_run_dir,
+            site_id=str((state.get("site") or {}).get("site_id") or ""),
+        ).model_dump(mode="json")
+        route_snapshot = route_run.get("selected_route_snapshot")
+        if isinstance(route_snapshot, dict) and route_snapshot.get("waypoints"):
+            routes = [
+                route
+                for route in authoring.get("routes") or []
+                if isinstance(route, dict) and route.get("id") != route_snapshot.get("id")
+            ]
+            routes.append(route_snapshot)
+            authoring["routes"] = routes
+            authoring["selected_route_id"] = route_snapshot.get("id")
+        heatmap_snapshot = heatmap_snapshot_for_route_run(
+            timeline_run_dir,
+            str(route_run.get("route_run_id") or ""),
+            evidence=evidence,
+        )
+        return build_map_data(
+            state,
+            report,
+            heatmap_snapshot=heatmap_snapshot,
+            authoring=authoring,
+            qr_events=load_qr_events(timeline_run_dir),
+        )
 
     def _unified_timeline(
         self,
