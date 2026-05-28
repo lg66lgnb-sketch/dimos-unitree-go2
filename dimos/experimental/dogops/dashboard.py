@@ -32,6 +32,7 @@ from dimos.experimental.dogops.heatmap_runs import (
     heatmap_snapshot_for_route_run,
     latest_heatmap_snapshot,
 )
+from dimos.experimental.dogops.live_camera import DogOpsLiveCameraAdapter
 from dimos.experimental.dogops.live_map import DogOpsLiveMapAdapter
 from dimos.experimental.dogops.map_authoring import (
     EditableIncidentLocation,
@@ -125,6 +126,7 @@ _ROBOT_SESSIONS_LOCK = threading.Lock()
 _AUTHORING_LOCK = threading.Lock()
 _QR_EVENTS_LOCK = threading.Lock()
 _LIVE_MAP_ADAPTER = DogOpsLiveMapAdapter()
+_LIVE_CAMERA_ADAPTER = DogOpsLiveCameraAdapter()
 
 
 class DogOpsDashboardServer(ThreadingHTTPServer):
@@ -134,14 +136,17 @@ class DogOpsDashboardServer(ThreadingHTTPServer):
         handler_class: type[BaseHTTPRequestHandler],
         *,
         live_map_adapter: DogOpsLiveMapAdapter,
+        live_camera_adapter: DogOpsLiveCameraAdapter | None = None,
     ) -> None:
         self.live_map_adapter = live_map_adapter
+        self.live_camera_adapter = live_camera_adapter
         super().__init__(server_address, handler_class)
 
     def server_close(self) -> None:
-        stop = getattr(getattr(self, "live_map_adapter", None), "stop", None)
-        if stop is not None:
-            stop()
+        for adapter_name in ("live_map_adapter", "live_camera_adapter"):
+            stop = getattr(getattr(self, adapter_name, None), "stop", None)
+            if stop is not None:
+                stop()
         with _ROBOT_SESSIONS_LOCK:
             sessions = list(_ROBOT_SESSIONS.values())
             _ROBOT_SESSIONS.clear()
@@ -161,7 +166,12 @@ def make_dashboard_server(run_dir: str | Path, host: str, port: int) -> Threadin
         robot_control_token = token
         robot_ip = DEFAULT_ROBOT_IP
 
-    return DogOpsDashboardServer((host, port), Handler, live_map_adapter=_LIVE_MAP_ADAPTER)
+    return DogOpsDashboardServer(
+        (host, port),
+        Handler,
+        live_map_adapter=_LIVE_MAP_ADAPTER,
+        live_camera_adapter=_LIVE_CAMERA_ADAPTER,
+    )
 
 
 def serve_dashboard(run_dir: str | Path, host: str = "127.0.0.1", port: int = 8765) -> None:
@@ -222,6 +232,12 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/nav":
             report = self._read_json(self.run_dir / "report.json")
             self._send_json(report.get("nav_summary") or {})
+        elif path == "/api/camera/status":
+            if self._authorize_local_read():
+                self._send_json(_LIVE_CAMERA_ADAPTER.status())
+        elif path == "/api/camera/frame.jpg":
+            if self._authorize_local_read():
+                self._send_camera_frame()
         elif path == "/api/map":
             state = self._read_json(self.run_dir / "state.json")
             report = self._read_json(self.run_dir / "report.json")
@@ -1467,6 +1483,28 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)
+
+    def _send_camera_frame(self) -> None:
+        try:
+            payload = _LIVE_CAMERA_ADAPTER.frame_jpeg()
+        except Exception as exc:
+            self._send_json(
+                {"ok": False, "error": "camera_frame_unavailable", "message": str(exc)},
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            return
+        if payload is None:
+            self._send_json(
+                {"ok": False, "error": "camera_frame_pending"},
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            return
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(payload)
 
     def _read_json(self, path: Path) -> dict[str, Any]:
         return json.loads(path.read_text(encoding="utf-8"))
