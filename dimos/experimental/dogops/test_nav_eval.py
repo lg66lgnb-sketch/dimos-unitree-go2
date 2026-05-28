@@ -1,6 +1,6 @@
+from dimos.experimental.dogops.mission_engine import run_offline_simulation
 from dimos.experimental.dogops.models import NavAction, NavEvent
 from dimos.experimental.dogops.nav_eval import DogOpsNavEvalModule, summarize_nav_events
-from dimos.experimental.dogops.mission_engine import run_offline_simulation
 
 
 def test_summarize_nav_events_records_retries_and_tag_recovery() -> None:

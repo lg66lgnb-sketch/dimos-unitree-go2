@@ -6,10 +6,10 @@ from pathlib import Path
 from dimos.experimental.dogops.models import (
     DogOpsState,
     Incident,
+    Manifest,
     MissionConfig,
     MissionRun,
     MissionState,
-    Manifest,
     NavEvent,
     Observation,
     PackageStatus,

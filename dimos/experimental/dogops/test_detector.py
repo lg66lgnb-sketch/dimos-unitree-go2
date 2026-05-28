@@ -6,6 +6,15 @@ from dimos.experimental.dogops.detector import DogOpsTagDetector
 from dimos.experimental.dogops.tag_registry import DogOpsTagRegistry
 
 
+class _ImageLike:
+    def __init__(self, image, *, frame_id: str = "camera_optical") -> None:
+        self._image = image
+        self.frame_id = frame_id
+
+    def to_opencv(self):
+        return self._image
+
+
 def test_tag_registry_resolves_demo_entities(dogops_site) -> None:
     registry = DogOpsTagRegistry(dogops_site)
 
@@ -55,3 +64,27 @@ def test_detector_reads_generated_apriltag_with_opencv(dogops_site) -> None:
 
     assert detections[0].tag_id == 104
     assert detections[0].entity_id == "PKG-104"
+
+
+def test_detector_reads_dimos_image_like_frame_with_opencv(dogops_site) -> None:
+    cv2 = pytest.importorskip("cv2")
+    np = pytest.importorskip("numpy")
+    if not hasattr(cv2, "aruco"):
+        pytest.skip("OpenCV aruco is unavailable")
+    aruco = cv2.aruco
+    dictionary = aruco.getPredefinedDictionary(aruco.DICT_APRILTAG_36h11)
+    if hasattr(aruco, "generateImageMarker"):
+        marker = aruco.generateImageMarker(dictionary, 104, 240)
+    else:
+        marker = aruco.drawMarker(dictionary, 104, 240)
+    canvas = np.full((320, 320), 255, dtype=marker.dtype)
+    canvas[40:280, 40:280] = marker
+
+    detector = DogOpsTagDetector(dogops_site)
+    detections = detector.detect_dimos_image(_ImageLike(canvas))
+
+    assert detections[0].tag_id == 104
+    assert detections[0].entity_id == "PKG-104"
+    assert detections[0].frame_id == "camera_optical"
+    assert detections[0].center_px == (159.5, 159.5)
+    assert detections[0].area_px is not None

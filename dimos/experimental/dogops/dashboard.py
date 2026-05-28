@@ -305,6 +305,9 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/robot/map_origin":
             if self._authorize_robot_control():
                 self._robot_map_origin()
+        elif path == "/api/robot/scan_zone":
+            if self._authorize_robot_control():
+                self._robot_scan_zone()
         elif path == "/api/map/heatmap/gather":
             if self._authorize_robot_control():
                 self._gather_heatmap()
@@ -1201,6 +1204,53 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
             }
         )
 
+    def _robot_scan_zone(self) -> None:
+        payload = self._read_body_json()
+        zone_id = str(payload.get("zone_id") or "").strip()
+        if not zone_id:
+            self._send_json(
+                {"ok": False, "error": "missing_zone_id"},
+                HTTPStatus.BAD_REQUEST,
+            )
+            return
+
+        try:
+            result = _run_robot_call(lambda: _run_robot_scan_zone(zone_id))
+        except ModuleNotFoundError as exc:
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": "dimos_mcp_unavailable",
+                    "message": str(exc),
+                },
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            return
+        except TimeoutError as exc:
+            self._send_json(
+                {"ok": False, "error": "scan_zone_timeout", "message": str(exc)},
+                HTTPStatus.GATEWAY_TIMEOUT,
+            )
+            return
+        except Exception as exc:
+            if _is_mcp_unavailable_error(exc):
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": "dimos_mcp_unavailable",
+                        "message": str(exc),
+                    },
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+                return
+            self._send_json(
+                {"ok": False, "error": "scan_zone_failed", "message": str(exc)},
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            return
+
+        self._send_json({"ok": True, "command": "scan_zone", "zone_id": zone_id, **(result or {})})
+
     def _robot_map_start(self) -> None:
         robot_ip = self.robot_ip
         try:
@@ -1542,6 +1592,10 @@ def _run_robot_posture(command: str, robot_ip: str) -> bool:
 
 def _run_robot_go_to(x: float, y: float) -> dict[str, Any]:
     return _call_dimos_mcp_skill("go_to", {"x": x, "y": y})
+
+
+def _run_robot_scan_zone(zone_id: str) -> dict[str, Any]:
+    return _call_dimos_mcp_skill("scan_zone", {"zone_id": zone_id})
 
 
 def _run_route_hard_stop(robot_ip: str) -> dict[str, Any]:

@@ -138,7 +138,9 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert 'data-live-target' in content
     assert "refreshDimOSMap" in content
     assert 'data-map-action="gather_heatmap"' in content
+    assert 'data-map-action="scan_zone"' in content
     assert "/api/map/heatmap/gather" in content
+    assert "/api/robot/scan_zone" in content
     assert 'data-map-edit-label-row' in content
     assert 'data-map-edit-route-row' in content
     assert 'data-map-edit-action="dry_run_route"' in content
@@ -1643,6 +1645,51 @@ def test_dashboard_robot_go_to_calls_dimos_bridge(tmp_path, monkeypatch) -> None
     assert result["transport"] == "dimos_mcp"
     assert result["skill"] == "go_to"
     assert calls == [(1.25, -0.5)]
+
+
+def test_dashboard_robot_scan_zone_calls_dimos_bridge(tmp_path, monkeypatch) -> None:
+    calls: list[str] = []
+
+    def fake_scan(zone_id: str) -> dict[str, object]:
+        calls.append(zone_id)
+        return {
+            "transport": "dimos_mcp",
+            "skill": "scan_zone",
+            "mcp_result": {
+                "ok": True,
+                "source": "camera",
+                "visible_tag_ids": [104],
+                "package_ids": ["PKG-104"],
+            },
+        }
+
+    monkeypatch.setattr(dashboard, "_run_robot_scan_zone", fake_scan)
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        status, result = _post_json(
+            f"{base_url}/api/robot/scan_zone",
+            {"command": "scan_zone", "zone_id": "QA_HOLD"},
+            headers=_robot_headers(server),
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 200
+    assert result["ok"] is True
+    assert result["command"] == "scan_zone"
+    assert result["zone_id"] == "QA_HOLD"
+    assert result["transport"] == "dimos_mcp"
+    assert result["skill"] == "scan_zone"
+    assert result["mcp_result"]["source"] == "camera"  # type: ignore[index]
+    assert calls == ["QA_HOLD"]
 
 
 def test_dashboard_robot_go_to_rejects_bad_target(tmp_path, monkeypatch) -> None:
