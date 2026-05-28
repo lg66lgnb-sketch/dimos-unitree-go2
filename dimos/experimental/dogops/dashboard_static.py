@@ -873,6 +873,7 @@ def render_site_map(
         '<div class="map-edit-row map-route-action-row" data-route-action-row hidden>'
         '<span class="map-route-summary" data-route-action-summary>Select a waypoint to add actions</span>'
         '<button type="button" data-route-action-kind="capture_image">Capture Image</button>'
+        '<button type="button" data-route-action-kind="gemini_inspect_image">Gemini Inspect</button>'
         '<button type="button" data-route-action-kind="scan_qr">Scan QR</button>'
         '<button type="button" data-route-action-kind="scan_tags">Scan Tags</button>'
         '<button type="button" data-route-action-kind="wait">Wait</button>'
@@ -1750,6 +1751,19 @@ def render_dashboard_html(
           </table>
         </div>
       </section>
+      <section>
+        <h2>Gemini Vision Evidence</h2>
+        <div class="route-run-timeline">
+          <table>
+            <thead>
+              <tr><th>Waypoint</th><th>Summary</th><th>Change</th><th>Severity</th><th>Confidence</th><th>Baseline</th></tr>
+            </thead>
+            <tbody data-gemini-evidence>
+              <tr><td colspan="6">No Gemini analysis recorded</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
     </div>
     <section class="wide">
       <h2>Package Reconciliation</h2>
@@ -1812,6 +1826,7 @@ def render_dashboard_html(
       const routeSummary = document.querySelector("[data-map-route-summary]");
       const routeRunHistory = document.querySelector("[data-route-run-history]");
       const routeRunTimeline = document.querySelector("[data-route-run-timeline]");
+      const geminiEvidence = document.querySelector("[data-gemini-evidence]");
       const liveHeatmap = liveMapSvg ? liveMapSvg.querySelector("[data-live-heatmap]") : null;
       const livePath = liveMapSvg ? liveMapSvg.querySelector("[data-live-path]") : null;
       const liveTrace = liveMapSvg ? liveMapSvg.querySelector("[data-live-trace]") : null;
@@ -2221,6 +2236,24 @@ def render_dashboard_html(
           return `<tr><td>${{htmlEscape(event.sequence || "")}}</td><td>${{htmlEscape(event.kind || "-")}}</td><td>${{htmlEscape(event.state || "-")}}</td><td>${{htmlEscape(target)}}</td><td>${{htmlEscape(event.note || "")}}</td></tr>`;
         }}).join("");
       }};
+      const renderGeminiEvidence = (evidence) => {{
+        if (!geminiEvidence) return;
+        const rows = Array.isArray(evidence)
+          ? evidence.filter((item) => item.kind === "gemini_vision_analysis")
+          : [];
+        if (!rows.length) {{
+          geminiEvidence.innerHTML = '<tr><td colspan="6">No Gemini analysis recorded</td></tr>';
+          return;
+        }}
+        geminiEvidence.innerHTML = rows.slice(-6).map((item) => {{
+          const metadata = item.metadata || {{}};
+          const changed = metadata.changed === true ? "Changed" : metadata.changed === false ? "No change" : "-";
+          const confidence = Number.isFinite(Number(metadata.confidence)) ? Number(metadata.confidence).toFixed(2) : "-";
+          const baseline = `${{metadata.baseline_match || "none"}}${{metadata.baseline_evidence_id ? ` / ${{metadata.baseline_evidence_id}}` : ""}}`;
+          const summary = metadata.summary || metadata.change_summary || item.path || "-";
+          return `<tr><td>${{htmlEscape(metadata.waypoint_id || "-")}}</td><td>${{htmlEscape(summary)}}</td><td>${{htmlEscape(changed)}}</td><td>${{htmlEscape(metadata.severity || "-")}}</td><td>${{htmlEscape(confidence)}}</td><td>${{htmlEscape(baseline)}}</td></tr>`;
+        }}).join("");
+      }};
       const refreshRouteRunHistory = async () => {{
         try {{
           const currentResponse = await fetch("/api/route-runs/current", {{
@@ -2230,6 +2263,7 @@ def render_dashboard_html(
           const current = await currentResponse.json();
           if (currentResponse.ok && current.ok !== false) {{
             renderRouteRunTimeline(current.timeline || current.events || []);
+            renderGeminiEvidence(current.evidence || []);
           }}
           const listResponse = await fetch("/api/route-runs", {{
             cache: "no-store",
@@ -2430,6 +2464,16 @@ def render_dashboard_html(
         if (kind === "capture_image") {{
           return {{target: waypoint.target_id || waypoint.id}};
         }}
+        if (kind === "gemini_inspect_image") {{
+          return {{
+            target: waypoint.target_id || waypoint.id,
+            prompt: "Inspect this waypoint for physical changes, safety issues, package changes, and work-order evidence.",
+            baseline_policy: "same_waypoint_latest_previous",
+            require_baseline: false,
+            model: "gemini-2.5-flash",
+            max_image_bytes_inline: 20000000,
+          }};
+        }}
         if (kind === "wait") {{
           const seconds = Number(window.prompt("Wait seconds", "2") || 2);
           return {{seconds: Number.isFinite(seconds) ? seconds : 2}};
@@ -2438,6 +2482,7 @@ def render_dashboard_html(
       }};
       const routeActionLabels = {{
         capture_image: "Capture Image",
+        gemini_inspect_image: "Gemini Inspect",
         scan_qr: "Scan QR",
         scan_tags: "Scan Tags",
         wait: "Wait",

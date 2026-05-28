@@ -149,6 +149,7 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert 'data-map-edit-action="heatmap_run"' in content
     assert 'data-route-action-row' in content
     assert 'data-route-action-kind="capture_image"' in content
+    assert 'data-route-action-kind="gemini_inspect_image"' in content
     assert 'data-route-action-kind="scan_qr"' in content
     assert 'data-route-action-kind="scan_tags"' in content
     assert 'data-route-action-kind="wait"' in content
@@ -1051,6 +1052,14 @@ def test_dashboard_route_action_authoring_persists_valid_actions(tmp_path) -> No
                         args={},
                     ),
                     EditableRouteAction(
+                        id="ACT-GEMINI",
+                        kind="gemini_inspect_image",
+                        label="Gemini inspect",
+                        required=True,
+                        timeout_s=5.0,
+                        args={"target": "WP-1"},
+                    ),
+                    EditableRouteAction(
                         id="ACT-TAGS",
                         kind="scan_tags",
                         label="Scan AprilTags",
@@ -1120,6 +1129,7 @@ def test_dashboard_route_action_authoring_persists_valid_actions(tmp_path) -> No
     actions = routes[0]["waypoints"][0]["actions"]  # type: ignore[index]
     assert [action["kind"] for action in actions] == [
         "capture_image",
+        "gemini_inspect_image",
         "scan_tags",
         "scan_qr",
         "wait",
@@ -1128,12 +1138,13 @@ def test_dashboard_route_action_authoring_persists_valid_actions(tmp_path) -> No
         "operator_prompt",
     ]
     assert actions[0]["required"] is True
-    assert actions[1]["args"] == {"expected": [101, 102]}
-    assert actions[2]["args"] == {"expected": ["QR-1"]}
-    assert actions[3]["args"] == {"seconds": 2.0}
-    assert actions[4]["args"] == {"target": "ASSET_1"}
-    assert actions[5]["args"] == {"target": "WO-001"}
-    assert actions[6]["args"] == {"target": "WP-1"}
+    assert actions[1]["args"] == {"target": "WP-1"}
+    assert actions[2]["args"] == {"expected": [101, 102]}
+    assert actions[3]["args"] == {"expected": ["QR-1"]}
+    assert actions[4]["args"] == {"seconds": 2.0}
+    assert actions[5]["args"] == {"target": "ASSET_1"}
+    assert actions[6]["args"] == {"target": "WO-001"}
+    assert actions[7]["args"] == {"target": "WP-1"}
 
 
 def test_dashboard_map_data_bounds_include_live_overlay(tmp_path) -> None:

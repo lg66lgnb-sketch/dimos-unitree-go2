@@ -13,6 +13,7 @@ from dimos.experimental.dogops.map_authoring import (
     MapAuthoringState,
     save_map_authoring,
 )
+from dimos.experimental.dogops.route_actions import EditableRouteAction
 from dimos.experimental.dogops.route_executor import load_route_execution, save_route_execution
 from dimos.experimental.dogops.skills import DogOpsSkillContainer
 
@@ -229,6 +230,47 @@ def test_skill_container_route_skills_validate_and_report_dry_run(tmp_path) -> N
     assert result["state"] == "completed"
     assert result["transport"] == "dry_run"
     assert status["state"] == "completed"
+
+
+def test_skill_container_qr_route_action_uses_scan_zone_flow(tmp_path) -> None:
+    save_map_authoring(
+        tmp_path / "latest",
+        MapAuthoringState(
+            selected_route_id="ROUTE_SCAN_QR",
+            routes=[
+                EditableRoute(
+                    id="ROUTE_SCAN_QR",
+                    label="Route Scan QR",
+                    waypoints=[
+                        EditableRouteWaypoint(
+                            id="WP-INBOUND",
+                            label="Inbound",
+                            target_id="INBOUND_DOCK",
+                            pose=EditableMapPoint(x=1.0, y=2.0),
+                            actions=[
+                                EditableRouteAction(
+                                    id="SCAN-QR",
+                                    kind="scan_qr",
+                                    args={},
+                                )
+                            ],
+                        ),
+                    ],
+                )
+            ],
+        ),
+    )
+    skills = DogOpsSkillContainer(run_dir=tmp_path / "latest")
+
+    result = _payload(skills.follow_route(dry_run=True))
+
+    assert result["ok"] is True
+    events = result["route_execution"]["events"]  # type: ignore[index]
+    completed = [event for event in events if event.get("action_id") == "SCAN-QR"][-1]
+    assert completed["state"] == "completed"
+    assert completed["payload"]["source"] == "scan_zone"
+    assert completed["payload"]["scan_zone_source"] == "simulation"
+    assert completed["payload"]["detected_payloads"] == ["PKG-101", "PKG-102"]
 
 
 def test_skill_container_follow_route_requires_navigation_stream_for_live_run(tmp_path) -> None:
