@@ -691,6 +691,80 @@ def build_poi_data(state: dict[str, Any], report: dict[str, Any]) -> dict[str, A
     }
 
 
+def _route_action_count(route: dict[str, Any]) -> int:
+    return sum(
+        len(waypoint.get("actions") or [])
+        for waypoint in route.get("waypoints") or []
+        if isinstance(waypoint, dict)
+    )
+
+
+def _route_action_rows(route: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for waypoint in route.get("waypoints") or []:
+        if not isinstance(waypoint, dict):
+            continue
+        for action in waypoint.get("actions") or []:
+            if not isinstance(action, dict):
+                continue
+            rows.append(
+                {
+                    "waypoint": waypoint.get("label") or waypoint.get("id") or "-",
+                    "kind": action.get("kind") or "-",
+                    "label": action.get("label") or action.get("kind") or "-",
+                    "args": action.get("args") or {},
+                }
+            )
+    return rows
+
+
+def _render_saved_route_rows(authoring: dict[str, Any]) -> str:
+    routes = [route for route in authoring.get("routes") or [] if isinstance(route, dict)]
+    if not routes:
+        return '<tr><td colspan="6">No saved routes</td></tr>'
+    selected_route_id = authoring.get("selected_route_id")
+    rows: list[str] = []
+    for route in routes:
+        route_id = str(route.get("id") or "")
+        selected = route_id == selected_route_id
+        waypoints = route.get("waypoints") or []
+        rows.append(
+            f'<tr class="{"is-selected-route" if selected else ""}">'
+            f"<td><strong>{escape(str(route.get('label') or route_id))}</strong><br>"
+            f"<span>{escape(route_id or '-')}</span></td>"
+            f"<td>{'Yes' if selected else ''}</td>"
+            f"<td>{len(waypoints)}</td>"
+            f"<td>{_route_action_count(route)}</td>"
+            "<td>-</td>"
+            '<td><div class="route-table-actions">'
+            f'<button type="button" data-route-table-action="select" data-route-id="{escape(route_id, quote=True)}">Select</button>'
+            f'<button type="button" data-route-table-action="rename" data-route-id="{escape(route_id, quote=True)}">Rename</button>'
+            f'<button type="button" data-route-table-action="duplicate" data-route-id="{escape(route_id, quote=True)}">Duplicate</button>'
+            f'<button type="button" data-route-table-action="delete" data-route-id="{escape(route_id, quote=True)}">Delete</button>'
+            "</div></td></tr>"
+        )
+        if selected:
+            action_rows = _route_action_rows(route)
+            if action_rows:
+                detail = (
+                    '<ol class="route-actions-list">'
+                    + "".join(
+                        "<li>"
+                        f"<strong>{escape(str(action['waypoint']))}</strong>: "
+                        f"{escape(str(action['label']))} "
+                        f"<span>({escape(str(action['kind']))})</span> "
+                        f"<code>{escape(json.dumps(action['args'], sort_keys=True))}</code>"
+                        "</li>"
+                        for action in action_rows
+                    )
+                    + "</ol>"
+                )
+            else:
+                detail = "No actions saved for this route"
+            rows.append(f'<tr class="route-actions-subrow"><td colspan="6">{detail}</td></tr>')
+    return "".join(rows)
+
+
 def render_site_map(
     state: dict[str, Any],
     report: dict[str, Any],
@@ -705,6 +779,7 @@ def render_site_map(
     bounds = map_data["bounds"]
     bounds_attr = escape(json.dumps(bounds, separators=(",", ":")), quote=True)
     authoring_attr = escape(json.dumps(authoring or {}, separators=(",", ":")), quote=True)
+    route_table_rows = _render_saved_route_rows(authoring or {})
     projector = _MapProjector(bounds)
     route_points = " ".join(
         f"{projector.x(point['x']):.1f},{projector.y(point['y']):.1f}"
@@ -813,7 +888,7 @@ def render_site_map(
         "<thead>"
         "<tr><th>Route</th><th>Selected</th><th>Waypoints</th><th>Actions</th><th>Last Run</th><th>Manage</th></tr>"
         "</thead>"
-        '<tbody data-route-table><tr><td colspan="6">No saved routes</td></tr></tbody>'
+        f'<tbody data-route-table>{route_table_rows}</tbody>'
         "</table>"
         "</div>"
         "</div>"

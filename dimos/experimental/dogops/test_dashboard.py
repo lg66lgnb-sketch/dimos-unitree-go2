@@ -350,6 +350,62 @@ def test_dashboard_map_controls_are_grouped_near_legend(tmp_path) -> None:
     assert "label: routeId" in content
 
 
+def test_dashboard_saved_routes_table_renders_selected_actions_and_escapes(tmp_path) -> None:
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    save_map_authoring(
+        run_dir,
+        MapAuthoringState(
+            selected_route_id='ROUTE_"A"&',
+            routes=[
+                EditableRoute(
+                    id='ROUTE_"A"&',
+                    label='Route <A> "quoted"',
+                    waypoints=[
+                        EditableRouteWaypoint(
+                            id="WP-1",
+                            label="Waypoint <One>",
+                            pose=EditableMapPoint(x=1.0, y=2.0),
+                            actions=[
+                                EditableRouteAction(
+                                    id="ACT-1",
+                                    kind="scan_qr",
+                                    label='Scan <QR> "now"',
+                                    args={"expected": ['PAYLOAD<1>&"']},
+                                )
+                            ],
+                        )
+                    ],
+                ),
+                EditableRoute(
+                    id="ROUTE_B",
+                    label="Route B",
+                    waypoints=[
+                        EditableRouteWaypoint(
+                            id="WP-2",
+                            label="Waypoint 2",
+                            pose=EditableMapPoint(x=2.0, y=3.0),
+                        )
+                    ],
+                ),
+            ],
+        ),
+    )
+
+    html_path = write_dashboard_html(run_dir)
+    content = html_path.read_text(encoding="utf-8")
+
+    assert "Saved Routes" in content
+    assert "Route &lt;A&gt; &quot;quoted&quot;" in content
+    assert 'data-route-id="ROUTE_&quot;A&quot;&amp;"' in content
+    assert '<tr class="route-actions-subrow">' in content
+    assert "Waypoint &lt;One&gt;" in content
+    assert "Scan &lt;QR&gt; &quot;now&quot;" in content
+    assert "PAYLOAD&lt;1&gt;&amp;\\&quot;" in content
+    assert "<td>1</td><td>1</td>" in content
+    assert "Route B" in content
+
+
 def test_dashboard_rerun_web_url_stays_loopback_only() -> None:
     fallback = "http://127.0.0.1:9877"
 
