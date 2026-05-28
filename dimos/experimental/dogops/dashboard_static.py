@@ -10,6 +10,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from dimos.experimental.dogops.map_authoring import load_map_authoring
+from dimos.experimental.dogops.qr_cargo import get_latest_qr_events
 
 MAP_WIDTH = 920
 MAP_HEIGHT = 560
@@ -39,19 +40,20 @@ def build_map_data(
     *,
     live_overlay: dict[str, Any] | None = None,
     authoring: dict[str, Any] | None = None,
+    qr_events: list[dict[str, Any]] | None = None,
     include_static_site: bool = True,
 ) -> dict[str, Any]:
     site = state.get("site") or {}
     authoring = authoring or {}
     authored_entities = _authoring_entities(authoring)
     authored_incidents = _authoring_incidents(authoring)
-    zones = (site.get("zones") or []) if include_static_site else []
-    assets = (site.get("assets") or []) if include_static_site else []
-    site_packages = (site.get("packages") or []) if include_static_site else []
-    observations = (state.get("observations") or []) if include_static_site else []
-    nav_events = (state.get("nav_events") or []) if include_static_site else []
-    incidents = (report.get("incidents") or []) if include_static_site else []
-    report_packages = (report.get("packages") or []) if include_static_site else []
+    zones = site.get("zones") or [] if include_static_site else []
+    assets = site.get("assets") or [] if include_static_site else []
+    site_packages = site.get("packages") or [] if include_static_site else []
+    observations = state.get("observations") or [] if include_static_site else []
+    nav_events = state.get("nav_events") or [] if include_static_site else []
+    incidents = report.get("incidents") or [] if include_static_site else []
+    report_packages = report.get("packages") or [] if include_static_site else []
 
     zone_points: dict[str, tuple[float, float]] = {}
     map_zones: list[dict[str, Any]] = []
@@ -278,6 +280,8 @@ def build_map_data(
             }
         )
 
+    map_qr_cargo_events = _qr_cargo_overlays(qr_events or [], entity_points)
+
     live = live_overlay or {
         "ok": False,
         "source": "DimOS live LCM topics",
@@ -295,32 +299,35 @@ def build_map_data(
         for group in (map_zones, map_assets, map_packages, map_route, map_observations)
         for item in group
     ]
+    points.extend(
+        (item["x"], item["y"])
+        for item in map_qr_cargo_events
+        if item.get("x") is not None and item.get("y") is not None
+    )
     points.extend(_no_go_shape_points(authoring))
     points.extend(_live_overlay_points(live))
     bounds = _map_bounds(points)
-    has_semantic_layer = any(
-        (
-            map_zones,
-            map_assets,
-            map_packages,
-            map_route,
-            map_observations,
-            map_incidents,
-            authoring.get("no_go_shapes") or [],
-        )
+    semantic_visible = bool(
+        map_zones
+        or map_assets
+        or map_packages
+        or map_observations
+        or map_incidents
+        or map_qr_cargo_events
+        or authoring.get("no_go_shapes")
     )
-    has_heatmap_layer = bool((live.get("costmap") or {}).get("cells")) if isinstance(live, dict) else False
-    has_path_layer = bool(live.get("path") or live.get("route")) if isinstance(live, dict) else False
-    has_robot_layer = bool(live.get("robot_pose")) if isinstance(live, dict) else False
     return {
         "site_id": site.get("site_id"),
         "site_name": site.get("site_name"),
+        "static_site_included": include_static_site,
+        "native_empty": not include_static_site and not semantic_visible and not _live_overlay_points(live),
         "zones": map_zones,
         "assets": map_assets,
         "packages": map_packages,
         "route": map_route,
         "observations": map_observations,
         "incidents": map_incidents,
+        "qr_cargo_events": map_qr_cargo_events,
         "no_go_shapes": authoring.get("no_go_shapes") or [],
         "tag_bindings": authoring.get("tag_bindings") or [],
         "authoring": {
@@ -334,15 +341,12 @@ def build_map_data(
         },
         "bounds": bounds,
         "live": live,
-        "static_site_included": include_static_site,
-        "native_empty": not include_static_site
-        and not has_semantic_layer
-        and not any((has_heatmap_layer, has_path_layer, has_robot_layer)),
         "layers": {
-            "semantic": has_semantic_layer,
-            "heatmap": has_heatmap_layer,
-            "path": has_path_layer,
-            "robot": has_robot_layer,
+            "semantic": semantic_visible,
+            "heatmap": bool((live.get("costmap") or {}).get("cells")) if isinstance(live, dict) else False,
+            "path": bool(live.get("path") or live.get("route")) if isinstance(live, dict) else False,
+            "robot": bool(live.get("robot_pose")) if isinstance(live, dict) else False,
+            "qr": bool(map_qr_cargo_events),
         },
     }
 
@@ -467,19 +471,89 @@ def _float_or_none(value: Any) -> float | None:
     return result
 
 
+def _qr_cargo_overlays(
+    qr_events: list[dict[str, Any]],
+    entity_points: dict[str, tuple[float, float]],
+) -> list[dict[str, Any]]:
+    overlays: list[dict[str, Any]] = []
+    for event in qr_events:
+        payload = event.get("qr_payload") if isinstance(event.get("qr_payload"), dict) else {}
+        location_node_id = str(payload.get("location_node_id") or "")
+        static_xy = entity_points.get(location_node_id)
+        static_pose = _qr_static_pose(static_xy) if static_xy is not None else None
+        detection_pose = _qr_detection_pose(event.get("robot_pose_at_detection"))
+        map_position = detection_pose or static_pose
+        pose_delta = _qr_pose_delta(detection_pose, static_pose)
+
+        overlay = {
+            "event_id": event.get("event_id"),
+            "warehouse_id": payload.get("warehouse_id"),
+            "location_node_id": location_node_id,
+            "zone": payload.get("zone"),
+            "shelf_id": payload.get("shelf_id"),
+            "cargo_id": payload.get("cargo_id"),
+            "task": payload.get("task"),
+            "timestamp": event.get("timestamp"),
+            "status": event.get("status"),
+            "action_policy": event.get("action_policy") or "report_only",
+            "robot_pose_at_detection": event.get("robot_pose_at_detection"),
+            "static_location_node_pose": static_pose,
+            "map_position": map_position,
+            "pose_delta": pose_delta,
+            "source": event.get("source"),
+            "linked_entity_id": location_node_id if location_node_id in entity_points else None,
+            "qr_payload": payload,
+        }
+        if map_position is not None:
+            overlay["x"] = map_position["x"]
+            overlay["y"] = map_position["y"]
+        overlays.append(overlay)
+    return overlays
+
+
+def _qr_detection_pose(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    point = _xy_point(value)
+    if point is None:
+        return None
+    return {
+        "frame": str(value.get("frame") or "map"),
+        "x": point[0],
+        "y": point[1],
+        "yaw": _float_or_none(value.get("yaw")),
+        "source": "robot_pose_at_detection",
+    }
+
+
+def _qr_static_pose(point: tuple[float, float]) -> dict[str, Any]:
+    return {
+        "frame": "world",
+        "x": point[0],
+        "y": point[1],
+        "theta_deg": None,
+        "source": "site_or_authoring",
+    }
+
+
+def _qr_pose_delta(
+    detection_pose: dict[str, Any] | None,
+    static_pose: dict[str, Any] | None,
+) -> dict[str, float] | None:
+    if detection_pose is None or static_pose is None:
+        return None
+    dx = float(detection_pose["x"]) - float(static_pose["x"])
+    dy = float(detection_pose["y"]) - float(static_pose["y"])
+    return {"dx": dx, "dy": dy, "distance_m": math.hypot(dx, dy)}
+
+
 def build_route_data(
     state: dict[str, Any],
     report: dict[str, Any],
     *,
     authoring: dict[str, Any] | None = None,
-    include_static_site: bool = True,
 ) -> dict[str, Any]:
-    map_data = build_map_data(
-        state,
-        report,
-        authoring=authoring,
-        include_static_site=include_static_site,
-    )
+    map_data = build_map_data(state, report, authoring=authoring)
     checkpoints = {
         str(checkpoint.get("target_id")): checkpoint
         for checkpoint in report.get("checkpoint_verifications") or []
@@ -540,7 +614,6 @@ def build_poi_data(state: dict[str, Any], report: dict[str, Any]) -> dict[str, A
                 "tag_id": observation.get("tag_id"),
                 "visible_tag_ids": _visible_tag_ids(observation),
                 "source": observation.get("source", "unknown"),
-                "image_path": observation.get("image_path"),
                 "related_incident_ids": related_incident_ids,
             }
         )
@@ -595,29 +668,22 @@ def render_site_map(
     report: dict[str, Any],
     *,
     authoring: dict[str, Any] | None = None,
-    route_execution: dict[str, Any] | None = None,
+    qr_events: list[dict[str, Any]] | None = None,
+    include_static_site: bool = True,
 ) -> str:
-    include_static_site = _include_static_site_map()
     map_data = build_map_data(
         state,
         report,
         authoring=authoring,
+        qr_events=qr_events,
         include_static_site=include_static_site,
     )
-    if include_static_site and not map_data["zones"]:
-        return '<div class="map-empty">Map data unavailable</div>'
 
     bounds = map_data["bounds"]
     bounds_attr = escape(json.dumps(bounds, separators=(",", ":")), quote=True)
     authoring_attr = escape(json.dumps(authoring or {}, separators=(",", ":")), quote=True)
-    home_pose = next((zone for zone in map_data["zones"] if zone.get("id") == "HOME"), None)
-    home_pose_attr = escape(
-        json.dumps(
-            {"x": home_pose["x"], "y": home_pose["y"]} if home_pose else {},
-            separators=(",", ":"),
-        ),
-        quote=True,
-    )
+    static_site_attr = "true" if map_data.get("static_site_included") else "false"
+    native_empty_attr = "true" if map_data.get("native_empty") else "false"
     projector = _MapProjector(bounds)
     route_points = " ".join(
         f"{projector.x(point['x']):.1f},{projector.y(point['y']):.1f}"
@@ -639,6 +705,11 @@ def render_site_map(
     incidents = "".join(
         _render_incident(projector, incident) for incident in map_data["incidents"]
     )
+    qr_cargo = "".join(
+        _render_qr_cargo_event(projector, event)
+        for event in map_data["qr_cargo_events"]
+    )
+    semantic_hidden_attr = "" if map_data["layers"]["semantic"] else " hidden"
     route = ""
     if route_points:
         route = (
@@ -647,9 +718,13 @@ def render_site_map(
         )
     robot = _render_live_robot_pose()
     scan_items = "".join(_render_scan_item(observation) for observation in map_data["observations"])
-    rerun_source_url = _trusted_rerun_source_url(os.environ.get("DOGOPS_RERUN_SOURCE_URL"))
     rerun_web_url = _trusted_rerun_web_url(os.environ.get("DOGOPS_RERUN_WEB_URL"))
+    rerun_source_url = _trusted_rerun_source_url(os.environ.get("DOGOPS_RERUN_SOURCE_URL"))
     rerun_view_mode = _trusted_rerun_view_mode(os.environ.get("DOGOPS_RERUN_VIEW_MODE"))
+    camera_stream_url = _trusted_camera_stream_url(
+        os.environ.get("DOGOPS_CAMERA_STREAM_URL")
+        or os.environ.get("DOGOPS_GO2_CAMERA_STREAM_URL")
+    )
     rerun_web_url_attr = escape(rerun_web_url, quote=True)
     legend = (
         '<div class="map-legend">'
@@ -660,55 +735,61 @@ def render_site_map(
         '<span><i class="legend-tag"></i>tag return</span>'
         '<span><i class="legend-no-go"></i>no-go cost</span>'
         '<span><i class="legend-incident"></i>P1/P2 event</span>'
+        '<span><i class="legend-qr"></i>QR cargo</span>'
         "</div>"
     )
     layer_controls = (
         '<div class="map-layer-controls" data-map-layer-controls>'
-        '<button type="button" data-map-layer="semantic" aria-pressed="true">Semantic</button>'
-        '<button type="button" data-map-layer="heatmap" aria-pressed="true">Heatmap</button>'
-        '<button type="button" data-map-layer="path" aria-pressed="true">Path</button>'
-        '<button type="button" data-map-layer="robot" aria-pressed="true">Robot</button>'
+        '<button type="button" data-map-layer="semantic" aria-pressed="true">'
+        '<i class="layer-semantic"></i>Semantic</button>'
+        '<button type="button" data-map-layer="heatmap" aria-pressed="true">'
+        '<i class="legend-heatmap"></i>Heatmap</button>'
+        '<button type="button" data-map-layer="path" aria-pressed="true">'
+        '<i class="legend-route"></i>Path</button>'
+        '<button type="button" data-map-layer="robot" aria-pressed="true">'
+        '<i class="legend-live"></i>Robot</button>'
+        '<button type="button" data-map-layer="qr" aria-pressed="true">'
+        '<i class="legend-qr"></i>QR</button>'
         "</div>"
     )
     edit_controls = (
         '<div class="map-edit-controls" data-map-edit-controls>'
-        '<button type="button" data-map-edit-action="map_from_scratch">Map From Scratch</button>'
-        '<button type="button" data-map-edit-action="return_home">Return Home</button>'
+        '<div class="map-edit-row" data-map-edit-general-row>'
         '<button type="button" data-map-edit-mode="select" aria-pressed="true">Select</button>'
         '<button type="button" data-map-edit-mode="home" aria-pressed="false">Set Home</button>'
-        '<button type="button" data-map-edit-mode="zone" aria-pressed="false">Label</button>'
-        '<button type="button" data-map-edit-mode="asset" aria-pressed="false">Asset</button>'
-        '<button type="button" data-map-edit-mode="package" aria-pressed="false">Package</button>'
-        '<button type="button" data-map-edit-mode="no_go" aria-pressed="false">No-Go</button>'
-        '<button type="button" data-map-edit-mode="route" aria-pressed="false">Add Photo POI</button>'
-        '<button type="button" data-map-edit-mode="incident" aria-pressed="false">Incident</button>'
-        '<button type="button" data-map-edit-mode="tag" aria-pressed="false">Bind Tag</button>'
-        '<button type="button" data-map-edit-action="use_observation">Use Observation</button>'
         '<button type="button" data-map-edit-action="delete_selected">Delete</button>'
-        '<button type="button" data-map-edit-action="route_select">Select Route</button>'
-        '<button type="button" data-map-edit-action="run_route_sim">Simulate POI Route</button>'
-        '<button type="button" data-map-edit-action="run_route">Run POI Route</button>'
-        '<button type="button" data-map-edit-action="stop_route">Stop Route</button>'
-        '<button type="button" data-map-edit-action="route_up">Route Up</button>'
-        '<button type="button" data-map-edit-action="route_down">Route Down</button>'
-        '<button type="button" data-map-edit-action="publish_no_go">Publish No-Go</button>'
         '<button type="button" data-map-edit-action="save">Save</button>'
         '<button type="button" data-map-edit-action="reset">Reset</button>'
         '<button type="button" data-map-edit-action="export">Export</button>'
         "</div>"
+        '<div class="map-edit-row" data-map-edit-label-row>'
+        '<button type="button" data-map-edit-mode="zone" aria-pressed="false">Label</button>'
+        '<button type="button" data-map-edit-mode="asset" aria-pressed="false">Asset</button>'
+        '<button type="button" data-map-edit-mode="package" aria-pressed="false">Package</button>'
+        '<button type="button" data-map-edit-mode="no_go" aria-pressed="false">No-Go</button>'
+        '<button type="button" data-map-edit-mode="incident" aria-pressed="false">Incident</button>'
+        '<button type="button" data-map-edit-mode="tag" aria-pressed="false">Bind Tag</button>'
+        '<button type="button" data-map-edit-action="use_observation">Use Observation</button>'
+        '<button type="button" data-map-edit-action="publish_no_go">Publish No-Go</button>'
+        "</div>"
+        '<div class="map-edit-row" data-map-edit-route-row>'
+        '<button type="button" data-map-edit-mode="route" aria-pressed="false">Route</button>'
+        '<button type="button" data-map-edit-action="route_select">Select Route</button>'
+        '<button type="button" data-map-edit-action="run_route">Run Route</button>'
+        '<button type="button" data-map-edit-action="stop_route">Stop Route</button>'
+        '<button type="button" data-map-edit-action="route_up">Route Up</button>'
+        '<button type="button" data-map-edit-action="route_down">Route Down</button>'
+        '<span class="map-route-summary" data-map-route-summary>Selected route: none. Next: Route1</span>'
+        "</div>"
+        "</div>"
     )
-    route_execution_status = _route_execution_status_text(route_execution)
-    static_site_attr = "true" if include_static_site else "false"
-    native_empty_attr = "true" if map_data["native_empty"] else "false"
-    semantic_hidden_attr = "" if map_data["layers"]["semantic"] else " hidden"
     return f"""
-      <div class="map-shell" data-map-surface data-map-static-site="{static_site_attr}" data-map-native-empty="{native_empty_attr}">
-        {_render_rerun_surface(rerun_source_url, rerun_web_url, rerun_view_mode)}
-        {layer_controls}
+      <div class="map-shell" data-map-surface>
+        {_render_rerun_surface(rerun_source_url, rerun_web_url, rerun_view_mode, camera_stream_url)}
         {edit_controls}
         <svg class="site-map" role="img" aria-label="DogOps mission map"
           data-live-map-svg data-map-bounds="{bounds_attr}" data-map-authoring="{authoring_attr}"
-          data-home-pose="{home_pose_attr}"
+          data-map-static-site="{static_site_attr}" data-map-native-empty="{native_empty_attr}"
           viewBox="0 0 {MAP_WIDTH} {MAP_HEIGHT}">
           <defs>
             <filter id="dogops-map-glow" x="-50%" y="-50%" width="200%" height="200%">
@@ -739,17 +820,43 @@ def render_site_map(
             {route}
             <polyline class="map-dimos-path" data-live-path points="" />
           </g>
+          <g data-layer="qr" data-qr-cargo-layer>
+            {qr_cargo}
+          </g>
           <g data-layer="robot">
             {robot}
           </g>
         </svg>
+        {layer_controls}
         {legend}
         <div class="map-workflow">
           <a href="{rerun_web_url_attr}" target="_blank" rel="noreferrer" data-rerun-web-link>Open 3D View</a>
           <span class="map-command-status" data-map-command-status>Map command idle</span>
         </div>
         <div class="map-authoring-status" data-map-authoring-status>Map authoring idle</div>
-        <div class="map-route-execution-status" data-route-execution-status>{escape(route_execution_status)}</div>
+        <div class="map-route-execution-status" data-route-execution-status>Execution: idle</div>
+        <div class="route-run-history">
+          <strong>Route Run History</strong>
+          <table>
+            <thead>
+              <tr><th>Time</th><th>Run</th><th>Route</th><th>State</th><th>Progress</th></tr>
+            </thead>
+            <tbody data-route-run-history>
+              <tr><td colspan="5">No route runs recorded</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="route-run-timeline">
+          <strong>Current Timeline</strong>
+          <table>
+            <thead>
+              <tr><th>#</th><th>Kind</th><th>State</th><th>Target</th><th>Note</th></tr>
+            </thead>
+            <tbody data-route-run-timeline>
+              <tr><td colspan="5">No active route timeline</td></tr>
+            </tbody>
+          </table>
+        </div>
         <div class="map-live-status" data-live-map-status>Live odom: waiting for Go2</div>
         <ol class="scan-strip">{scan_items}</ol>
       </div>
@@ -762,8 +869,7 @@ def render_dashboard_html(
     *,
     robot_control_token: str | None = None,
     authoring: dict[str, Any] | None = None,
-    route_execution: dict[str, Any] | None = None,
-    rerun_command: dict[str, Any] | None = None,
+    qr_events: list[dict[str, Any]] | None = None,
 ) -> str:
     run = state["run"]
     nav = report.get("nav_summary") or {}
@@ -781,28 +887,24 @@ def render_dashboard_html(
     )
     mean_target_time_metric = f"{nav.get('mean_elapsed_s', 0):.1f}s"
     route_coverage_metric = f"{float(nav.get('route_coverage', 0.0)) * 100:.0f}%"
+    qr_events = qr_events or []
+    include_static_site = _include_static_site_map()
     map_html = render_site_map(
         state,
         report,
         authoring=authoring,
-        route_execution=route_execution,
+        qr_events=qr_events,
+        include_static_site=include_static_site,
     )
-    include_static_site = _include_static_site_map()
-    route_data = build_route_data(
+    qr_map_data = build_map_data(
         state,
         report,
         authoring=authoring,
+        qr_events=qr_events,
         include_static_site=include_static_site,
     )
+    route_data = build_route_data(state, report, authoring=authoring)
     poi_data = build_poi_data(state, report)
-    proof_data = build_test_flow_proof(
-        state,
-        report,
-        route_data,
-        poi_data,
-        route_execution=route_execution,
-        rerun_command=rerun_command,
-    )
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -876,8 +978,6 @@ def render_dashboard_html(
     .state-resolved, .state-verified, .state-verified_closed, .state-found_ok {{ color: var(--accent); font-weight: 700; }}
     .state-open, .state-missing {{ color: var(--danger); font-weight: 700; }}
     .severity-P1 {{ color: var(--danger); font-weight: 700; }}
-    .state-captured, .state-returned, .state-pass {{ color: var(--accent); font-weight: 700; }}
-    .state-fail {{ color: var(--danger); font-weight: 700; }}
     .timeline {{ display: grid; gap: 8px; }}
     .timeline div {{ border-left: 3px solid var(--accent); padding-left: 10px; }}
     .evidence-grid {{
@@ -898,35 +998,6 @@ def render_dashboard_html(
       background: #fbfcfd;
       padding: 8px 10px;
     }}
-    .poi-capture {{
-      align-items: center;
-      display: grid;
-      gap: 0.65rem;
-      grid-template-columns: 96px 1fr;
-    }}
-    .poi-capture img {{
-      aspect-ratio: 16 / 9;
-      background: #03060b;
-      border: 1px solid #263244;
-      border-radius: 6px;
-      object-fit: cover;
-      width: 96px;
-    }}
-    .proof-grid {{
-      display: grid;
-      gap: 8px;
-      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-    }}
-    .proof-item {{
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      background: #fbfcfd;
-      padding: 10px 12px;
-    }}
-    .proof-item strong {{
-      display: block;
-      margin-bottom: 4px;
-    }}
     .map-panel {{
       background: #07090d;
       border-color: #1d2430;
@@ -940,11 +1011,9 @@ def render_dashboard_html(
       background: #03060b;
       border: 1px solid #1d2430;
       border-radius: 8px;
-      contain: layout paint;
       display: grid;
-      height: clamp(360px, 44vh, 620px);
-      max-height: 620px;
-      min-height: 360px;
+      height: clamp(320px, 38vh, 460px);
+      min-height: 320px;
       overflow: hidden;
       position: relative;
     }}
@@ -952,24 +1021,10 @@ def render_dashboard_html(
       background: #03060b;
       display: block;
       height: 100%;
-      max-height: 100%;
-      min-height: 0;
-      overflow: hidden;
-      position: relative;
-      width: 100%;
-    }}
-    .rerun-canvas > * {{
-      height: 100% !important;
-      max-height: 100% !important;
-      min-height: 0 !important;
-      width: 100% !important;
-    }}
-    .rerun-canvas canvas {{
-      height: 100%;
-      max-height: 100%;
       width: 100%;
     }}
     .rerun-canvas[hidden] {{ display: none; }}
+    .rerun-canvas > * {{ height: 100%; width: 100%; }}
     .rerun-standby {{
       align-items: center;
       background:
@@ -986,19 +1041,8 @@ def render_dashboard_html(
       text-align: center;
       z-index: 1;
     }}
+    .viewer-offline[hidden] {{ display: none; }}
     .rerun-standby[hidden] {{ display: none; }}
-    .rerun-offline {{
-      align-items: center;
-      color: #d8dee9;
-      display: grid;
-      inset: 0;
-      justify-items: center;
-      padding: 18px;
-      position: absolute;
-      text-align: center;
-      z-index: 2;
-    }}
-    .rerun-offline[hidden] {{ display: none; }}
     .rerun-chip {{
       border: 1px solid #2d3a4f;
       border-radius: 999px;
@@ -1030,6 +1074,46 @@ def render_dashboard_html(
       text-decoration: none;
     }}
     .rerun-controls button:hover, .rerun-controls a:hover {{ border-color: #52e0c4; }}
+    .live-video-panel {{
+      background: rgba(3, 6, 11, 0.88);
+      border: 1px solid #334155;
+      border-radius: 6px;
+      bottom: 12px;
+      box-shadow: 0 14px 40px rgba(0, 0, 0, 0.35);
+      color: #e5edf5;
+      display: grid;
+      grid-template-rows: auto 1fr;
+      min-height: 112px;
+      overflow: hidden;
+      position: absolute;
+      right: 12px;
+      width: min(260px, calc(100% - 24px));
+      z-index: 2;
+    }}
+    .live-video-panel strong {{
+      background: rgba(15, 23, 42, 0.88);
+      border-bottom: 1px solid #334155;
+      color: #d8fff6;
+      font-size: 12px;
+      padding: 6px 8px;
+    }}
+    .live-video-panel iframe {{
+      background: #05070c;
+      border: 0;
+      height: 100%;
+      min-height: 84px;
+      width: 100%;
+    }}
+    .live-video-placeholder {{
+      align-items: center;
+      color: #a9b4c4;
+      display: flex;
+      font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace;
+      justify-content: center;
+      min-height: 84px;
+      padding: 10px;
+      text-align: center;
+    }}
     .site-map {{
       aspect-ratio: 23 / 14;
       background: #03060b;
@@ -1104,6 +1188,23 @@ def render_dashboard_html(
       stroke: #fed7aa;
     }}
     .map-observation {{ fill: #05070c; stroke: #a78bfa; stroke-width: 2; }}
+    .map-qr-cargo-ring {{ fill: rgba(250, 204, 21, 0.18); stroke: #facc15; stroke-width: 2.2; }}
+    .map-qr-cargo-core {{ fill: #0f766e; stroke: #d9f99d; stroke-width: 1.4; }}
+    .map-qr-cargo-label {{
+      fill: #fef9c3;
+      font-size: 11px;
+      font-weight: 700;
+      paint-order: stroke;
+      stroke: #05070c;
+      stroke-linejoin: round;
+      stroke-width: 4px;
+    }}
+    .map-qr-cargo-marker.is-selected .map-qr-cargo-ring {{ stroke: #ffffff; stroke-width: 3.2; }}
+    .qr-linked .map-zone-anchor, .qr-linked .map-asset, .qr-linked .map-package {{
+      filter: url(#dogops-map-glow);
+      stroke: #facc15;
+      stroke-width: 3;
+    }}
     .map-observation-ray {{ stroke: #a78bfa; stroke-dasharray: 4 5; stroke-width: 1.2; }}
     .map-incident {{ fill: none; filter: url(#dogops-map-glow); stroke: #fb7185; stroke-width: 2.4; }}
     .map-incident-label {{
@@ -1142,20 +1243,37 @@ def render_dashboard_html(
     .map-go-to-cross {{ stroke: #fecaca; stroke-linecap: round; stroke-width: 2; }}
     .map-axis-label {{ fill: #657184; font-size: 10px; }}
     .site-map.go-to-armed {{ cursor: crosshair; }}
-    .map-legend {{
+    .map-legend, .map-layer-controls {{
       color: #a9b4c4;
       display: flex;
       flex-wrap: wrap;
       gap: 12px;
       font-size: 12px;
     }}
-    .map-legend span {{ align-items: center; display: inline-flex; gap: 6px; }}
-    .map-legend i {{
+    .map-legend span, .map-layer-controls button {{
+      align-items: center;
+      display: inline-flex;
+      gap: 6px;
+    }}
+    .map-legend i, .map-layer-controls i {{
       border-radius: 999px;
       display: inline-block;
       height: 10px;
       width: 10px;
     }}
+    .map-layer-controls button {{
+      background: transparent;
+      border: 0;
+      color: inherit;
+      cursor: pointer;
+      font: inherit;
+      padding: 0;
+    }}
+    .map-layer-controls button[aria-pressed="true"] {{
+      color: #d8fff6;
+      font-weight: 700;
+    }}
+    .map-layer-controls button[aria-pressed="false"] {{ opacity: 0.48; }}
     .legend-free {{ background: #484981; }}
     .legend-heatmap {{ background: #f97316; }}
     .legend-route {{ background: #52e0c4; }}
@@ -1163,6 +1281,8 @@ def render_dashboard_html(
     .legend-tag {{ background: #a78bfa; }}
     .legend-no-go {{ background: #ef4444; }}
     .legend-incident {{ background: #fb7185; }}
+    .layer-semantic {{ background: #a78bfa; }}
+    .legend-qr {{ background: #facc15; }}
     .map-workflow {{
       align-items: center;
       color: #a9b4c4;
@@ -1183,17 +1303,17 @@ def render_dashboard_html(
     }}
     .map-command-status.ok {{ color: #86efac; }}
     .map-command-status.error {{ color: #fca5a5; }}
-    .map-layer-controls {{
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-    }}
     .map-edit-controls {{
+      display: grid;
+      gap: 8px;
+    }}
+    .map-edit-row {{
+      align-items: center;
       display: flex;
       flex-wrap: wrap;
       gap: 8px;
     }}
-    .map-layer-controls button, .map-edit-controls button {{
+    .map-edit-controls button {{
       background: #0d1119;
       border: 1px solid #334155;
       border-radius: 999px;
@@ -1203,11 +1323,18 @@ def render_dashboard_html(
       min-height: 30px;
       padding: 5px 10px;
     }}
-    .map-layer-controls button[aria-pressed="true"], .map-edit-controls button[aria-pressed="true"] {{
+    .map-edit-controls button[aria-pressed="true"] {{
       background: #123b36;
       border-color: #52e0c4;
       color: #d8fff6;
       font-weight: 700;
+    }}
+    .map-route-summary {{
+      color: #a9b4c4;
+      font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace;
+      min-height: 30px;
+      display: inline-flex;
+      align-items: center;
     }}
     .map-live-status {{
       color: #f7d75d;
@@ -1228,6 +1355,29 @@ def render_dashboard_html(
     }}
     .map-route-execution-status.ok {{ color: #86efac; }}
     .map-route-execution-status.error {{ color: #fca5a5; }}
+    .route-run-history, .route-run-timeline {{
+      color: #cbd5e1;
+      display: grid;
+      gap: 6px;
+      font-size: 12px;
+    }}
+    .route-run-history strong, .route-run-timeline strong {{ color: #eef2f8; }}
+    .route-run-history table, .route-run-timeline table {{
+      border-collapse: collapse;
+      width: 100%;
+    }}
+    .route-run-history th, .route-run-history td,
+    .route-run-timeline th, .route-run-timeline td {{
+      border-bottom: 1px solid #1d2430;
+      padding: 5px 4px;
+      text-align: left;
+      vertical-align: top;
+    }}
+    .route-run-history th, .route-run-timeline th {{
+      color: #93a4b8;
+      font-size: 10px;
+      text-transform: uppercase;
+    }}
     .scan-strip {{
       color: #b8c4d4;
       display: grid;
@@ -1375,6 +1525,24 @@ def render_dashboard_html(
     }}
     .robot-status.error {{ color: var(--danger); }}
     .robot-status.ok {{ color: var(--accent); }}
+    .qr-cargo-status {{ color: var(--muted); margin-bottom: 8px; min-height: 18px; }}
+    .qr-cargo-status.ok {{ color: var(--accent); }}
+    .qr-cargo-status.error {{ color: var(--danger); }}
+    .qr-cargo-table {{ overflow-x: auto; }}
+    .qr-cargo-table table {{ min-width: 980px; }}
+    .qr-actions {{ display: flex; flex-wrap: wrap; gap: 6px; min-width: 260px; }}
+    .qr-actions button {{
+      background: #f8fafc;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      color: var(--ink);
+      cursor: pointer;
+      font: inherit;
+      min-height: 30px;
+      padding: 4px 8px;
+    }}
+    .qr-actions button:hover {{ border-color: var(--accent); }}
+    .qr-actions button:disabled {{ cursor: not-allowed; opacity: 0.55; }}
     @media (max-width: 920px) {{
       main {{ gap: 12px; padding: 16px 18px 24px; }}
       section {{ padding: 10px; }}
@@ -1405,10 +1573,6 @@ def render_dashboard_html(
     <div>State: <strong>{escape(str(run["state"]))}</strong></div>
   </header>
   <main>
-    <section class="wide" data-test-flow-proof>
-      <h2>Test Flow Proof</h2>
-      {test_flow_proof(proof_data)}
-    </section>
     <section class="map-panel">
       <h2>Mission Map</h2>
       {map_html}
@@ -1427,6 +1591,10 @@ def render_dashboard_html(
         </div>
       </section>
       <section>
+        <h2>QR Cargo</h2>
+        {qr_cargo_panel(qr_map_data["qr_cargo_events"])}
+      </section>
+      <section>
         <h2>Robot Control</h2>
         <div class="posture-controls" data-posture-controls>
           <button type="button" data-posture="wake">Wake / Stand</button>
@@ -1434,7 +1602,7 @@ def render_dashboard_html(
           <button type="button" data-posture="sleep">Sleep</button>
         </div>
         <div class="map-controls" data-map-controls>
-          <button type="button" data-map-action="start">Start Live Map</button>
+          <button type="button" data-map-action="map_from_scratch">Map From Scratch</button>
           <button type="button" data-map-action="origin">Set Map Origin</button>
           <button type="button" data-map-action="arm_go_to" aria-pressed="false">Arm Go To</button>
         </div>
@@ -1512,11 +1680,11 @@ def render_dashboard_html(
       <div class="evidence-grid">
         <div>
           <h2>Route Stops</h2>
-          {route_table(route_data["stops"], poi_data)}
+          {route_table(route_data["stops"])}
         </div>
         <div>
           <h2>POI Evidence</h2>
-          <div data-poi-evidence>{poi_list(poi_data)}</div>
+          {poi_list(poi_data)}
         </div>
       </div>
     </section>
@@ -1534,17 +1702,22 @@ def render_dashboard_html(
       const rerunStandby = document.querySelector("[data-rerun-standby]");
       const rerunStatus = document.querySelector("[data-rerun-status]");
       const liveMapSvg = document.querySelector("[data-live-map-svg]");
-      const poiEvidence = document.querySelector("[data-poi-evidence]");
       const liveMapStatus = document.querySelector("[data-live-map-status]");
       const mapCommandStatus = document.querySelector("[data-map-command-status]");
       const mapAuthoringStatus = document.querySelector("[data-map-authoring-status]");
       const routeExecutionStatus = document.querySelector("[data-route-execution-status]");
+      const routeSummary = document.querySelector("[data-map-route-summary]");
+      const routeRunHistory = document.querySelector("[data-route-run-history]");
+      const routeRunTimeline = document.querySelector("[data-route-run-timeline]");
       const liveHeatmap = liveMapSvg ? liveMapSvg.querySelector("[data-live-heatmap]") : null;
       const livePath = liveMapSvg ? liveMapSvg.querySelector("[data-live-path]") : null;
       const liveTrace = liveMapSvg ? liveMapSvg.querySelector("[data-live-trace]") : null;
       const liveRobot = liveMapSvg ? liveMapSvg.querySelector("[data-live-robot]") : null;
       const liveTarget = liveMapSvg ? liveMapSvg.querySelector("[data-live-target]") : null;
       const goToMarker = liveMapSvg ? liveMapSvg.querySelector("[data-go-to-marker]") : null;
+      const qrCargoLayer = liveMapSvg ? liveMapSvg.querySelector("[data-qr-cargo-layer]") : null;
+      const qrCargoRows = document.querySelector("[data-qr-cargo-events]");
+      const qrCargoStatus = document.querySelector("[data-qr-cargo-status]");
       const status = document.querySelector("[data-robot-status]");
       if (!controls || !status) return;
       let motionProfile = "nudge";
@@ -1560,7 +1733,7 @@ def render_dashboard_html(
       let dragMapObject = null;
       let liveMapBounds = null;
       let liveOverlayBounds = null;
-      let mapHomePose = null;
+      let latestQrEventsById = new Map();
       try {{
         liveMapBounds = liveMapSvg ? JSON.parse(liveMapSvg.dataset.mapBounds || "{{}}") : null;
       }} catch (_) {{
@@ -1570,11 +1743,6 @@ def render_dashboard_html(
         mapAuthoring = liveMapSvg ? JSON.parse(liveMapSvg.dataset.mapAuthoring || "{{}}") : null;
       }} catch (_) {{
         mapAuthoring = null;
-      }}
-      try {{
-        mapHomePose = liveMapSvg ? JSON.parse(liveMapSvg.dataset.homePose || "{{}}") : null;
-      }} catch (_) {{
-        mapHomePose = null;
       }}
       liveOverlayBounds = liveMapBounds;
       const liveMapSize = {{width: {MAP_WIDTH}, height: {MAP_HEIGHT}}};
@@ -1621,22 +1789,106 @@ def render_dashboard_html(
         routeExecutionStatus.textContent = text;
         routeExecutionStatus.className = `map-route-execution-status ${{state || ""}}`;
       }};
+      const routeList = () => {{
+        const current = mapAuthoring || {{}};
+        return Array.isArray(current.routes) ? current.routes : [];
+      }};
+      const nextRouteId = (routes = routeList()) => {{
+        const used = new Set(routes.map((route) => String(route.id || "")));
+        let index = 1;
+        while (used.has(`Route${{index}}`)) index += 1;
+        return `Route${{index}}`;
+      }};
+      const updateRouteSummary = () => {{
+        if (!routeSummary) return;
+        const current = mapAuthoring || {{}};
+        const routes = routeList();
+        if (!routes.length) {{
+          routeSummary.textContent = `Selected route: none. Next: ${{nextRouteId(routes)}}`;
+          return;
+        }}
+        const selected = routes.find((route) => route.id === current.selected_route_id) || null;
+        const selectedText = selected
+          ? `${{selected.id}} (${{(selected.waypoints || []).length}} waypoint${{(selected.waypoints || []).length === 1 ? "" : "s"}})`
+          : "none";
+        const routeIds = routes.map((route) => route.id).join(", ");
+        routeSummary.textContent = `Selected route: ${{selectedText}}. Routes: ${{routeIds}}. Next: ${{nextRouteId(routes)}}`;
+      }};
+      updateRouteSummary();
       const setRerunStatus = (text) => {{
         if (rerunStatus) rerunStatus.textContent = text;
       }};
-      const connectRerunSurface = async ({{replay = false}} = {{}}) => {{
+      const loadRerunViewer = async () => {{
+        if (window.DogOpsRerunWebViewer) return window.DogOpsRerunWebViewer;
+        const module = await import("/static/rerun-web-viewer.js?v=dogops-3d-view");
+        return module;
+      }};
+      const isNativeRerunView = () => rerunSurface && rerunSurface.dataset.rerunViewMode === "native-3d";
+      const connectRerunSurface = async () => {{
         if (!rerunSurface) return false;
-        setRerunStatus("Connecting 3D View...");
         try {{
-          const viewer = window.DogOpsRerunWebViewer || await import("/static/rerun-web-viewer.js?v=dogops-rerun-v2");
+          setRerunStatus("Connecting 3D View...");
+          const viewer = await loadRerunViewer();
           await viewer.mount(rerunSurface);
-          if (replay && viewer.replay) await viewer.replay(rerunSurface);
           if (rerunStandby) rerunStandby.hidden = true;
           return true;
         }} catch (error) {{
           setRerunStatus(`3D View unavailable: ${{error.message}}`);
           return false;
         }}
+      }};
+      const requestRerunReplay = async (action) => {{
+        try {{
+          const response = await fetch("/api/rerun/replay", {{
+            method: "POST",
+            headers: {{
+              "Content-Type": "application/json",
+              "X-DogOps-Control-Token": robotControlToken,
+            }},
+            body: JSON.stringify({{action}}),
+          }});
+          const result = await response.json();
+          if (!response.ok || result.ok === false) {{
+            throw new Error(result.message || result.error || "rerun_replay_failed");
+          }}
+          window.sessionStorage.setItem("dogops:rerun-replay", action);
+          const viewer = await loadRerunViewer();
+          if (viewer.replay) await viewer.replay(rerunSurface);
+          return result;
+        }} catch (error) {{
+          setRerunStatus(`3D View replay failed: ${{error.message}}`);
+          return null;
+        }}
+      }};
+      const mapFromScratch = async () => {{
+        setMapCommandStatus("Starting map from scratch...", "");
+        await connectRerunSurface();
+        if (isNativeRerunView()) {{
+          try {{
+            const response = await fetch("/api/map/explore/start", {{
+              method: "POST",
+              headers: {{
+                "Content-Type": "application/json",
+                "X-DogOps-Control-Token": robotControlToken,
+              }},
+              body: "{{}}",
+            }});
+            const result = await response.json();
+            if (!response.ok || result.ok === false) {{
+              throw new Error(result.message || result.error || "explore_start_failed");
+            }}
+            setMapCommandStatus("Map from scratch started using live DimOS map data", "ok");
+          }} catch (error) {{
+            setMapCommandStatus(`Map from scratch failed: ${{error.message}}`, "error");
+          }}
+        }} else {{
+          const result = await requestRerunReplay("replay_mapping");
+          setMapCommandStatus(
+            result ? "Map replay started" : "Map replay failed",
+            result ? "ok" : "error"
+          );
+        }}
+        await refreshDimOSMap();
       }};
       const projectPoseWithBounds = (pose, bounds) => {{
         if (!bounds || !pose) return null;
@@ -1707,6 +1959,7 @@ def render_dashboard_html(
             throw new Error(result.message || result.error || "map_authoring_failed");
           }}
           mapAuthoring = result.authoring || mapAuthoring;
+          updateRouteSummary();
           setMapAuthoringStatus("Map edit saved; refreshing", "ok");
           await refreshDimOSMap();
           window.setTimeout(() => window.location.reload(), 150);
@@ -1776,7 +2029,7 @@ def render_dashboard_html(
       }};
       const selectedRoute = () => {{
         const current = mapAuthoring || {{}};
-        const routes = Array.isArray(current.routes) ? current.routes : [];
+        const routes = routeList();
         if (!routes.length) return null;
         if (!current.selected_route_id) return null;
         return routes.find((route) => route.id === current.selected_route_id) || null;
@@ -1786,68 +2039,72 @@ def render_dashboard_html(
         const total = Number(state.waypoints_total || 0);
         const reached = Number(state.waypoints_reached || 0);
         const active = state.active_waypoint_id ? ` active=${{state.active_waypoint_id}}` : "";
+        const action = state.active_action_id ? ` action=${{state.active_action_id}}` : "";
+        const run = state.route_run_id ? ` run=${{state.route_run_id}}` : "";
         const transport = state.transport ? ` transport=${{state.transport}}` : "";
         const error = state.last_error ? ` error=${{state.last_error}}` : "";
-        return `Execution: ${{state.state}} ${{reached}}/${{total}}${{active}}${{transport}}${{error}}`;
+        return `Execution: ${{state.state}} ${{reached}}/${{total}}${{active}}${{action}}${{run}}${{transport}}${{error}}`;
       }};
-      const safeText = (value) => String(value == null ? "" : value);
-      const appendText = (parent, tagName, text, className = "") => {{
-        const element = document.createElement(tagName);
-        if (className) element.className = className;
-        element.textContent = safeText(text);
-        parent.appendChild(element);
-        return element;
-      }};
-      const evidenceImageSrc = (imagePath) => {{
-        const path = safeText(imagePath).replace(/^\\/+/, "");
-        return path ? `/${{path}}` : "";
-      }};
-      const renderPoiEvidence = (poi) => {{
-        if (!poiEvidence) return;
-        const list = document.createElement("ul");
-        list.className = "compact-list";
-        for (const capture of (poi.captures || []).slice(0, 8)) {{
-          const item = document.createElement("li");
-          const row = document.createElement("div");
-          row.className = "poi-capture";
-          const imageSrc = evidenceImageSrc(capture.image_path);
-          if (imageSrc) {{
-            const image = document.createElement("img");
-            image.src = imageSrc;
-            image.alt = `${{capture.id}} photo evidence`;
-            row.appendChild(image);
-          }}
-          const detail = document.createElement("div");
-          const title = appendText(detail, "strong", capture.id || "capture");
-          title.style.display = "block";
-          const tags = (capture.visible_tag_ids || []).length ? capture.visible_tag_ids.join(", ") : "none";
-          appendText(detail, "span", `${{capture.zone_id || "unknown"}} / tags ${{tags}}`);
-          row.appendChild(detail);
-          item.appendChild(row);
-          list.appendChild(item);
-        }}
-        for (const reading of (poi.readings || []).slice(0, 3)) {{
-          const item = document.createElement("li");
-          const label = reading.kind === "temperature"
-            ? `${{reading.asset_id}} ${{reading.reading_celsius}}C <= ${{reading.max_celsius}}C`
-            : `${{reading.asset_id}} ${{reading.state || "unknown"}}`;
-          appendText(item, "strong", reading.kind || "reading");
-          item.appendChild(document.createTextNode(` ${{label}}`));
-          list.appendChild(item);
-        }}
-        poiEvidence.replaceChildren(list);
-      }};
-      const refreshPoiEvidence = async () => {{
+      const formatRouteRunTime = (seconds) => {{
+        if (!seconds) return "-";
         try {{
-          const response = await fetch("/api/poi");
-          if (!response.ok) return;
-          renderPoiEvidence(await response.json());
+          return new Date(Number(seconds) * 1000).toLocaleTimeString();
         }} catch (_) {{
-          // Keep the static evidence if the live refresh is unavailable.
+          return "-";
+        }}
+      }};
+      const htmlEscape = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({{
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;",
+      }}[char]));
+      const renderRouteRunHistory = (runs) => {{
+        if (!routeRunHistory) return;
+        if (!Array.isArray(runs) || !runs.length) {{
+          routeRunHistory.innerHTML = '<tr><td colspan="5">No route runs recorded</td></tr>';
+          return;
+        }}
+        routeRunHistory.innerHTML = runs.slice(0, 8).map((run) => {{
+          const progress = `${{Number(run.waypoints_reached || 0)}}/${{Number(run.waypoints_total || 0)}} wp, ${{Number(run.actions_completed || 0)}}/${{Number(run.actions_total || 0)}} act`;
+          return `<tr><td>${{htmlEscape(formatRouteRunTime(run.started_at))}}</td><td>${{htmlEscape(run.dogops_run_id || "-")}}</td><td>${{htmlEscape(run.route_id || "-")}}</td><td>${{htmlEscape(run.state || "-")}}</td><td>${{htmlEscape(progress)}}</td></tr>`;
+        }}).join("");
+      }};
+      const renderRouteRunTimeline = (events) => {{
+        if (!routeRunTimeline) return;
+        if (!Array.isArray(events) || !events.length) {{
+          routeRunTimeline.innerHTML = '<tr><td colspan="5">No active route timeline</td></tr>';
+          return;
+        }}
+        routeRunTimeline.innerHTML = events.slice(-10).map((event) => {{
+          const target = event.target_id || event.waypoint_id || event.action_id || "-";
+          return `<tr><td>${{htmlEscape(event.sequence || "")}}</td><td>${{htmlEscape(event.kind || "-")}}</td><td>${{htmlEscape(event.state || "-")}}</td><td>${{htmlEscape(target)}}</td><td>${{htmlEscape(event.note || "")}}</td></tr>`;
+        }}).join("");
+      }};
+      const refreshRouteRunHistory = async () => {{
+        try {{
+          const currentResponse = await fetch("/api/route-runs/current", {{
+            cache: "no-store",
+            headers: {{"X-DogOps-Control-Token": robotControlToken}},
+          }});
+          const current = await currentResponse.json();
+          if (currentResponse.ok && current.ok !== false) {{
+            renderRouteRunTimeline(current.timeline || current.events || []);
+          }}
+          const listResponse = await fetch("/api/route-runs", {{
+            cache: "no-store",
+            headers: {{"X-DogOps-Control-Token": robotControlToken}},
+          }});
+          const list = await listResponse.json();
+          if (listResponse.ok && list.ok !== false) {{
+            renderRouteRunHistory(list.route_runs || []);
+          }}
+        }} catch (_) {{
+          // Keep the latest rendered history visible if polling fails.
         }}
       }};
       const refreshRouteExecution = async () => {{
-        if (!robotControlToken) return;
         if (routeExecutionPolling) return;
         routeExecutionPolling = true;
         try {{
@@ -1861,88 +2118,20 @@ def render_dashboard_html(
           }}
           const state = result.route_execution || {{}};
           setRouteExecutionStatus(routeExecutionText(state), state.state === "failed" ? "error" : "ok");
+          await refreshRouteRunHistory();
         }} catch (error) {{
           setRouteExecutionStatus(`Execution: status unavailable (${{error.message}})`, "error");
         }} finally {{
           routeExecutionPolling = false;
         }}
       }};
-      const requestRerunReplay = async (action) => {{
-        try {{
-          const response = await fetch("/api/rerun/replay", {{
-            method: "POST",
-            headers: {{
-              "Content-Type": "application/json",
-              "X-DogOps-Control-Token": robotControlToken,
-            }},
-            body: JSON.stringify({{action}}),
-          }});
-          const result = await response.json();
-          if (!response.ok || result.ok === false) {{
-            throw new Error(result.message || result.error || "rerun_replay_failed");
-          }}
-          setMapCommandStatus("3D replay requested; waiting for simulation frames...", "ok");
-          await new Promise((resolve) => window.setTimeout(resolve, Number(result.replay_after_ms || 850)));
-          await connectRerunSurface({{replay: true}});
-          setMapCommandStatus("3D replay started.", "ok");
-          return true;
-        }} catch (error) {{
-          setMapCommandStatus(`3D replay failed: ${{error.message}}`, "error");
-          return false;
-        }}
-      }};
-      const isNativeRerunView = () => (rerunSurface && rerunSurface.dataset.rerunViewMode) === "native-3d";
-      const mapFromScratch = async () => {{
-        if (isNativeRerunView()) {{
-          try {{
-            const response = await fetch("/api/map/explore/start", {{
-              method: "POST",
-              headers: {{
-                "Content-Type": "application/json",
-                "X-DogOps-Control-Token": robotControlToken,
-              }},
-              body: JSON.stringify({{}}),
-            }});
-            const result = await response.json();
-            if (!response.ok || result.ok === false) {{
-              throw new Error(result.message || result.error || "explore_start_failed");
-            }}
-          }} catch (error) {{
-            setMapCommandStatus(`Native exploration failed: ${{error.message}}`, "error");
-            return;
-          }}
-          setMapCommandStatus("Native 3D mapping uses the live DimOS/MuJoCo stream.", "ok");
-          await connectRerunSurface({{replay: false}});
-          await refreshDimOSMap();
-          await refreshLiveMap();
-          return;
-        }}
-        setMapCommandStatus("Mapping from scratch in simulation...", "ok");
-        await requestRerunReplay("replay_mapping");
-      }};
-      const returnHome = async () => {{
-        const route = selectedRoute();
-        const home = route && Array.isArray(route.waypoints)
-          ? route.waypoints.find((waypoint) => waypoint.target_id === "HOME" || waypoint.label === "HOME")
-          : null;
-        const target = (home && home.pose)
-          || ((mapAuthoring && mapAuthoring.home) ? mapAuthoring.home : null)
-          || mapHomePose;
-        if (!target) {{
-          setMapCommandStatus("Home target unavailable", "error");
-          return;
-        }}
-        setMapCommandStatus("Return home target selected", "ok");
-        await sendGoToTarget({{x: Number(target.x), y: Number(target.y), source: "return_home"}});
-      }};
-      const runSelectedRoute = async (dryRun = false) => {{
+      const runSelectedRoute = async () => {{
         const route = selectedRoute();
         if (!route) {{
-          setRouteExecutionStatus("Execution: select or author POIs first", "error");
+          setRouteExecutionStatus("Execution: select or author a route first", "error");
           return;
         }}
-        setRouteExecutionStatus(`Execution: starting ${{route.id}}${{dryRun ? " simulation" : ""}}...`, "");
-        await requestRerunReplay("replay_route");
+        setRouteExecutionStatus(`Execution: starting ${{route.id}}...`, "");
         try {{
           const response = await fetch("/api/map/routes/follow", {{
             method: "POST",
@@ -1950,7 +2139,7 @@ def render_dashboard_html(
               "Content-Type": "application/json",
               "X-DogOps-Control-Token": robotControlToken,
             }},
-            body: JSON.stringify({{route_id: route.id, dry_run: dryRun}}),
+            body: JSON.stringify({{route_id: route.id, dry_run: false}}),
           }});
           const result = await response.json();
           const state = (result.mcp_result && result.mcp_result.route_execution) || result.route_execution || {{}};
@@ -1958,7 +2147,6 @@ def render_dashboard_html(
             throw new Error(result.message || result.error || "follow_route_failed");
           }}
           setRouteExecutionStatus(routeExecutionText(state), "ok");
-          await refreshPoiEvidence();
         }} catch (error) {{
           setRouteExecutionStatus(`Execution failed: ${{error.message}}`, "error");
         }} finally {{
@@ -2029,10 +2217,20 @@ def render_dashboard_html(
       }};
       const selectRouteByPrompt = async () => {{
         const current = mapAuthoring || {{}};
-        const routes = Array.isArray(current.routes) ? current.routes : [];
-        const routeId = window.prompt("Route id", current.selected_route_id || (routes[0] && routes[0].id) || "AUTHORED_ROUTE");
+        const routes = routeList();
+        const existingRouteIds = routes.map((route) => route.id).join(", ") || "none";
+        const routeIdInput = window.prompt(
+          `Route id (existing: ${{existingRouteIds}}; new id creates a route)`,
+          current.selected_route_id || (routes[0] && routes[0].id) || nextRouteId(routes)
+        );
+        const routeId = routeIdInput ? routeIdInput.trim() : "";
         if (!routeId) return;
-        await postAuthoring(`/api/map/routes/${{encodeURIComponent(routeId)}}/select`, {{}});
+        const existing = routes.find((route) => route.id === routeId);
+        if (existing) {{
+          await postAuthoring(`/api/map/routes/${{encodeURIComponent(routeId)}}/select`, {{}});
+        }} else {{
+          await saveRoutes([...routes, {{id: routeId, label: routeId, waypoints: [], mission_id: null}}], routeId);
+        }}
       }};
       const mapEditId = (prefix) => `${{prefix}}-${{Date.now().toString(36)}}`;
       const applyMapEditAt = async (target) => {{
@@ -2082,28 +2280,17 @@ def render_dashboard_html(
           }});
         }} else if (mapEditMode === "route") {{
           const current = mapAuthoring || {{}};
-          const routes = Array.isArray(current.routes) ? [...current.routes] : [];
-          const route = routes.find((item) => item.id === "AUTHORED_POI_ROUTE") || {{id: "AUTHORED_POI_ROUTE", label: "Authored photo POI route", waypoints: [], mission_id: null}};
+          const routes = [...routeList()];
+          const newRouteId = nextRouteId(routes);
+          const route = routes.find((item) => item.id === current.selected_route_id) || routes[0] || {{id: newRouteId, label: newRouteId, waypoints: [], mission_id: null}};
           const routeIndex = routes.indexOf(route);
-          const existingWaypoints = (route.waypoints || []).filter((waypoint) => waypoint.target_id !== "HOME");
-          const poiCount = existingWaypoints.length + 1;
-          route.waypoints = [...existingWaypoints, {{
+          route.waypoints = [...(route.waypoints || []), {{
             id: mapEditId("WP"),
-            label: `Photo POI ${{poiCount}}`,
+            label: `Waypoint ${{(route.waypoints || []).length + 1}}`,
             pose,
-            target_id: `PHOTO_POI_${{poiCount}}`,
+            target_id: null,
             required: true,
           }}];
-          const homePose = (mapAuthoring && mapAuthoring.home) || mapHomePose;
-          if (homePose) {{
-            route.waypoints.push({{
-              id: "HOME-RETURN",
-              label: "Return Home",
-              pose: {{x: Number(homePose.x), y: Number(homePose.y), source: "site_config"}},
-              target_id: "HOME",
-              required: true,
-            }});
-          }}
           routes[routeIndex >= 0 ? routeIndex : 0] = route;
           await postAuthoring("/api/map/authoring", {{...current, routes, selected_route_id: route.id}}, "PUT");
         }} else if (mapEditMode === "incident") {{
@@ -2182,6 +2369,193 @@ def render_dashboard_html(
           `translate(${{projected.x.toFixed(1)}} ${{projected.y.toFixed(1)}})`
         );
       }};
+      const clearChildren = (node) => {{
+        if (!node) return;
+        while (node.firstChild) node.removeChild(node.firstChild);
+      }};
+      const qrText = (value, fallback = "unknown") => {{
+        if (value === null || value === undefined || value === "") return fallback;
+        return String(value);
+      }};
+      const formatQrTimestamp = (value) => {{
+        const numeric = Number(value);
+        if (!Number.isFinite(numeric)) return "unknown";
+        return numeric.toFixed(3);
+      }};
+      const formatQrRobotPose = (pose) => {{
+        if (!pose) return "unknown";
+        const x = Number(pose.x);
+        const y = Number(pose.y);
+        const yaw = Number(pose.yaw);
+        if (!Number.isFinite(x) || !Number.isFinite(y)) return "unknown";
+        if (!Number.isFinite(yaw)) return x.toFixed(2) + ", " + y.toFixed(2);
+        return x.toFixed(2) + ", " + y.toFixed(2) + ", yaw " + yaw.toFixed(2);
+      }};
+      const setQrCargoStatus = (text, state = "") => {{
+        if (!qrCargoStatus) return;
+        qrCargoStatus.textContent = text;
+        qrCargoStatus.className = "qr-cargo-status " + state;
+      }};
+      const renderQrCargoRows = (events) => {{
+        if (!qrCargoRows) return;
+        const items = Array.isArray(events) ? events : [];
+        latestQrEventsById = new Map(items.map((event) => [String(event.event_id || ""), event]));
+        clearChildren(qrCargoRows);
+        if (!items.length) {{
+          const row = document.createElement("tr");
+          row.setAttribute("data-qr-empty", "");
+          const cell = document.createElement("td");
+          cell.colSpan = 10;
+          cell.className = "muted";
+          cell.textContent = "No QR cargo events yet";
+          row.appendChild(cell);
+          qrCargoRows.appendChild(row);
+          setQrCargoStatus("QR cargo idle", "");
+          return;
+        }}
+        for (const event of items.slice(0, 50)) {{
+          const eventId = String(event.event_id || "");
+          const row = document.createElement("tr");
+          row.setAttribute("data-qr-event-row", "");
+          row.setAttribute("data-qr-event-id", eventId);
+          const addCell = (text) => {{
+            const cell = document.createElement("td");
+            cell.textContent = text;
+            row.appendChild(cell);
+          }};
+          addCell(formatQrTimestamp(event.timestamp));
+          addCell(qrText(event.warehouse_id));
+          addCell(qrText(event.location_node_id));
+          addCell(qrText(event.cargo_id));
+          addCell([event.zone, event.shelf_id].filter(Boolean).join(" / ") || "unknown");
+          addCell(qrText(event.task));
+          addCell(qrText(event.source));
+          addCell(qrText(event.status) + " / " + qrText(event.action_policy, "report_only"));
+          addCell(formatQrRobotPose(event.robot_pose_at_detection));
+          const actions = document.createElement("td");
+          actions.className = "qr-actions";
+          const addButton = (label, attribute, disabled = false) => {{
+            const button = document.createElement("button");
+            button.type = "button";
+            button.textContent = label;
+            button.setAttribute(attribute, eventId);
+            button.disabled = disabled;
+            actions.appendChild(button);
+          }};
+          addButton("Select on map", "data-qr-select", !event.map_position);
+          addButton("Promote to Package", "data-qr-promote-package");
+          addButton("Promote to Label", "data-qr-promote-label");
+          addButton("Bind Location Node", "data-qr-bind-location");
+          addButton("Copy JSON", "data-qr-copy");
+          row.appendChild(actions);
+          qrCargoRows.appendChild(row);
+        }}
+        setQrCargoStatus("Latest QR cargo events: " + items.length, "ok");
+      }};
+      const renderQrCargoMarkers = (events) => {{
+        if (!qrCargoLayer) return;
+        clearChildren(qrCargoLayer);
+        const items = Array.isArray(events) ? events : [];
+        const svgNS = "http://www.w3.org/2000/svg";
+        for (const event of items) {{
+          if (!event.map_position) continue;
+          const projected = projectLiveOverlayPoint(Number(event.map_position.x), Number(event.map_position.y));
+          if (!projected) continue;
+          const eventId = String(event.event_id || "");
+          const group = document.createElementNS(svgNS, "g");
+          group.setAttribute("class", "map-qr-cargo-marker");
+          group.setAttribute("data-edit-kind", "qr_cargo");
+          group.setAttribute("data-edit-id", eventId);
+          group.setAttribute("data-qr-event-id", eventId);
+          group.setAttribute("data-linked-entity-id", String(event.linked_entity_id || event.location_node_id || ""));
+          const title = document.createElementNS(svgNS, "title");
+          title.textContent = "QR cargo " + qrText(event.cargo_id, "cargo") + " / " + qrText(event.location_node_id);
+          group.appendChild(title);
+          const ring = document.createElementNS(svgNS, "circle");
+          ring.setAttribute("class", "map-qr-cargo-ring");
+          ring.setAttribute("cx", projected.x.toFixed(1));
+          ring.setAttribute("cy", projected.y.toFixed(1));
+          ring.setAttribute("r", "14");
+          group.appendChild(ring);
+          const core = document.createElementNS(svgNS, "rect");
+          core.setAttribute("class", "map-qr-cargo-core");
+          core.setAttribute("x", (projected.x - 5).toFixed(1));
+          core.setAttribute("y", (projected.y - 5).toFixed(1));
+          core.setAttribute("width", "10");
+          core.setAttribute("height", "10");
+          core.setAttribute("rx", "1.5");
+          group.appendChild(core);
+          const label = document.createElementNS(svgNS, "text");
+          label.setAttribute("class", "map-qr-cargo-label");
+          label.setAttribute("x", (projected.x + 14).toFixed(1));
+          label.setAttribute("y", (projected.y + 5).toFixed(1));
+          label.textContent = qrText(event.cargo_id, "cargo");
+          group.appendChild(label);
+          qrCargoLayer.appendChild(group);
+        }}
+      }};
+      const clearQrCargoHighlight = () => {{
+        if (!liveMapSvg) return;
+        liveMapSvg.querySelectorAll(".map-qr-cargo-marker.is-selected, .qr-linked").forEach((item) => {{
+          item.classList.remove("is-selected");
+          item.classList.remove("qr-linked");
+        }});
+      }};
+      const highlightLinkedEntity = (linkedId) => {{
+        if (!liveMapSvg || !linkedId) return;
+        liveMapSvg.querySelectorAll("[data-edit-id]").forEach((item) => {{
+          if (item.getAttribute("data-edit-id") === linkedId) item.classList.add("qr-linked");
+        }});
+      }};
+      const highlightQrCargoEvent = (eventId) => {{
+        clearQrCargoHighlight();
+        if (!qrCargoLayer) return;
+        const marker = Array.from(qrCargoLayer.querySelectorAll("[data-qr-event-id]")).find(
+          (item) => item.getAttribute("data-qr-event-id") === eventId
+        );
+        const event = latestQrEventsById.get(eventId);
+        if (marker) {{
+          marker.classList.add("is-selected");
+          marker.scrollIntoView({{block: "nearest", inline: "nearest"}});
+          setQrCargoStatus("Selected QR event " + eventId, "ok");
+        }} else {{
+          setQrCargoStatus("QR event has no map position", "error");
+        }}
+        if (event) highlightLinkedEntity(event.linked_entity_id || event.location_node_id);
+      }};
+      const postQrAction = async (eventId, action) => {{
+        setQrCargoStatus("Saving QR cargo action...", "");
+        try {{
+          const response = await fetch("/api/qr/events/" + encodeURIComponent(eventId) + "/" + action, {{
+            method: "POST",
+            headers: {{
+              "Content-Type": "application/json",
+              "X-DogOps-Control-Token": robotControlToken,
+            }},
+            body: "{{}}",
+          }});
+          const result = await response.json();
+          if (!response.ok || result.ok === false) throw new Error(result.message || result.error || "qr_action_failed");
+          setQrCargoStatus("QR cargo action saved", "ok");
+          await refreshDimOSMap();
+          window.setTimeout(() => window.location.reload(), 150);
+        }} catch (error) {{
+          setQrCargoStatus("QR cargo action failed: " + error.message, "error");
+        }}
+      }};
+      const copyQrEventJson = async (eventId) => {{
+        const event = latestQrEventsById.get(eventId);
+        if (!event) return;
+        const raw = JSON.stringify(event, null, 2);
+        try {{
+          if (!navigator.clipboard) throw new Error("clipboard unavailable");
+          await navigator.clipboard.writeText(raw);
+          setQrCargoStatus("QR event JSON copied", "ok");
+        }} catch (_) {{
+          window.prompt("QR event JSON", raw);
+        }}
+      }};
+
       const updateDimOSMapLayers = (data) => {{
         const live = data && data.live ? data.live : null;
         if (!live) return;
@@ -2189,6 +2563,9 @@ def render_dashboard_html(
         const heatmapCells = renderLiveHeatmap(live.costmap);
         const pathPoints = renderDimOSPath(live.path || live.route || []);
         renderDimOSTarget(live.target);
+        const qrEvents = Array.isArray(data.qr_cargo_events) ? data.qr_cargo_events : [];
+        renderQrCargoMarkers(qrEvents);
+        renderQrCargoRows(qrEvents);
         dimosRobotPoseActive = Boolean(live.robot_pose);
         if (live.robot_pose) {{
           const yawRad = Number.isFinite(live.robot_pose.theta_deg)
@@ -2314,7 +2691,7 @@ def render_dashboard_html(
         setMapCommandStatus(`Sending Go To x=${{target.x.toFixed(2)}} y=${{target.y.toFixed(2)}}...`, "");
         const result = await sendRobotAction(
           "/api/robot/go_to",
-          {{command: "go_to", x: target.x, y: target.y, source: target.source || "map_click"}},
+          {{command: "go_to", x: target.x, y: target.y, source: "map_click"}},
           () => `Go To sent x=${{target.x.toFixed(2)}} y=${{target.y.toFixed(2)}}`
         );
         setMapCommandStatus(
@@ -2357,8 +2734,8 @@ def render_dashboard_html(
         await sendJogCommand(command);
       }});
       if (rerunConnect) {{
-        rerunConnect.addEventListener("click", () => {{
-          connectRerunSurface();
+        rerunConnect.addEventListener("click", async () => {{
+          await connectRerunSurface();
         }});
       }}
       if (liveMapSvg) {{
@@ -2443,12 +2820,8 @@ def render_dashboard_html(
           if (!button) return;
           const action = button.getAttribute("data-map-action");
           button.blur();
-          if (action === "start") {{
-            await sendRobotAction(
-              "/api/robot/map_start",
-              {{command: "map_start"}},
-              () => "Live map connected"
-            );
+          if (action === "map_from_scratch") {{
+            await mapFromScratch();
           }} else if (action === "origin") {{
             await sendRobotAction(
               "/api/robot/map_origin",
@@ -2500,14 +2873,8 @@ def render_dashboard_html(
             await placeSelectedFromObservation();
           }} else if (action === "route_select") {{
             await selectRouteByPrompt();
-          }} else if (action === "map_from_scratch") {{
-            await mapFromScratch();
-          }} else if (action === "return_home") {{
-            await returnHome();
-          }} else if (action === "run_route_sim") {{
-            await runSelectedRoute(true);
           }} else if (action === "run_route") {{
-            await runSelectedRoute(false);
+            await runSelectedRoute();
           }} else if (action === "stop_route") {{
             await stopRouteExecution();
           }} else if (action === "route_up") {{
@@ -2516,6 +2883,24 @@ def render_dashboard_html(
             await moveSelectedRouteWaypoint(1);
           }} else if (action === "publish_no_go") {{
             await postAuthoring("/api/map/no_go_shapes/publish", {{}});
+          }}
+        }});
+      }}
+      if (qrCargoRows) {{
+        qrCargoRows.addEventListener("click", async (event) => {{
+          const button = event.target.closest("button[data-qr-select], button[data-qr-promote-package], button[data-qr-promote-label], button[data-qr-bind-location], button[data-qr-copy]");
+          if (!button) return;
+          button.blur();
+          if (button.hasAttribute("data-qr-select")) {{
+            highlightQrCargoEvent(button.getAttribute("data-qr-select") || "");
+          }} else if (button.hasAttribute("data-qr-promote-package")) {{
+            await postQrAction(button.getAttribute("data-qr-promote-package") || "", "promote_to_package");
+          }} else if (button.hasAttribute("data-qr-promote-label")) {{
+            await postQrAction(button.getAttribute("data-qr-promote-label") || "", "promote_to_label");
+          }} else if (button.hasAttribute("data-qr-bind-location")) {{
+            await postQrAction(button.getAttribute("data-qr-bind-location") || "", "bind_location_node");
+          }} else if (button.hasAttribute("data-qr-copy")) {{
+            await copyQrEventJson(button.getAttribute("data-qr-copy") || "");
           }}
         }});
       }}
@@ -2534,9 +2919,11 @@ def render_dashboard_html(
       refreshLiveMap();
       refreshDimOSMap();
       refreshRouteExecution();
+      refreshRouteRunHistory();
       window.setInterval(refreshLiveMap, 1000);
       window.setInterval(refreshDimOSMap, 1500);
       window.setInterval(refreshRouteExecution, 1500);
+      window.setInterval(refreshRouteRunHistory, 5000);
     }})();
   </script>
 </body>
@@ -2627,7 +3014,9 @@ def _trusted_rerun_web_url(raw_url: str | None) -> str:
 
 def _trusted_rerun_source_url(raw_url: str | None) -> str:
     fallback = "rerun+http://127.0.0.1:9877/proxy"
-    if not raw_url or not raw_url.startswith("rerun+"):
+    if not raw_url:
+        return fallback
+    if not raw_url.startswith("rerun+"):
         return fallback
     try:
         parsed = urlparse(raw_url.removeprefix("rerun+"))
@@ -2641,88 +3030,76 @@ def _trusted_rerun_source_url(raw_url: str | None) -> str:
     return raw_url
 
 
-def _trusted_rerun_view_mode(raw_view_mode: str | None) -> str:
-    return "native-3d" if raw_view_mode == "native-3d" else "dogops-2d"
+def _trusted_rerun_view_mode(raw_value: str | None) -> str:
+    return "dogops-2d" if raw_value == "dogops-2d" else "native-3d"
 
 
 def _include_static_site_map() -> bool:
-    return _trusted_rerun_view_mode(os.environ.get("DOGOPS_RERUN_VIEW_MODE")) != "native-3d"
+    raw_value = os.environ.get("DOGOPS_INCLUDE_STATIC_SITE_MAP")
+    if raw_value is None:
+        return True
+    return raw_value.strip().lower() not in {"0", "false", "no", "off"}
 
 
-def _route_execution_status_text(route_execution: dict[str, Any] | None) -> str:
-    if not route_execution or not route_execution.get("state"):
-        return "Execution: idle"
-    reached = int(route_execution.get("waypoints_reached") or 0)
-    total = int(route_execution.get("waypoints_total") or 0)
-    transport = route_execution.get("transport")
-    suffix = f" transport={transport}" if transport else ""
-    return f"Execution: {route_execution['state']} {reached}/{total}{suffix}"
+def _trusted_camera_stream_url(raw_url: str | None) -> str:
+    if not raw_url:
+        return ""
+    try:
+        parsed = urlparse(raw_url)
+    except ValueError:
+        return ""
+    if parsed.scheme not in {"http", "https"}:
+        return ""
+    host = (parsed.hostname or "").lower()
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        return ""
+    return raw_url
 
 
-def _with_default_route_authoring(
-    authoring: dict[str, Any],
-    state: dict[str, Any],
-    report: dict[str, Any],
-) -> dict[str, Any]:
-    if authoring.get("routes"):
-        return authoring
-    route_data = build_route_data(state, report, authoring=authoring)
-    waypoints = []
-    for index, stop in enumerate(route_data.get("stops") or [], 1):
-        try:
-            x = float(stop["x"])
-            y = float(stop["y"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        target_id = str(stop.get("target_id") or f"POI_{index}")
-        waypoints.append(
-            {
-                "id": f"POI-{index}",
-                "label": f"Photo POI {index}: {target_id}",
-                "target_id": target_id,
-                "pose": {"x": x, "y": y, "source": "site_config"},
-            }
+def _render_live_video_panel(camera_stream_url: str) -> str:
+    if not camera_stream_url:
+        return (
+            '<div class="live-video-panel is-waiting" data-live-video-panel>'
+            "<strong>Live video</strong>"
+            '<div class="live-video-placeholder" data-live-video-placeholder>'
+            "Waiting for local Go2 camera stream"
+            "</div>"
+            "</div>"
         )
-    if not waypoints:
-        return authoring
-    updated = dict(authoring)
-    updated["routes"] = [
-        {
-            "id": "DOGOPS_PHOTO_POI_ROUTE",
-            "label": "DogOps photo POI route",
-            "mission_id": str(state.get("mission_id") or report.get("mission_id") or ""),
-            "waypoints": waypoints,
-        }
-    ]
-    updated["selected_route_id"] = "DOGOPS_PHOTO_POI_ROUTE"
-    return updated
+    camera_stream_url_attr = escape(camera_stream_url, quote=True)
+    return (
+        '<div class="live-video-panel" data-live-video-panel>'
+        "<strong>Live video</strong>"
+        f'<iframe data-live-video-frame title="Live Go2 camera" src="{camera_stream_url_attr}" loading="lazy"></iframe>'
+        "</div>"
+    )
 
 
 def _render_rerun_surface(
     rerun_source_url: str,
     rerun_web_url: str,
     rerun_view_mode: str,
+    camera_stream_url: str,
 ) -> str:
     rerun_source_url_attr = escape(rerun_source_url, quote=True)
     rerun_web_url_attr = escape(rerun_web_url, quote=True)
-    rerun_view_mode_attr = escape(_trusted_rerun_view_mode(rerun_view_mode), quote=True)
+    rerun_view_mode_attr = escape(rerun_view_mode, quote=True)
     return (
-        '<div class="rerun-surface" data-rerun-surface data-map-viewer '
+        '<div class="rerun-surface" data-map-viewer data-rerun-surface '
         f'data-rerun-source-url="{rerun_source_url_attr}" '
-        'data-rerun-asset-base-url="/assets/vendor/@rerun-io/web-viewer/" '
-        f'data-rerun-view-mode="{rerun_view_mode_attr}">'
+        f'data-rerun-view-mode="{rerun_view_mode_attr}" '
+        'data-rerun-asset-base-url="/assets/vendor/@rerun-io/web-viewer/">'
         '<div class="rerun-canvas" data-rerun-canvas hidden></div>'
-        '<div class="rerun-offline" data-viewer-offline hidden>'
-        '<div>3D View unavailable. Start the Rerun stream, then connect again.</div>'
-        "</div>"
         '<div class="rerun-standby" data-rerun-standby>'
         '<span class="rerun-chip">3D View</span>'
         '<div class="rerun-status" data-rerun-status>3D View standby</div>'
         '<div class="rerun-controls">'
         '<button type="button" data-rerun-connect>Connect 3D View</button>'
-        f'<a href="{rerun_web_url_attr}" target="_blank" rel="noreferrer">Open</a>'
+        f'<a href="{rerun_web_url_attr}" target="_blank" rel="noreferrer">Open 3D View</a>'
         "</div>"
         "</div>"
+        '<div class="viewer-offline" data-viewer-offline hidden></div>'
+        f"{_render_live_video_panel(camera_stream_url)}"
         "</div>"
     )
 
@@ -3019,6 +3396,32 @@ def _render_incident(projector: _MapProjector, incident: dict[str, Any]) -> str:
     )
 
 
+def _render_qr_cargo_event(projector: _MapProjector, event: dict[str, Any]) -> str:
+    position = event.get("map_position")
+    if not isinstance(position, dict):
+        return ""
+    x = projector.x(float(position["x"]))
+    y = projector.y(float(position["y"]))
+    event_id = escape(str(event.get("event_id") or ""))
+    cargo_id = escape(str(event.get("cargo_id") or "cargo"))
+    location_node_id = escape(str(event.get("location_node_id") or "unknown"))
+    title = escape(
+        f"QR cargo {event.get('cargo_id') or 'cargo'} / "
+        f"{event.get('location_node_id') or 'unknown'} / "
+        f"{event.get('action_policy') or 'report_only'}"
+    )
+    return (
+        f'<g class="map-qr-cargo-marker" data-edit-kind="qr_cargo" '
+        f'data-edit-id="{event_id}" data-qr-event-id="{event_id}" '
+        f'data-linked-entity-id="{location_node_id}"><title>{title}</title>'
+        f'<circle class="map-qr-cargo-ring" cx="{x:.1f}" cy="{y:.1f}" r="14" />'
+        f'<rect class="map-qr-cargo-core" x="{x - 5:.1f}" y="{y - 5:.1f}" '
+        f'width="10" height="10" rx="1.5" />'
+        f'<text class="map-qr-cargo-label" x="{x + 14:.1f}" y="{y + 5:.1f}">{cargo_id}</text>'
+        "</g>"
+    )
+
+
 def _render_route_stop(projector: _MapProjector, stop: dict[str, Any], index: int) -> str:
     x = projector.x(float(stop["x"]))
     y = projector.y(float(stop["y"]))
@@ -3074,115 +3477,71 @@ def metric(label: str, value: object) -> str:
     )
 
 
-def build_test_flow_proof(
-    state: dict[str, Any],
-    report: dict[str, Any],
-    route_data: dict[str, Any],
-    poi_data: dict[str, Any],
-    *,
-    route_execution: dict[str, Any] | None = None,
-    rerun_command: dict[str, Any] | None = None,
-) -> list[dict[str, Any]]:
-    nav = report.get("nav_summary") or {}
-    events = route_execution.get("events") if isinstance(route_execution, dict) else []
-    reached_targets = [
-        str(event.get("target_id"))
-        for event in events or []
-        if event.get("state") == "reached" and event.get("target_id")
-    ]
-    captures = poi_data.get("captures") or []
-    photo_captures = [
-        capture
-        for capture in captures
-        if str(capture.get("id") or "").startswith("OBS-POI-")
-        and str(capture.get("image_path") or "")
-    ]
-    photo_targets = {
-        str(capture.get("entity_id") or capture.get("zone_id") or "")
-        for capture in photo_captures
-    }
-    route_targets = [str(stop.get("target_id")) for stop in route_data.get("stops") or []]
-    poi_targets = [target for target in route_targets if target.startswith("PHOTO_POI_")]
-    home_reached = "HOME" in reached_targets or any(
-        str(event.get("target_id")) == "HOME"
-        and "dashboard simulation go_to" in str(event.get("note") or "")
-        for event in state.get("nav_events") or []
-    )
-    route_complete = (
-        isinstance(route_execution, dict)
-        and route_execution.get("state") == "completed"
-        and int(route_execution.get("waypoints_reached") or 0)
-        == int(route_execution.get("waypoints_total") or 0)
-        and int(route_execution.get("waypoints_total") or 0) > 0
-    )
-    safety_clear = (
-        route_complete
-        and route_execution.get("last_error") in {None, ""}
-        and int(nav.get("safety_stops") or 0) == 0
-    )
-    rerun_actions = [
-        str(item)
-        for item in (rerun_command or {}).get("history", [])
-        if isinstance(item, str)
-    ]
-    current_rerun_action = (rerun_command or {}).get("action")
-    if isinstance(current_rerun_action, str):
-        rerun_actions.append(current_rerun_action)
-    return [
-        {
-            "label": "Map area from scratch",
-            "ok": "replay_mapping" in rerun_actions,
-            "detail": f"3D View replay actions: {', '.join(rerun_actions) or 'not run'}",
-        },
-        {
-            "label": "Return home",
-            "ok": home_reached,
-            "detail": "HOME reached by return-home command or final route stop",
-        },
-        {
-            "label": "Avoid obstacles",
-            "ok": safety_clear,
-            "detail": (
-                f"safety_stops={int(nav.get('safety_stops') or 0)}, "
-                f"last_error={route_execution.get('last_error') if isinstance(route_execution, dict) else 'none'}"
-            ),
-        },
-        {
-            "label": "Select POIs on lower map",
-            "ok": len(poi_targets) > 0,
-            "detail": f"{len(poi_targets)} photo POI target(s): {', '.join(poi_targets) or 'none'}",
-        },
-        {
-            "label": "Visit POIs",
-            "ok": bool(poi_targets) and set(poi_targets).issubset(set(reached_targets)),
-            "detail": f"reached: {', '.join(reached_targets) or 'none'}",
-        },
-        {
-            "label": "Capture POI images",
-            "ok": bool(poi_targets) and set(poi_targets).issubset(photo_targets),
-            "detail": f"{len(photo_captures)} image evidence item(s)",
-        },
-        {
-            "label": "Return home after POIs",
-            "ok": bool(reached_targets) and reached_targets[-1] == "HOME",
-            "detail": f"final reached target: {reached_targets[-1] if reached_targets else 'none'}",
-        },
-    ]
-
-
-def test_flow_proof(items: list[dict[str, Any]]) -> str:
+def qr_cargo_panel(events: list[dict[str, Any]]) -> str:
     rows = []
-    for item in items:
-        ok = bool(item.get("ok"))
-        state = "pass" if ok else "fail"
+    for event in events[:50]:
+        event_id = escape(str(event.get("event_id") or ""))
+        timestamp = _format_timestamp(event.get("timestamp"))
+        robot_pose = _format_qr_robot_pose(event.get("robot_pose_at_detection"))
+        zone_shelf = " / ".join(
+            item
+            for item in [str(event.get("zone") or ""), str(event.get("shelf_id") or "")]
+            if item
+        ) or "unknown"
+        select_disabled = "" if event.get("map_position") else " disabled"
         rows.append(
-            '<div class="proof-item">'
-            f"<strong>{escape(str(item.get('label') or 'Proof'))}</strong>"
-            f'<span class="state-{state}">{state}</span>'
-            f'<div class="muted">{escape(str(item.get("detail") or ""))}</div>'
-            "</div>"
+            f'<tr data-qr-event-row data-qr-event-id="{event_id}">'
+            f"<td>{escape(timestamp)}</td>"
+            f"<td>{escape(str(event.get('warehouse_id') or 'unknown'))}</td>"
+            f"<td>{escape(str(event.get('location_node_id') or 'unknown'))}</td>"
+            f"<td>{escape(str(event.get('cargo_id') or 'unknown'))}</td>"
+            f"<td>{escape(zone_shelf)}</td>"
+            f"<td>{escape(str(event.get('task') or 'unknown'))}</td>"
+            f"<td>{escape(str(event.get('source') or 'unknown'))}</td>"
+            f"<td>{escape(str(event.get('status') or 'unknown'))} / "
+            f"{escape(str(event.get('action_policy') or 'report_only'))}</td>"
+            f"<td>{escape(robot_pose)}</td>"
+            '<td class="qr-actions">'
+            f'<button type="button" data-qr-select="{event_id}"{select_disabled}>Select on map</button>'
+            f'<button type="button" data-qr-promote-package="{event_id}">Promote to Package</button>'
+            f'<button type="button" data-qr-promote-label="{event_id}">Promote to Label</button>'
+            f'<button type="button" data-qr-bind-location="{event_id}">Bind Location Node</button>'
+            f'<button type="button" data-qr-copy="{event_id}">Copy JSON</button>'
+            "</td>"
+            "</tr>"
         )
-    return '<div class="proof-grid">' + "".join(rows) + "</div>"
+    if not rows:
+        rows.append(
+            '<tr data-qr-empty><td colspan="10" class="muted">No QR cargo events yet</td></tr>'
+        )
+    return (
+        '<div class="qr-cargo-status" data-qr-cargo-status>QR cargo idle</div>'
+        '<div class="qr-cargo-table"><table><thead><tr>'
+        '<th>Time</th><th>WH</th><th>Location Node</th><th>Cargo</th>'
+        '<th>Zone/Shelf</th><th>Task</th><th>Source</th><th>Status/Policy</th>'
+        '<th>Robot Pose</th><th>Actions</th></tr></thead>'
+        f'<tbody data-qr-cargo-events>{"".join(rows)}</tbody></table></div>'
+    )
+
+
+def _format_timestamp(value: object) -> str:
+    try:
+        return f"{float(value):.3f}"
+    except (TypeError, ValueError):
+        return "unknown"
+
+
+def _format_qr_robot_pose(value: object) -> str:
+    if not isinstance(value, dict):
+        return "unknown"
+    x = _float_or_none(value.get("x"))
+    y = _float_or_none(value.get("y"))
+    yaw = _float_or_none(value.get("yaw"))
+    if x is None or y is None:
+        return "unknown"
+    if yaw is None:
+        return f"{x:.2f}, {y:.2f}"
+    return f"{x:.2f}, {y:.2f}, yaw {yaw:.2f}"
 
 
 def package_table(packages: list[dict[str, Any]]) -> str:
@@ -3269,26 +3628,15 @@ def checkpoint_table(checkpoints: list[dict[str, Any]]) -> str:
     )
 
 
-def route_table(stops: list[dict[str, Any]], poi_data: dict[str, Any] | None = None) -> str:
-    captured_targets = {
-        str(capture.get("entity_id") or capture.get("zone_id") or "")
-        for capture in (poi_data or {}).get("captures", [])
-        if str(capture.get("image_path") or "")
-    }
+def route_table(stops: list[dict[str, Any]]) -> str:
     rows = []
     for stop in stops:
-        target_id = str(stop["target_id"])
-        if target_id in captured_targets and target_id == "HOME":
-            state = "returned"
-        elif target_id in captured_targets:
-            state = "captured"
-        else:
-            state = "verified" if stop.get("tag_verified") else "missing"
+        state = "verified" if stop.get("tag_verified") else "missing"
         tag_id = stop.get("expected_tag_id")
         rows.append(
             "<tr>"
             f"<td>{escape(str(stop['sequence']))}</td>"
-            f"<td>{escape(target_id)}</td>"
+            f"<td>{escape(str(stop['target_id']))}</td>"
             f"<td>{escape(str(tag_id if tag_id is not None else 'none'))}</td>"
             f"<td>{escape(str(stop.get('retries', 0)))}</td>"
             f"<td class=\"state-{state}\">{state}</td>"
@@ -3306,28 +3654,15 @@ def poi_list(poi_data: dict[str, Any]) -> str:
     captures = poi_data.get("captures") or []
     readings = poi_data.get("readings") or []
     items = []
-    image_captures = [capture for capture in captures if capture.get("image_path")]
-    text_captures = [capture for capture in captures if not capture.get("image_path")]
-    for capture in [*image_captures, *text_captures][:8]:
+    for capture in captures[:4]:
         tags = ", ".join(str(tag_id) for tag_id in capture.get("visible_tag_ids") or []) or "none"
         incidents = capture.get("related_incident_ids") or []
         incident_text = f" / incidents {', '.join(incidents)}" if incidents else ""
-        image_path = str(capture.get("image_path") or "").lstrip("/")
-        image = (
-            f'<img src="/{escape(image_path, quote=True)}" '
-            f'alt="{escape(str(capture["id"]), quote=True)} photo evidence">'
-            if image_path
-            else ""
-        )
         items.append(
             "<li>"
-            '<div class="poi-capture">'
-            f"{image}"
-            "<div>"
             f"<strong>{escape(str(capture['id']))}</strong> "
-            f"<span>{escape(str(capture.get('zone_id') or 'unknown'))} / tags {escape(tags)}"
-            f"{escape(incident_text)}</span>"
-            "</div></div>"
+            f"{escape(str(capture.get('zone_id') or 'unknown'))} / tags {escape(tags)}"
+            f"{escape(incident_text)}"
             "</li>"
         )
     for reading in readings[:3]:
@@ -3346,14 +3681,10 @@ def write_dashboard_html(run_dir: str | Path, *, robot_control_token: str | None
     root = Path(run_dir)
     state = _read_json(root / "state.json")
     report = _read_json(root / "report.json")
-    route_execution = _read_json_if_exists(root / "route_execution.json")
-    rerun_command = _read_json_if_exists(root / "rerun_command.json")
     authoring = load_map_authoring(
         root,
         site_id=str((state.get("site") or {}).get("site_id") or ""),
     ).model_dump(mode="json")
-    if _include_static_site_map():
-        authoring = _with_default_route_authoring(authoring, state, report)
     html_path = root / "dashboard.html"
     html_path.write_text(
         render_dashboard_html(
@@ -3361,8 +3692,7 @@ def write_dashboard_html(run_dir: str | Path, *, robot_control_token: str | None
             report,
             robot_control_token=robot_control_token,
             authoring=authoring,
-            route_execution=route_execution,
-            rerun_command=rerun_command,
+            qr_events=get_latest_qr_events(root),
         ),
         encoding="utf-8",
     )
@@ -3371,12 +3701,6 @@ def write_dashboard_html(run_dir: str | Path, *, robot_control_token: str | None
 
 def _read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
-
-
-def _read_json_if_exists(path: Path) -> dict[str, Any] | None:
-    if not path.exists():
-        return None
-    return _read_json(path)
 
 
 def _latest_fact_value(observations: list[dict[str, Any]], key: str) -> object | None:

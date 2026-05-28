@@ -17,7 +17,7 @@ import subprocess
 import threading
 import time
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from pydantic import ValidationError
 
@@ -53,13 +53,20 @@ from dimos.experimental.dogops.map_authoring import (
     publish_no_go_constraints,
     validation_error_message,
 )
+from dimos.experimental.dogops.qr_cargo import (
+    append_qr_event,
+    get_latest_qr_events,
+    get_qr_event,
+    load_qr_events,
+    qr_events_path,
+)
 from dimos.experimental.dogops.route_executor import (
     DogOpsRouteExecutor,
     RouteExecutionError,
     load_route_execution,
     request_route_stop,
 )
-from dimos.experimental.dogops.models import NavAction, NavEvent
+from dimos.experimental.dogops.route_run_store import RouteRunStore
 from dimos.experimental.dogops.store import DogOpsStore
 
 try:  # pragma: no cover - exercised only inside a full DimOS checkout.
@@ -112,15 +119,19 @@ DEFAULT_ROBOT_IP = (
 _ROBOT_SESSIONS: dict[str, _RobotMotionSession] = {}
 _ROBOT_SESSIONS_LOCK = threading.Lock()
 _AUTHORING_LOCK = threading.Lock()
+_QR_EVENTS_LOCK = threading.Lock()
 _LIVE_MAP_ADAPTER = DogOpsLiveMapAdapter()
 
 
 def _rerun_view_mode() -> str:
-    return "native-3d" if os.environ.get("DOGOPS_RERUN_VIEW_MODE") == "native-3d" else "dogops-2d"
+    return "dogops-2d" if os.environ.get("DOGOPS_RERUN_VIEW_MODE") == "dogops-2d" else "native-3d"
 
 
 def _include_static_site_map() -> bool:
-    return _rerun_view_mode() != "native-3d"
+    raw_value = os.environ.get("DOGOPS_INCLUDE_STATIC_SITE_MAP")
+    if raw_value is None:
+        return True
+    return raw_value.strip().lower() not in {"0", "false", "no", "off"}
 
 
 class DogOpsDashboardServer(ThreadingHTTPServer):
@@ -148,7 +159,7 @@ class DogOpsDashboardServer(ThreadingHTTPServer):
 
 def make_dashboard_server(run_dir: str | Path, host: str, port: int) -> ThreadingHTTPServer:
     root = Path(run_dir)
-    robot_control_token = secrets.token_urlsafe(32)
+    robot_control_token = os.environ.get("DOGOPS_DASHBOARD_TOKEN") or secrets.token_urlsafe(32)
     write_dashboard_html(root, robot_control_token=robot_control_token)
     token = robot_control_token
 
@@ -207,7 +218,8 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
     robot_ip: str
 
     def do_GET(self) -> None:
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
         if path in {"/", "/dashboard.html"}:
             self._send_file(self.run_dir / "dashboard.html", "text/html; charset=utf-8")
         elif path == "/api/state":
@@ -227,15 +239,31 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
                     report,
                     live_overlay=_LIVE_MAP_ADAPTER.snapshot(),
                     authoring=authoring.model_dump(mode="json"),
+                    qr_events=load_qr_events(self.run_dir),
                     include_static_site=_include_static_site_map(),
                 )
             )
         elif path == "/api/map/authoring":
             state = self._read_json(self.run_dir / "state.json")
             self._send_json(self._load_authoring(state).model_dump(mode="json"))
+        elif path == "/api/qr/events":
+            self._send_qr_events()
+        elif path == "/api/qr/events/latest":
+            self._send_latest_qr_events(parse_qs(parsed.query))
+        elif path.startswith("/api/qr/events/"):
+            self._send_qr_event(unquote(path.split("/")[-1]))
         elif path == "/api/map/routes/status":
             if self._authorize_map_authoring_write():
                 self._route_execution_status()
+        elif path == "/api/route-runs":
+            if self._authorize_map_authoring_write():
+                self._route_runs_list()
+        elif path == "/api/route-runs/current":
+            if self._authorize_map_authoring_write():
+                self._route_runs_current()
+        elif path.startswith("/api/route-runs/"):
+            if self._authorize_map_authoring_write():
+                self._route_runs_detail(path)
         elif path == "/api/robot/pose":
             if self._authorize_local_read():
                 self._send_json(_robot_pose_snapshot(self.robot_ip))
@@ -271,6 +299,18 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
             self._mark_work_order_ready(work_order_id)
         elif path == "/api/operator/event":
             self._record_operator_event()
+        elif path == "/api/qr/events":
+            if self._authorize_map_authoring_write():
+                self._record_qr_event()
+        elif path.startswith("/api/qr/events/") and path.endswith("/promote_to_package"):
+            if self._authorize_map_authoring_write():
+                self._promote_qr_event_to_package(_qr_event_id_from_path(path))
+        elif path.startswith("/api/qr/events/") and path.endswith("/promote_to_label"):
+            if self._authorize_map_authoring_write():
+                self._promote_qr_event_to_label(_qr_event_id_from_path(path))
+        elif path.startswith("/api/qr/events/") and path.endswith("/bind_location_node"):
+            if self._authorize_map_authoring_write():
+                self._bind_qr_location_node(_qr_event_id_from_path(path))
         elif path == "/api/robot/jog":
             if self._authorize_robot_control():
                 self._robot_jog()
@@ -371,20 +411,11 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: object) -> None:
         return
 
-    def _load_authoring(
-        self,
-        state: dict[str, Any] | None = None,
-        *,
-        include_default_route: bool = True,
-    ) -> MapAuthoringState:
+    def _load_authoring(self, state: dict[str, Any] | None = None) -> MapAuthoringState:
         if state is None:
             state = self._read_json(self.run_dir / "state.json")
         site_id = str((state.get("site") or {}).get("site_id") or "")
-        authoring = load_map_authoring(self.run_dir, site_id=site_id)
-        if include_default_route and not authoring.routes and _include_static_site_map():
-            report = self._read_json(self.run_dir / "report.json")
-            authoring = _with_default_inspection_route(authoring, state, report)
-        return authoring
+        return load_map_authoring(self.run_dir, site_id=site_id)
 
     def _send_authoring(self, authoring: MapAuthoringState) -> None:
         state = self._read_json(self.run_dir / "state.json")
@@ -399,6 +430,7 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
                     report,
                     live_overlay=_LIVE_MAP_ADAPTER.snapshot(),
                     authoring=payload,
+                    qr_events=load_qr_events(self.run_dir),
                     include_static_site=_include_static_site_map(),
                 ),
             }
@@ -417,7 +449,7 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
 
     def _persist_authoring_mutation(self, mutate: Any) -> MapAuthoringState:
         with _AUTHORING_LOCK:
-            authoring = mutate(self._load_authoring(include_default_route=False))
+            authoring = mutate(self._load_authoring())
             self._save_authoring(authoring)
             return authoring
 
@@ -688,6 +720,139 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         write_dashboard_html(self.run_dir, robot_control_token=self.robot_control_token)
         return result
 
+    def _route_runs_list(self) -> None:
+        store = RouteRunStore(self.run_dir)
+        self._send_json({"ok": True, "route_runs": store.list_route_runs()})
+
+    def _route_runs_current(self) -> None:
+        store = RouteRunStore(self.run_dir)
+        current = store.current_route_run()
+        route_events = store.route_run_events(current["route_run_id"]) if current else []
+        self._send_json(
+            {
+                "ok": True,
+                "route_run": current,
+                "events": route_events,
+                "timeline": self._unified_timeline(route_events, current) if current else [],
+                "evidence": store.route_run_evidence(current["route_run_id"]) if current else [],
+            }
+        )
+
+    def _route_runs_detail(self, path: str) -> None:
+        parts = [part for part in path.split("/") if part]
+        route_run_id = parts[2] if len(parts) >= 3 else ""
+        if not route_run_id:
+            self._send_json({"ok": False, "error": "missing_route_run_id"}, HTTPStatus.BAD_REQUEST)
+            return
+        store = RouteRunStore(self.run_dir)
+        route_run = store.route_run_detail(route_run_id)
+        if not route_run:
+            self._send_json({"ok": False, "error": "route_run_not_found"}, HTTPStatus.NOT_FOUND)
+            return
+        if len(parts) == 4 and parts[3] == "events":
+            self._send_json({"ok": True, "events": store.route_run_events(route_run_id)})
+            return
+        if len(parts) == 4 and parts[3] == "evidence":
+            self._send_json({"ok": True, "evidence": store.route_run_evidence(route_run_id)})
+            return
+        route_events = store.route_run_events(route_run_id)
+        self._send_json(
+            {
+                "ok": True,
+                "route_run": route_run,
+                "events": route_events,
+                "timeline": self._unified_timeline(route_events, route_run),
+                "evidence": store.route_run_evidence(route_run_id),
+            }
+        )
+
+    def _unified_timeline(
+        self,
+        route_events: list[dict[str, Any]],
+        route_run: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        timeline_run_dir = Path(str(route_run.get("run_dir") or self.run_dir))
+        state = self._read_optional_json(timeline_run_dir / "state.json")
+        report = self._read_optional_json(timeline_run_dir / "report.json")
+        route_run_id = str(route_run.get("route_run_id") or "")
+        dogops_run_id = str(route_run.get("dogops_run_id") or state.get("run", {}).get("id") or timeline_run_dir.name)
+        rows = [
+            {
+                "event_id": f"TL-{event.get('event_id') or event.get('sequence')}",
+                "route_run_id": event.get("route_run_id") or route_run_id,
+                "ts": event.get("ts") or 0,
+                "sequence": event.get("sequence"),
+                "kind": event.get("kind") or "route",
+                "state": event.get("state") or "",
+                "target_id": event.get("target_id") or event.get("waypoint_id") or event.get("action_id"),
+                "note": event.get("note") or "",
+            }
+            for event in route_events
+        ]
+        for observation in state.get("observations") or []:
+            rows.append(
+                {
+                    "event_id": f"OBS-{observation.get('id')}",
+                    "route_run_id": route_run_id,
+                    "ts": observation.get("ts") or 0,
+                    "sequence": "",
+                    "kind": "observation",
+                    "state": "recorded",
+                    "target_id": observation.get("entity_id") or observation.get("zone_id"),
+                    "note": f"observation {observation.get('id')}",
+                }
+            )
+        for incident in report.get("incidents") or []:
+            rows.append(
+                {
+                    "event_id": f"INC-{incident.get('id')}",
+                    "route_run_id": route_run_id,
+                    "ts": incident.get("ts_open") or 0,
+                    "sequence": "",
+                    "kind": "incident",
+                    "state": incident.get("state") or "",
+                    "target_id": incident.get("entity_id"),
+                    "note": incident.get("title") or incident.get("id") or "",
+                }
+            )
+        incidents_by_id = {item.get("id"): item for item in report.get("incidents") or []}
+        for work_order in report.get("work_orders") or []:
+            incident = incidents_by_id.get(work_order.get("incident_id")) or {}
+            rows.append(
+                {
+                    "event_id": f"WO-{work_order.get('id')}",
+                    "route_run_id": route_run_id,
+                    "ts": incident.get("ts_closed") or incident.get("ts_open") or 0,
+                    "sequence": "",
+                    "kind": "work_order",
+                    "state": work_order.get("state") or "",
+                    "target_id": work_order.get("incident_id"),
+                    "note": work_order.get("requested_action") or work_order.get("id") or "",
+                }
+            )
+        for checkpoint in report.get("checkpoint_verifications") or []:
+            rows.append(
+                {
+                    "event_id": f"VER-{checkpoint.get('target_id')}",
+                    "route_run_id": route_run_id,
+                    "ts": state.get("run", {}).get("ended_at") or state.get("run", {}).get("started_at") or 0,
+                    "sequence": "",
+                    "kind": "verification",
+                    "state": "verified" if checkpoint.get("verified") else "missing",
+                    "target_id": checkpoint.get("target_id"),
+                    "note": f"expected tag {checkpoint.get('expected_tag_id')}",
+                }
+            )
+        rows.sort(key=lambda item: (float(item.get("ts") or 0), str(item.get("kind") or "")))
+        for index, row in enumerate(rows, 1):
+            row["sequence"] = row.get("sequence") or index
+        store = RouteRunStore(timeline_run_dir)
+        store.replace_timeline_events(dogops_run_id, rows, route_run_id=route_run_id)
+        return store.timeline_events(
+            dogops_run_id=dogops_run_id,
+            route_run_id=route_run_id,
+        )
+
     def _route_execution_payload(
         self,
         *,
@@ -699,6 +864,7 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
             "route_execution": route_execution
             or load_route_execution(self.run_dir).model_dump(mode="json"),
             "authoring": authoring.model_dump(mode="json"),
+            "route_run": RouteRunStore(self.run_dir).current_route_run(),
             "live": _LIVE_MAP_ADAPTER.snapshot(),
         }
 
@@ -784,6 +950,129 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         with events_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, sort_keys=True) + "\n")
         self._send_json({"ok": True, "path": str(events_path)})
+
+    def _send_qr_events(self) -> None:
+        events = load_qr_events(self.run_dir)
+        self._send_json(
+            {
+                "ok": True,
+                "events": events,
+                "count": len(events),
+                "path": str(qr_events_path(self.run_dir)),
+            }
+        )
+
+    def _send_latest_qr_events(self, query: dict[str, list[str]]) -> None:
+        events = get_latest_qr_events(self.run_dir, limit=_limit_from_query(query))
+        self._send_json({"ok": True, "events": events, "count": len(events)})
+
+    def _send_qr_event(self, event_id: str) -> None:
+        event = get_qr_event(self.run_dir, event_id)
+        if event is None:
+            self._send_json(
+                {"ok": False, "error": "unknown_qr_event", "event_id": event_id},
+                HTTPStatus.NOT_FOUND,
+            )
+            return
+        self._send_json({"ok": True, "event": event})
+
+    def _record_qr_event(self) -> None:
+        payload = self._read_body_json()
+        try:
+            with _QR_EVENTS_LOCK:
+                event = append_qr_event(self.run_dir, payload)
+                write_dashboard_html(
+                    self.run_dir,
+                    robot_control_token=self.robot_control_token,
+                )
+        except (ValueError, json.JSONDecodeError) as exc:
+            self._send_json(
+                {"ok": False, "error": "invalid_qr_event", "message": str(exc)},
+                HTTPStatus.BAD_REQUEST,
+            )
+            return
+        self._send_json(
+            {
+                "ok": True,
+                "event": event,
+                "path": str(qr_events_path(self.run_dir)),
+            },
+            HTTPStatus.CREATED,
+        )
+
+    def _promote_qr_event_to_package(self, event_id: str) -> None:
+        self._promote_qr_event_to_authoring(event_id, entity_kind="package")
+
+    def _promote_qr_event_to_label(self, event_id: str) -> None:
+        self._promote_qr_event_to_authoring(event_id, entity_kind="checkpoint")
+
+    def _bind_qr_location_node(self, event_id: str) -> None:
+        self._promote_qr_event_to_authoring(event_id, entity_kind="checkpoint")
+
+    def _promote_qr_event_to_authoring(self, event_id: str, *, entity_kind: str) -> None:
+        event = get_qr_event(self.run_dir, event_id)
+        if event is None:
+            self._send_json(
+                {"ok": False, "error": "unknown_qr_event", "event_id": event_id},
+                HTTPStatus.NOT_FOUND,
+            )
+            return
+
+        payload = event.get("qr_payload") if isinstance(event.get("qr_payload"), dict) else {}
+        if entity_kind == "package":
+            entity_id = str(payload.get("cargo_id") or event_id)
+            label = entity_id
+            zone_id = str(payload.get("location_node_id") or payload.get("zone") or "")
+        else:
+            entity_id = str(payload.get("location_node_id") or event_id)
+            label = entity_id
+            zone_id = str(payload.get("zone") or "")
+
+        try:
+            position = self._qr_authoring_position(event)
+            if position is None:
+                raise ValueError("QR event has no map position to promote")
+            entity = EditableMapEntity.model_validate(
+                {
+                    "id": entity_id,
+                    "kind": entity_kind,
+                    "label": label,
+                    "pose": {
+                        "x": position["x"],
+                        "y": position["y"],
+                        "theta_deg": None,
+                        "source": "qr_cargo_event",
+                    },
+                    "zone_id": zone_id or None,
+                    "source_id": event_id,
+                }
+            )
+            authoring = self._persist_authoring_mutation(
+                lambda existing: replace_entity(existing, entity)
+            )
+        except (ValidationError, ValueError) as exc:
+            self._handle_authoring_error(exc)
+            return
+
+        self._send_authoring(authoring)
+
+    def _qr_authoring_position(self, event: dict[str, Any]) -> dict[str, Any] | None:
+        state = self._read_json(self.run_dir / "state.json")
+        report = self._read_json(self.run_dir / "report.json")
+        authoring = self._load_authoring(state).model_dump(mode="json")
+        map_data = build_map_data(
+            state,
+            report,
+            live_overlay=_LIVE_MAP_ADAPTER.snapshot(),
+            authoring=authoring,
+            qr_events=[event],
+        )
+        overlays = map_data.get("qr_cargo_events") or []
+        if not overlays:
+            return None
+        overlay = overlays[0]
+        position = overlay.get("map_position")
+        return position if isinstance(position, dict) else None
 
     def _robot_jog(self) -> None:
         payload = self._read_body_json()
@@ -893,19 +1182,6 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
             return
 
         source = str(payload.get("source") or "dashboard")
-        if os.environ.get("DOGOPS_RUNTIME_MODE") == "rerun-sim":
-            result = self._simulate_go_to(x, y, source)
-            self._send_json(
-                {
-                    "ok": True,
-                    "command": "go_to",
-                    "x": x,
-                    "y": y,
-                    "source": source,
-                    **result,
-                }
-            )
-            return
         try:
             result = _run_robot_call(lambda: _run_robot_go_to(x, y))
         except ModuleNotFoundError as exc:
@@ -941,28 +1217,6 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
                 **(result or {}),
             }
         )
-
-    def _simulate_go_to(self, x: float, y: float, source: str) -> dict[str, Any]:
-        store = DogOpsStore.load_existing(self.run_dir)
-        state = store.state
-        assert state is not None
-        nav_event = NavEvent(
-            id=f"NAV-{len(state.nav_events) + 1:03d}",
-            run_id=state.run.id,
-            ts=time.time(),
-            action=NavAction.goto,
-            target_id="HOME" if source == "return_home" else source,
-            success=True,
-            elapsed_s=0.0,
-            retries=0,
-            guided=False,
-            error_m=0.0,
-            note=f"dashboard simulation go_to x={x:.2f} y={y:.2f}",
-        )
-        store.append_nav_event(nav_event)
-        store.write_state(state.run.id)
-        store.write_report(state.run.id)
-        return {"transport": "dashboard_dry_run", "skill": "go_to"}
 
     def _robot_map_start(self) -> None:
         robot_ip = self.robot_ip
@@ -1175,6 +1429,11 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
     def _read_json(self, path: Path) -> dict[str, Any]:
         return json.loads(path.read_text(encoding="utf-8"))
 
+    def _read_optional_json(self, path: Path) -> dict[str, Any]:
+        if not path.exists():
+            return {}
+        return self._read_json(path)
+
     def _read_body_json(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0") or 0)
         if length == 0:
@@ -1319,6 +1578,20 @@ def _go_to_target(payload: dict[str, Any]) -> tuple[float, float]:
     return x, y
 
 
+def _limit_from_query(query: dict[str, list[str]], *, default: int = 50) -> int:
+    raw = (query.get("limit") or [str(default)])[0]
+    try:
+        limit = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return max(1, min(limit, 500))
+
+
+def _qr_event_id_from_path(path: str) -> str:
+    parts = path.split("/")
+    return unquote(parts[4]) if len(parts) >= 6 else ""
+
+
 def _host_parts(host_header: str) -> tuple[str, int | None]:
     try:
         parsed = urlparse(f"//{host_header.strip()}")
@@ -1453,6 +1726,10 @@ def _run_robot_go_to(x: float, y: float) -> dict[str, Any]:
     return _call_dimos_mcp_skill("go_to", {"x": x, "y": y})
 
 
+def _run_route_hard_stop(robot_ip: str) -> dict[str, Any]:
+    return _publish_robot_hard_stop(robot_ip)
+
+
 def _publish_explore_command() -> dict[str, Any]:
     try:
         from dimos.core.transport import LCMTransport
@@ -1468,10 +1745,6 @@ def _publish_explore_command() -> dict[str, Any]:
     finally:
         transport.stop()
     return {"transport": "lcm", "topic": "/explore_cmd"}
-
-
-def _run_route_hard_stop(robot_ip: str) -> dict[str, Any]:
-    return _publish_robot_hard_stop(robot_ip)
 
 
 def _run_robot_follow_route(route_id: str | None, dry_run: bool) -> dict[str, Any]:
@@ -1506,10 +1779,6 @@ def _call_dimos_mcp_skill(
     *,
     timeout_s: float = DIMOS_MCP_CALL_TIMEOUT_S,
 ) -> dict[str, Any]:
-    direct_result = _call_dimos_mcp_skill_direct(skill_name, args, timeout_s=timeout_s)
-    if direct_result is not None:
-        return direct_result
-
     command = _dimos_mcp_call_command(skill_name, args)
     try:
         result = subprocess.run(
@@ -1552,46 +1821,6 @@ def _call_dimos_mcp_skill(
                 payload["mcp_result"] = decoded
             else:
                 payload["mcp_result"] = {"value": decoded}
-    return payload
-
-
-def _call_dimos_mcp_skill_direct(
-    skill_name: str,
-    args: dict[str, Any],
-    *,
-    timeout_s: float,
-) -> dict[str, Any] | None:
-    try:
-        from dimos.agents.mcp.mcp_adapter import McpAdapter
-    except ModuleNotFoundError:
-        return None
-    adapter = McpAdapter(timeout=timeout_s)
-    result = adapter.call_tool(skill_name, args)
-    payload: dict[str, Any] = {
-        "transport": "dimos_mcp",
-        "skill": skill_name,
-    }
-    content = result.get("content", []) if isinstance(result, dict) else []
-    text = "\n".join(
-        str(item.get("text", ""))
-        for item in content
-        if isinstance(item, dict) and item.get("text") is not None
-    ).strip()
-    if not text:
-        payload["mcp_result"] = result
-        return payload
-    try:
-        decoded = json.loads(text)
-    except json.JSONDecodeError:
-        payload["stdout"] = text
-    else:
-        if isinstance(decoded, dict):
-            if decoded.get("ok") is False:
-                detail = decoded.get("error") or decoded.get("message") or decoded
-                raise RuntimeError(f"dimos mcp call {skill_name} returned error: {detail}")
-            payload["mcp_result"] = decoded
-        else:
-            payload["mcp_result"] = {"value": decoded}
     return payload
 
 
