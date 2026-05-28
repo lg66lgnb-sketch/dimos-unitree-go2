@@ -356,6 +356,10 @@ def test_dashboard_map_controls_are_grouped_near_legend(tmp_path) -> None:
     assert "new id creates a route" in content
     assert "label: routeId" in content
     assert "routeTable.addEventListener(\"click\"" in content
+    assert 'data-route-run-select="' in content
+    assert "const overlayPath = Array.isArray(live.path) && live.path.length" in content
+    assert "? live.path" in content
+    assert ": data.route || []" in content
     assert "mapEditControls.addEventListener(\"click\"" in content
     assert ".map-route-table {" in content
     assert ".route-run-history, .route-run-timeline {" in content

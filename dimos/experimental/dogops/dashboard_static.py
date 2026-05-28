@@ -2872,7 +2872,12 @@ def render_dashboard_html(
         if (!live) return;
         if (data.bounds) liveOverlayBounds = data.bounds;
         const heatmapCells = renderLiveHeatmap(live.costmap);
-        const pathPoints = renderDimOSPath(live.path || live.route || data.route || []);
+        const overlayPath = Array.isArray(live.path) && live.path.length
+          ? live.path
+          : Array.isArray(live.route) && live.route.length
+            ? live.route
+            : data.route || [];
+        const pathPoints = renderDimOSPath(overlayPath);
         renderDimOSTarget(live.target);
         const qrEvents = Array.isArray(data.qr_cargo_events) ? data.qr_cargo_events : [];
         renderQrCargoMarkers(qrEvents);
