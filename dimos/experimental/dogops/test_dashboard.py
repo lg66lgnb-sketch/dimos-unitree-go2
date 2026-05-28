@@ -131,6 +131,10 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert "Waiting for /color_image" in content
     assert 'data-camera-frame' in content
     assert "/api/camera/frame.jpg" in content
+    assert '<div class="map-stack">' in content
+    assert content.index('<div class="map-stack">') < content.index('<div class="ops-stack">')
+    assert content.index('<h2>Mission Map</h2>') < content.index('<h2>DimOS Camera</h2>')
+    assert content.index('<h2>DimOS Camera</h2>') < content.index('<h2>Run Summary</h2>')
     assert 'data-map-surface' in content
     assert "map-route" in content
     assert "map-free-cell" in content

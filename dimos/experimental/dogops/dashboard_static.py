@@ -1016,6 +1016,7 @@ def render_dashboard_html(
       border-radius: 8px;
       padding: 12px;
     }}
+    .map-stack {{ display: grid; gap: 16px; }}
     .ops-stack {{ display: grid; gap: 10px; }}
     .wide {{ grid-column: 1 / -1; }}
     .metric-row {{
@@ -1707,27 +1708,29 @@ def render_dashboard_html(
     <div>State: <strong>{escape(str(run["state"]))}</strong></div>
   </header>
   <main>
-    <section class="map-panel">
-      <h2>Mission Map</h2>
-      {map_html}
-    </section>
-    <section class="camera-panel">
-      <div class="camera-header">
-        <h2>DimOS Camera</h2>
-        <span class="camera-health" data-camera-health>Waiting for /color_image</span>
-      </div>
-      <div class="camera-view">
-        <img src="about:blank" alt="Latest DimOS color_image frame" hidden data-camera-frame>
-        <div class="camera-empty" data-camera-empty>
-          <span><strong>No camera frame yet</strong>Waiting for DimOS color_image on /color_image.</span>
+    <div class="map-stack">
+      <section class="map-panel">
+        <h2>Mission Map</h2>
+        {map_html}
+      </section>
+      <section class="camera-panel">
+        <div class="camera-header">
+          <h2>DimOS Camera</h2>
+          <span class="camera-health" data-camera-health>Waiting for /color_image</span>
         </div>
-      </div>
-      <div class="camera-meta">
-        <span data-camera-topic>Topic: /color_image</span>
-        <span data-camera-shape>Frame: pending</span>
-        <span data-camera-age>Age: pending</span>
-      </div>
-    </section>
+        <div class="camera-view">
+          <img src="about:blank" alt="Latest DimOS color_image frame" hidden data-camera-frame>
+          <div class="camera-empty" data-camera-empty>
+            <span><strong>No camera frame yet</strong>Waiting for DimOS color_image on /color_image.</span>
+          </div>
+        </div>
+        <div class="camera-meta">
+          <span data-camera-topic>Topic: /color_image</span>
+          <span data-camera-shape>Frame: pending</span>
+          <span data-camera-age>Age: pending</span>
+        </div>
+      </section>
+    </div>
     <div class="ops-stack">
       <section>
         <h2>Run Summary</h2>
