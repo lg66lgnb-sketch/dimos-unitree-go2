@@ -1,0 +1,9 @@
+{
+  "name": "dimos-unitree-go2-dogops-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@rerun-io/web-viewer": "0.32.0-alpha.1"
+  }
+}

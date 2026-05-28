@@ -288,6 +288,17 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
             state = self._read_json(self.run_dir / "state.json")
             report = self._read_json(self.run_dir / "report.json")
             self._send_json(build_poi_data(state, report))
+        elif path == "/static/rerun-web-viewer.js":
+            self._send_static_asset(
+                Path(__file__).with_name("static") / "rerun-web-viewer.js",
+                "application/javascript; charset=utf-8",
+            )
+        elif path.startswith("/assets/vendor/@rerun-io/web-viewer/"):
+            relative = path.removeprefix("/assets/vendor/@rerun-io/web-viewer/")
+            self._send_static_asset(
+                _rerun_web_viewer_asset_path(relative),
+                _static_content_type(relative),
+            )
         else:
             self._send_json({"error": "not_found", "path": path}, HTTPStatus.NOT_FOUND)
 
@@ -1473,14 +1484,27 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
+        self._send_browser_isolation_headers()
         self.end_headers()
         self.wfile.write(payload)
+
+    def _send_static_asset(self, path: Path, content_type: str) -> None:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            self._send_json({"error": "missing_file", "path": str(path)}, HTTPStatus.NOT_FOUND)
+            return
+        if not resolved.exists() or not resolved.is_file():
+            self._send_json({"error": "missing_file", "path": str(path)}, HTTPStatus.NOT_FOUND)
+            return
+        self._send_file(resolved, content_type)
 
     def _send_json(self, payload: Any, status: HTTPStatus = HTTPStatus.OK) -> None:
         raw = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(raw)))
+        self._send_browser_isolation_headers()
         self.end_headers()
         self.wfile.write(raw)
 
@@ -1503,8 +1527,14 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "image/jpeg")
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Cache-Control", "no-store")
+        self._send_browser_isolation_headers()
         self.end_headers()
         self.wfile.write(payload)
+
+    def _send_browser_isolation_headers(self) -> None:
+        self.send_header("Cross-Origin-Opener-Policy", "same-origin")
+        self.send_header("Cross-Origin-Embedder-Policy", "require-corp")
+        self.send_header("Cross-Origin-Resource-Policy", "same-origin")
 
     def _read_json(self, path: Path) -> dict[str, Any]:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -1707,6 +1737,39 @@ def _origin_matches_host(origin: str, host_header: str) -> bool:
     if not _is_loopback_host(origin_host):
         return False
     return origin_host == request_host and origin_port == request_port
+
+
+def _rerun_web_viewer_asset_path(relative: str) -> Path:
+    if not relative or relative.startswith("/") or ".." in Path(relative).parts:
+        return Path("__missing__")
+    candidates = [
+        Path.cwd() / "node_modules" / "@rerun-io" / "web-viewer" / relative,
+        Path(__file__).parents[3]
+        / "node_modules"
+        / "@rerun-io"
+        / "web-viewer"
+        / relative,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+        if not candidate.suffix:
+            js_candidate = candidate.with_suffix(".js")
+            if js_candidate.exists():
+                return js_candidate
+    return candidates[0]
+
+
+def _static_content_type(relative: str) -> str:
+    if relative.endswith(".js"):
+        return "application/javascript; charset=utf-8"
+    if "." not in Path(relative).name:
+        return "application/javascript; charset=utf-8"
+    if relative.endswith(".wasm"):
+        return "application/wasm"
+    if relative.endswith(".map"):
+        return "application/json"
+    return "application/octet-stream"
 
 
 def _publish_robot_jog(

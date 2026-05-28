@@ -812,6 +812,12 @@ def render_site_map(
         )
     robot = _render_live_robot_pose()
     rerun_web_url = _trusted_rerun_web_url(os.environ.get("DOGOPS_RERUN_WEB_URL"))
+    rerun_source_url = _trusted_rerun_source_url(os.environ.get("DOGOPS_RERUN_SOURCE_URL"))
+    rerun_view_mode = _trusted_rerun_view_mode(os.environ.get("DOGOPS_RERUN_VIEW_MODE"))
+    camera_stream_url = _trusted_camera_stream_url(
+        os.environ.get("DOGOPS_CAMERA_STREAM_URL")
+        or os.environ.get("DOGOPS_GO2_CAMERA_STREAM_URL")
+    )
     rerun_web_url_attr = escape(rerun_web_url, quote=True)
     legend = (
         '<div class="map-legend">'
@@ -887,7 +893,7 @@ def render_site_map(
     )
     return f"""
       <div class="map-shell" data-map-surface>
-        {_render_rerun_surface(rerun_web_url)}
+        {_render_rerun_surface(rerun_source_url, rerun_web_url, rerun_view_mode, camera_stream_url)}
         {edit_controls}
         <svg class="site-map" role="img" aria-label="DogOps mission map"
           data-live-map-svg data-map-bounds="{bounds_attr}" data-map-authoring="{authoring_attr}"
@@ -932,7 +938,7 @@ def render_site_map(
         {layer_controls}
         {legend}
         <div class="map-workflow">
-          <a href="{rerun_web_url_attr}" target="_blank" rel="noreferrer" data-rerun-web-link>Open Rerun Web</a>
+          <a href="{rerun_web_url_attr}" target="_blank" rel="noreferrer" data-rerun-web-link>Open 3D View</a>
           <span class="map-command-status" data-map-command-status>Map command idle</span>
         </div>
         <div class="map-authoring-status" data-map-authoring-status>Map authoring idle</div>
@@ -1158,18 +1164,21 @@ def render_dashboard_html(
       border: 1px solid #1d2430;
       border-radius: 8px;
       display: grid;
-      min-height: 220px;
+      grid-template-rows: minmax(260px, 42vh);
+      height: clamp(300px, 44vh, 520px);
+      min-height: 300px;
       overflow: hidden;
       position: relative;
     }}
-    .rerun-surface iframe {{
+    .rerun-canvas {{
       background: #03060b;
-      border: 0;
       display: block;
       height: 100%;
-      min-height: 220px;
+      min-height: 0;
       width: 100%;
     }}
+    .rerun-canvas[hidden] {{ display: none; }}
+    .rerun-canvas > * {{ height: 100%; width: 100%; }}
     .rerun-standby {{
       align-items: center;
       background:
@@ -1218,6 +1227,54 @@ def render_dashboard_html(
       text-decoration: none;
     }}
     .rerun-controls button:hover, .rerun-controls a:hover {{ border-color: #52e0c4; }}
+    .viewer-offline[hidden] {{ display: none; }}
+    .live-video-panel {{
+      background: rgba(3, 6, 11, 0.88);
+      border: 1px solid #263348;
+      border-radius: 8px;
+      bottom: 12px;
+      box-shadow: 0 12px 30px rgba(0, 0, 0, 0.35);
+      color: #d8dee9;
+      display: grid;
+      gap: 6px;
+      overflow: hidden;
+      padding: 8px;
+      position: absolute;
+      right: 12px;
+      width: min(260px, calc(100% - 24px));
+      z-index: 2;
+    }}
+    .live-video-panel strong {{
+      color: #eef2f8;
+      font-size: 12px;
+      line-height: 1.1;
+    }}
+    .live-video-panel iframe, .live-video-panel img {{
+      aspect-ratio: 16 / 9;
+      background: #01030a;
+      border: 0;
+      border-radius: 5px;
+      display: block;
+      object-fit: contain;
+      width: 100%;
+    }}
+    .live-video-panel img[hidden] {{ display: none; }}
+    .live-video-placeholder {{
+      align-items: center;
+      aspect-ratio: 16 / 9;
+      background:
+        linear-gradient(135deg, rgba(82, 224, 196, 0.10), rgba(96, 165, 250, 0.08)),
+        #05070c;
+      border: 1px dashed #2d3a4f;
+      border-radius: 5px;
+      color: #94a3b8;
+      display: grid;
+      font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace;
+      justify-items: center;
+      padding: 10px;
+      text-align: center;
+    }}
+    .live-video-placeholder[hidden] {{ display: none; }}
     .site-map {{
       aspect-ratio: 23 / 14;
       background: #03060b;
@@ -1936,7 +1993,6 @@ def render_dashboard_html(
       const routeTable = document.querySelector("[data-route-table]");
       const rerunSurface = document.querySelector("[data-rerun-surface]");
       const rerunConnect = document.querySelector("[data-rerun-connect]");
-      const rerunFrame = document.querySelector("[data-rerun-frame]");
       const rerunStandby = document.querySelector("[data-rerun-standby]");
       const rerunStatus = document.querySelector("[data-rerun-status]");
       const liveMapSvg = document.querySelector("[data-live-map-svg]");
@@ -1964,6 +2020,8 @@ def render_dashboard_html(
       const cameraTopic = document.querySelector("[data-camera-topic]");
       const cameraShape = document.querySelector("[data-camera-shape]");
       const cameraAge = document.querySelector("[data-camera-age]");
+      const liveVideoFrame = document.querySelector("[data-live-video-frame]");
+      const liveVideoEmpty = document.querySelector("[data-live-video-empty]");
       const status = document.querySelector("[data-robot-status]");
       if (!controls || !status) return;
       let motionProfile = "nudge";
@@ -2127,15 +2185,25 @@ def render_dashboard_html(
       const setRerunStatus = (text) => {{
         if (rerunStatus) rerunStatus.textContent = text;
       }};
-      const connectRerunSurface = () => {{
-        if (!rerunSurface || !rerunFrame) return;
-        const url = rerunSurface.getAttribute("data-rerun-url") || "";
-        if (!url) return;
-        if (rerunFrame.getAttribute("src") !== url) {{
-          rerunFrame.setAttribute("src", url);
-        }}
+      const loadRerunViewer = async () => {{
+        if (window.DogOpsRerunWebViewer) return window.DogOpsRerunWebViewer;
+        const module = await import("/static/rerun-web-viewer.js?v=dogops-3d-view");
+        window.DogOpsRerunWebViewer = module;
+        return module;
+      }};
+      const connectRerunSurface = async () => {{
+        if (!rerunSurface) return false;
         if (rerunStandby) rerunStandby.hidden = true;
-        setRerunStatus("Rerun visualization connected");
+        setRerunStatus("Connecting 3D View...");
+        try {{
+          const viewer = await loadRerunViewer();
+          await viewer.mountDogOpsRerunViewer(rerunSurface);
+          return true;
+        }} catch (error) {{
+          if (rerunStandby) rerunStandby.hidden = false;
+          setRerunStatus(`3D View unavailable: ${{error && error.message ? error.message : error}}`);
+          return false;
+        }}
       }};
       const projectPoseWithBounds = (pose, bounds) => {{
         if (!bounds || !pose) return null;
@@ -2530,10 +2598,23 @@ def render_dashboard_html(
               cameraEmpty.hidden = false;
             }}
           }}
+          if (liveVideoFrame && liveVideoEmpty) {{
+            if (camera.received) {{
+              liveVideoFrame.src = `/api/camera/frame.jpg?view=top&ts=${{Date.now()}}`;
+              liveVideoFrame.hidden = false;
+              liveVideoEmpty.hidden = true;
+            }} else {{
+              liveVideoFrame.hidden = true;
+              liveVideoFrame.src = "about:blank";
+              liveVideoEmpty.hidden = false;
+            }}
+          }}
         }} catch (error) {{
           if (cameraHealth) cameraHealth.textContent = `Camera unavailable (${{error.message}})`;
           if (cameraFrame) cameraFrame.hidden = true;
           if (cameraEmpty) cameraEmpty.hidden = false;
+          if (liveVideoFrame) liveVideoFrame.hidden = true;
+          if (liveVideoEmpty) liveVideoEmpty.hidden = false;
         }}
       }};
       const runSelectedRoute = async (dryRun) => {{
@@ -3358,8 +3439,8 @@ def render_dashboard_html(
         await sendJogCommand(command);
       }});
       if (rerunConnect) {{
-        rerunConnect.addEventListener("click", () => {{
-          connectRerunSurface();
+        rerunConnect.addEventListener("click", async () => {{
+          await connectRerunSurface();
         }});
       }}
       if (liveMapSvg) {{
@@ -3677,19 +3758,86 @@ def _trusted_rerun_web_url(raw_url: str | None) -> str:
     return raw_url
 
 
-def _render_rerun_surface(rerun_web_url: str) -> str:
-    rerun_web_url_attr = escape(rerun_web_url, quote=True)
+def _trusted_rerun_source_url(raw_url: str | None) -> str:
+    fallback = "rerun+http://127.0.0.1:9877/proxy"
+    if not raw_url:
+        return fallback
+    if not raw_url.startswith("rerun+"):
+        return fallback
+    try:
+        parsed = urlparse(raw_url.removeprefix("rerun+"))
+    except ValueError:
+        return fallback
+    if parsed.scheme not in {"http", "https"}:
+        return fallback
+    host = (parsed.hostname or "").lower()
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        return fallback
+    return raw_url
+
+
+def _trusted_rerun_view_mode(raw_mode: str | None) -> str:
+    return "dogops-2d" if raw_mode == "dogops-2d" else "native-3d"
+
+
+def _trusted_camera_stream_url(raw_url: str | None) -> str:
+    if not raw_url:
+        return ""
+    try:
+        parsed = urlparse(raw_url)
+    except ValueError:
+        return ""
+    if parsed.scheme not in {"http", "https"}:
+        return ""
+    host = (parsed.hostname or "").lower()
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        return ""
+    return raw_url
+
+
+def _render_live_video_panel(camera_stream_url: str) -> str:
+    if camera_stream_url:
+        camera_stream_url_attr = escape(camera_stream_url, quote=True)
+        return (
+            '<div class="live-video-panel" data-live-video-panel>'
+            "<strong>Live Video</strong>"
+            f'<iframe src="{camera_stream_url_attr}" title="Dog live video stream" loading="lazy"></iframe>'
+            "</div>"
+        )
     return (
-        f'<div class="rerun-surface" data-rerun-surface data-rerun-url="{rerun_web_url_attr}">'
-        '<iframe data-rerun-frame title="Rerun Web visualization" loading="lazy"></iframe>'
+        '<div class="live-video-panel" data-live-video-panel>'
+        "<strong>Live Video</strong>"
+        '<img data-live-video-frame alt="Dog live video stream" hidden />'
+        '<div class="live-video-placeholder" data-live-video-empty>Waiting for camera stream</div>'
+        "</div>"
+    )
+
+
+def _render_rerun_surface(
+    rerun_source_url: str,
+    rerun_web_url: str,
+    rerun_view_mode: str,
+    camera_stream_url: str,
+) -> str:
+    rerun_source_url_attr = escape(rerun_source_url, quote=True)
+    rerun_web_url_attr = escape(rerun_web_url, quote=True)
+    rerun_view_mode_attr = escape(rerun_view_mode, quote=True)
+    return (
+        '<div class="rerun-surface" data-rerun-surface '
+        f'data-rerun-source-url="{rerun_source_url_attr}" '
+        f'data-rerun-view-mode="{rerun_view_mode_attr}" '
+        'data-rerun-asset-base-url="/assets/vendor/@rerun-io/web-viewer/">'
+        '<div class="rerun-canvas" data-rerun-canvas hidden></div>'
         '<div class="rerun-standby" data-rerun-standby>'
-        '<span class="rerun-chip">Rerun Web Visualization</span>'
-        '<div class="rerun-status" data-rerun-status>Rerun visualization standby</div>'
+        '<span class="rerun-chip">3D View</span>'
+        '<div class="rerun-status" data-rerun-status>3D View standby</div>'
         '<div class="rerun-controls">'
-        '<button type="button" data-rerun-connect>Connect Rerun</button>'
+        '<button type="button" data-rerun-connect>Connect 3D View</button>'
         f'<a href="{rerun_web_url_attr}" target="_blank" rel="noreferrer">Open</a>'
         "</div>"
         "</div>"
+        '<div class="viewer-offline" data-viewer-offline hidden>3D View unavailable</div>'
+        f"{_render_live_video_panel(camera_stream_url)}"
         "</div>"
     )
 

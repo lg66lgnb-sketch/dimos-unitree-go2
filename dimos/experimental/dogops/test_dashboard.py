@@ -197,10 +197,16 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert "no-go cost" in content
     assert 'data-rerun-surface' in content
     assert 'data-rerun-connect' in content
-    assert 'data-rerun-frame' in content
-    assert 'data-rerun-url=' in content
+    assert 'data-rerun-canvas' in content
+    assert 'data-rerun-source-url=' in content
+    assert 'data-rerun-view-mode="native-3d"' in content
     assert 'data-rerun-web-link' in content
-    assert "Rerun Web Visualization" in content
+    assert "3D View" in content
+    assert "Live Video" in content
+    assert "Waiting for camera stream" in content
+    assert "/api/camera/frame.jpg" in content
+    assert "/static/rerun-web-viewer.js" in content
+    assert "/assets/vendor/@rerun-io/web-viewer/" in content
     assert "connectRerunSurface" in content
     assert 'data-map-command-status' in content
     assert 'data-map-action="arm_go_to"' in content
@@ -449,6 +455,37 @@ def test_dashboard_rerun_web_url_stays_loopback_only() -> None:
     )
     assert dashboard_static._trusted_rerun_web_url("https://rerun.example.com") == fallback
     assert dashboard_static._trusted_rerun_web_url("javascript:alert(1)") == fallback
+
+
+def test_dashboard_rerun_source_url_stays_loopback_only() -> None:
+    fallback = "rerun+http://127.0.0.1:9877/proxy"
+
+    assert dashboard_static._trusted_rerun_source_url(None) == fallback
+    assert (
+        dashboard_static._trusted_rerun_source_url("rerun+http://localhost:9877/proxy")
+        == "rerun+http://localhost:9877/proxy"
+    )
+    assert (
+        dashboard_static._trusted_rerun_source_url("rerun+https://[::1]:9877/proxy")
+        == "rerun+https://[::1]:9877/proxy"
+    )
+    assert dashboard_static._trusted_rerun_source_url("http://127.0.0.1:9877/proxy") == fallback
+    assert dashboard_static._trusted_rerun_source_url("rerun+https://rerun.example.com/proxy") == fallback
+    assert dashboard_static._trusted_rerun_source_url("javascript:alert(1)") == fallback
+
+
+def test_dashboard_camera_stream_url_stays_loopback_only() -> None:
+    assert dashboard_static._trusted_camera_stream_url(None) == ""
+    assert (
+        dashboard_static._trusted_camera_stream_url("http://localhost:8080/video")
+        == "http://localhost:8080/video"
+    )
+    assert (
+        dashboard_static._trusted_camera_stream_url("https://[::1]:8080/video")
+        == "https://[::1]:8080/video"
+    )
+    assert dashboard_static._trusted_camera_stream_url("https://camera.example.com/video") == ""
+    assert dashboard_static._trusted_camera_stream_url("javascript:alert(1)") == ""
 
 
 def test_dashboard_module_writes_dashboard_and_reports_status(tmp_path) -> None:
