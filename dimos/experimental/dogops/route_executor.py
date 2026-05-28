@@ -19,7 +19,11 @@ from dimos.experimental.dogops.map_authoring import (
 )
 from dimos.experimental.dogops.models import DogOpsModel, NavAction, NavEvent
 from dimos.experimental.dogops.nav_eval import summarize_nav_events
-from dimos.experimental.dogops.route_actions import EditableRouteAction, execute_route_action
+from dimos.experimental.dogops.route_actions import (
+    EditableRouteAction,
+    ScanZoneHandler,
+    execute_route_action,
+)
 from dimos.experimental.dogops.route_run_store import RouteRunStore, new_route_run_id
 from dimos.experimental.dogops.store import DogOpsStore
 
@@ -143,6 +147,7 @@ class DogOpsRouteExecutor:
         goal_publisher: GoalPublisher | None = None,
         live_snapshot_reader: Callable[[], dict[str, Any]] | None = None,
         stop_handler: StopHandler | None = None,
+        scan_zone_handler: ScanZoneHandler | None = None,
         frame: str = "map",
         reach_radius_m: float = 0.35,
         waypoint_timeout_s: float = 20.0,
@@ -156,6 +161,7 @@ class DogOpsRouteExecutor:
         self.goal_publisher = goal_publisher
         self.live_snapshot_reader = live_snapshot_reader
         self.stop_handler = stop_handler
+        self.scan_zone_handler = scan_zone_handler
         self.frame = frame or "map"
         self.reach_radius_m = reach_radius_m
         self.waypoint_timeout_s = waypoint_timeout_s
@@ -424,6 +430,8 @@ class DogOpsRouteExecutor:
                     run_dir=self.run_dir,
                     route_run_id=state.route_run_id or "",
                     waypoint_id=waypoint.id,
+                    target_id=waypoint.target_id,
+                    scan_zone_handler=self.scan_zone_handler,
                 )
                 result_ok = result.ok
                 result_note = result.note

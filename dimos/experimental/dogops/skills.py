@@ -292,6 +292,7 @@ class DogOpsSkillContainer(Module):
             self.run_dir,
             goal_publisher=publisher,
             stop_handler=self._route_stop_handler,
+            scan_zone_handler=self.scan_zone,
             live_snapshot_reader=live_adapter.snapshot if not dry_run else None,
         )
         try:

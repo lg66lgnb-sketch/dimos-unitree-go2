@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+import json
 from pathlib import Path
 import html
 import os
@@ -40,12 +42,17 @@ class RouteActionResult(DogOpsModel):
     evidence: list[dict[str, Any]] = Field(default_factory=list)
 
 
+ScanZoneHandler = Callable[[str], str | dict[str, Any]]
+
+
 def execute_route_action(
     action: EditableRouteAction,
     *,
     run_dir: str | Path,
     route_run_id: str,
     waypoint_id: str,
+    target_id: str | None = None,
+    scan_zone_handler: ScanZoneHandler | None = None,
 ) -> RouteActionResult:
     if action.kind == "scan_tags":
         expected = [int(tag) for tag in action.args.get("expected", [])]
@@ -68,6 +75,17 @@ def execute_route_action(
         )
     if action.kind == "scan_qr":
         expected = [str(item) for item in action.args.get("expected", [])]
+        zone_id = _scan_zone_id_for_action(action, target_id=target_id, waypoint_id=waypoint_id)
+        if scan_zone_handler is not None and zone_id:
+            scan_result = _call_scan_zone(scan_zone_handler, zone_id)
+            if scan_result.get("ok") is True:
+                return _qr_result_from_scan_zone(expected, scan_result)
+            return RouteActionResult(
+                ok=False,
+                state="failed",
+                note=f"QR scan zone failed: {scan_result.get('error') or 'scan_zone_failed'}",
+                payload={"source": "scan_zone", "zone_id": zone_id, "scan_zone": scan_result},
+            )
         payloads = expected
         if not payloads and action.args.get("payload"):
             payloads = [str(action.args["payload"])]
@@ -136,6 +154,72 @@ def execute_route_action(
             payload={"source": "demo", **action.args},
         )
     return RouteActionResult(ok=False, state="failed", note=f"unsupported action: {action.kind}")
+
+
+def _scan_zone_id_for_action(
+    action: EditableRouteAction,
+    *,
+    target_id: str | None,
+    waypoint_id: str,
+) -> str:
+    for key in ("zone_id", "target_id", "target"):
+        value = action.args.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return (target_id or waypoint_id).strip()
+
+
+def _call_scan_zone(handler: ScanZoneHandler, zone_id: str) -> dict[str, Any]:
+    raw = handler(zone_id)
+    if isinstance(raw, str):
+        payload = json.loads(raw)
+    else:
+        payload = raw
+    if not isinstance(payload, dict):
+        raise ValueError("scan_zone handler returned a non-object payload")
+    return payload
+
+
+def _qr_result_from_scan_zone(
+    expected: list[str],
+    scan_result: dict[str, Any],
+) -> RouteActionResult:
+    detected_payloads = [str(item) for item in scan_result.get("package_ids") or []]
+    detected_tag_ids = [int(tag) for tag in scan_result.get("visible_tag_ids") or []]
+    zone_id = str(scan_result.get("zone_id") or "")
+    source = str(scan_result.get("source") or "scan_zone")
+    return RouteActionResult(
+        ok=True,
+        note=(
+            f"QR scan used scan_zone {zone_id} via {source}: "
+            f"{len(detected_payloads)} package payloads"
+        ),
+        payload={
+            "expected_payloads": expected,
+            "detected_payloads": detected_payloads,
+            "detected_tag_ids": detected_tag_ids,
+            "source": "scan_zone",
+            "scan_zone_source": source,
+            "zone_id": zone_id,
+            "scan_zone": scan_result,
+        },
+        evidence=[
+            {
+                "kind": "qr_detection",
+                "path": None,
+                "mime_type": "application/json",
+                "metadata": {
+                    "source": "scan_zone",
+                    "scan_zone_source": source,
+                    "zone_id": zone_id,
+                    "expected_payloads": expected,
+                    "detected_payloads": detected_payloads,
+                    "detected_tag_ids": detected_tag_ids,
+                    "scan_zone": scan_result,
+                },
+            }
+        ],
+    )
 
 
 def _capture_image_path(
