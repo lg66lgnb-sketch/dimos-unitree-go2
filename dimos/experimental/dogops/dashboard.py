@@ -1009,8 +1009,27 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
             )
             return
         command_path = self.run_dir / RERUN_COMMAND_FILENAME
+        history: list[str] = []
+        if command_path.exists():
+            try:
+                existing = json.loads(command_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                existing = {}
+            if isinstance(existing, dict):
+                history = [
+                    str(item)
+                    for item in existing.get("history", [])
+                    if isinstance(item, str)
+                ]
+                previous_action = existing.get("action")
+                if isinstance(previous_action, str) and previous_action not in history:
+                    history.append(previous_action)
+        history.append(action)
         command_path.write_text(
-            json.dumps({"action": action, "id": str(time.time_ns())}, sort_keys=True)
+            json.dumps(
+                {"action": action, "history": history[-20:], "id": str(time.time_ns())},
+                sort_keys=True,
+            )
             + "\n",
             encoding="utf-8",
         )

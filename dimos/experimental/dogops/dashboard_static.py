@@ -570,6 +570,7 @@ def render_site_map(
     report: dict[str, Any],
     *,
     authoring: dict[str, Any] | None = None,
+    route_execution: dict[str, Any] | None = None,
 ) -> str:
     map_data = build_map_data(state, report, authoring=authoring)
     if not map_data["zones"]:
@@ -664,6 +665,7 @@ def render_site_map(
         '<button type="button" data-map-edit-action="export">Export</button>'
         "</div>"
     )
+    route_execution_status = _route_execution_status_text(route_execution)
     return f"""
       <div class="map-shell" data-map-surface>
         {_render_rerun_surface(rerun_source_url, rerun_web_url)}
@@ -712,7 +714,7 @@ def render_site_map(
           <span class="map-command-status" data-map-command-status>Map command idle</span>
         </div>
         <div class="map-authoring-status" data-map-authoring-status>Map authoring idle</div>
-        <div class="map-route-execution-status" data-route-execution-status>Execution: idle</div>
+        <div class="map-route-execution-status" data-route-execution-status>{escape(route_execution_status)}</div>
         <div class="map-live-status" data-live-map-status>Live odom: waiting for Go2</div>
         <ol class="scan-strip">{scan_items}</ol>
       </div>
@@ -725,6 +727,8 @@ def render_dashboard_html(
     *,
     robot_control_token: str | None = None,
     authoring: dict[str, Any] | None = None,
+    route_execution: dict[str, Any] | None = None,
+    rerun_command: dict[str, Any] | None = None,
 ) -> str:
     run = state["run"]
     nav = report.get("nav_summary") or {}
@@ -742,9 +746,22 @@ def render_dashboard_html(
     )
     mean_target_time_metric = f"{nav.get('mean_elapsed_s', 0):.1f}s"
     route_coverage_metric = f"{float(nav.get('route_coverage', 0.0)) * 100:.0f}%"
-    map_html = render_site_map(state, report, authoring=authoring)
+    map_html = render_site_map(
+        state,
+        report,
+        authoring=authoring,
+        route_execution=route_execution,
+    )
     route_data = build_route_data(state, report, authoring=authoring)
     poi_data = build_poi_data(state, report)
+    proof_data = build_test_flow_proof(
+        state,
+        report,
+        route_data,
+        poi_data,
+        route_execution=route_execution,
+        rerun_command=rerun_command,
+    )
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -818,6 +835,8 @@ def render_dashboard_html(
     .state-resolved, .state-verified, .state-verified_closed, .state-found_ok {{ color: var(--accent); font-weight: 700; }}
     .state-open, .state-missing {{ color: var(--danger); font-weight: 700; }}
     .severity-P1 {{ color: var(--danger); font-weight: 700; }}
+    .state-captured, .state-returned, .state-pass {{ color: var(--accent); font-weight: 700; }}
+    .state-fail {{ color: var(--danger); font-weight: 700; }}
     .timeline {{ display: grid; gap: 8px; }}
     .timeline div {{ border-left: 3px solid var(--accent); padding-left: 10px; }}
     .evidence-grid {{
@@ -851,6 +870,21 @@ def render_dashboard_html(
       border-radius: 6px;
       object-fit: cover;
       width: 96px;
+    }}
+    .proof-grid {{
+      display: grid;
+      gap: 8px;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    }}
+    .proof-item {{
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fbfcfd;
+      padding: 10px 12px;
+    }}
+    .proof-item strong {{
+      display: block;
+      margin-bottom: 4px;
     }}
     .map-panel {{
       background: #07090d;
@@ -1330,6 +1364,10 @@ def render_dashboard_html(
     <div>State: <strong>{escape(str(run["state"]))}</strong></div>
   </header>
   <main>
+    <section class="wide" data-test-flow-proof>
+      <h2>Test Flow Proof</h2>
+      {test_flow_proof(proof_data)}
+    </section>
     <section class="map-panel">
       <h2>Mission Map</h2>
       {map_html}
@@ -1433,7 +1471,7 @@ def render_dashboard_html(
       <div class="evidence-grid">
         <div>
           <h2>Route Stops</h2>
-          {route_table(route_data["stops"])}
+          {route_table(route_data["stops"], poi_data)}
         </div>
         <div>
           <h2>POI Evidence</h2>
@@ -1768,6 +1806,7 @@ def render_dashboard_html(
         }}
       }};
       const refreshRouteExecution = async () => {{
+        if (!robotControlToken) return;
         if (routeExecutionPolling) return;
         routeExecutionPolling = true;
         try {{
@@ -2533,6 +2572,16 @@ def _trusted_rerun_source_url(raw_url: str | None) -> str:
     return raw_url
 
 
+def _route_execution_status_text(route_execution: dict[str, Any] | None) -> str:
+    if not route_execution or not route_execution.get("state"):
+        return "Execution: idle"
+    reached = int(route_execution.get("waypoints_reached") or 0)
+    total = int(route_execution.get("waypoints_total") or 0)
+    transport = route_execution.get("transport")
+    suffix = f" transport={transport}" if transport else ""
+    return f"Execution: {route_execution['state']} {reached}/{total}{suffix}"
+
+
 def _with_default_route_authoring(
     authoring: dict[str, Any],
     state: dict[str, Any],
@@ -2943,6 +2992,117 @@ def metric(label: str, value: object) -> str:
     )
 
 
+def build_test_flow_proof(
+    state: dict[str, Any],
+    report: dict[str, Any],
+    route_data: dict[str, Any],
+    poi_data: dict[str, Any],
+    *,
+    route_execution: dict[str, Any] | None = None,
+    rerun_command: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    nav = report.get("nav_summary") or {}
+    events = route_execution.get("events") if isinstance(route_execution, dict) else []
+    reached_targets = [
+        str(event.get("target_id"))
+        for event in events or []
+        if event.get("state") == "reached" and event.get("target_id")
+    ]
+    captures = poi_data.get("captures") or []
+    photo_captures = [
+        capture
+        for capture in captures
+        if str(capture.get("id") or "").startswith("OBS-POI-")
+        and str(capture.get("image_path") or "")
+    ]
+    photo_targets = {
+        str(capture.get("entity_id") or capture.get("zone_id") or "")
+        for capture in photo_captures
+    }
+    route_targets = [str(stop.get("target_id")) for stop in route_data.get("stops") or []]
+    poi_targets = [target for target in route_targets if target.startswith("PHOTO_POI_")]
+    home_reached = "HOME" in reached_targets or any(
+        str(event.get("target_id")) == "HOME"
+        and "dashboard simulation go_to" in str(event.get("note") or "")
+        for event in state.get("nav_events") or []
+    )
+    route_complete = (
+        isinstance(route_execution, dict)
+        and route_execution.get("state") == "completed"
+        and int(route_execution.get("waypoints_reached") or 0)
+        == int(route_execution.get("waypoints_total") or 0)
+        and int(route_execution.get("waypoints_total") or 0) > 0
+    )
+    safety_clear = (
+        route_complete
+        and route_execution.get("last_error") in {None, ""}
+        and int(nav.get("safety_stops") or 0) == 0
+    )
+    rerun_actions = [
+        str(item)
+        for item in (rerun_command or {}).get("history", [])
+        if isinstance(item, str)
+    ]
+    current_rerun_action = (rerun_command or {}).get("action")
+    if isinstance(current_rerun_action, str):
+        rerun_actions.append(current_rerun_action)
+    return [
+        {
+            "label": "Map area from scratch",
+            "ok": "replay_mapping" in rerun_actions,
+            "detail": f"3D View replay actions: {', '.join(rerun_actions) or 'not run'}",
+        },
+        {
+            "label": "Return home",
+            "ok": home_reached,
+            "detail": "HOME reached by return-home command or final route stop",
+        },
+        {
+            "label": "Avoid obstacles",
+            "ok": safety_clear,
+            "detail": (
+                f"safety_stops={int(nav.get('safety_stops') or 0)}, "
+                f"last_error={route_execution.get('last_error') if isinstance(route_execution, dict) else 'none'}"
+            ),
+        },
+        {
+            "label": "Select POIs on lower map",
+            "ok": len(poi_targets) > 0,
+            "detail": f"{len(poi_targets)} photo POI target(s): {', '.join(poi_targets) or 'none'}",
+        },
+        {
+            "label": "Visit POIs",
+            "ok": bool(poi_targets) and set(poi_targets).issubset(set(reached_targets)),
+            "detail": f"reached: {', '.join(reached_targets) or 'none'}",
+        },
+        {
+            "label": "Capture POI images",
+            "ok": bool(poi_targets) and set(poi_targets).issubset(photo_targets),
+            "detail": f"{len(photo_captures)} image evidence item(s)",
+        },
+        {
+            "label": "Return home after POIs",
+            "ok": bool(reached_targets) and reached_targets[-1] == "HOME",
+            "detail": f"final reached target: {reached_targets[-1] if reached_targets else 'none'}",
+        },
+    ]
+
+
+def test_flow_proof(items: list[dict[str, Any]]) -> str:
+    rows = []
+    for item in items:
+        ok = bool(item.get("ok"))
+        state = "pass" if ok else "fail"
+        rows.append(
+            '<div class="proof-item">'
+            f"<strong>{escape(str(item.get('label') or 'Proof'))}</strong>"
+            f'<span class="state-{state}">{state}</span>'
+            f'<div class="muted">{escape(str(item.get("detail") or ""))}</div>'
+            "</div>"
+        )
+    return '<div class="proof-grid">' + "".join(rows) + "</div>"
+
+
 def package_table(packages: list[dict[str, Any]]) -> str:
     rows = []
     for package in packages:
@@ -3027,15 +3187,26 @@ def checkpoint_table(checkpoints: list[dict[str, Any]]) -> str:
     )
 
 
-def route_table(stops: list[dict[str, Any]]) -> str:
+def route_table(stops: list[dict[str, Any]], poi_data: dict[str, Any] | None = None) -> str:
+    captured_targets = {
+        str(capture.get("entity_id") or capture.get("zone_id") or "")
+        for capture in (poi_data or {}).get("captures", [])
+        if str(capture.get("image_path") or "")
+    }
     rows = []
     for stop in stops:
-        state = "verified" if stop.get("tag_verified") else "missing"
+        target_id = str(stop["target_id"])
+        if target_id in captured_targets and target_id == "HOME":
+            state = "returned"
+        elif target_id in captured_targets:
+            state = "captured"
+        else:
+            state = "verified" if stop.get("tag_verified") else "missing"
         tag_id = stop.get("expected_tag_id")
         rows.append(
             "<tr>"
             f"<td>{escape(str(stop['sequence']))}</td>"
-            f"<td>{escape(str(stop['target_id']))}</td>"
+            f"<td>{escape(target_id)}</td>"
             f"<td>{escape(str(tag_id if tag_id is not None else 'none'))}</td>"
             f"<td>{escape(str(stop.get('retries', 0)))}</td>"
             f"<td class=\"state-{state}\">{state}</td>"
@@ -3053,7 +3224,9 @@ def poi_list(poi_data: dict[str, Any]) -> str:
     captures = poi_data.get("captures") or []
     readings = poi_data.get("readings") or []
     items = []
-    for capture in captures[:4]:
+    image_captures = [capture for capture in captures if capture.get("image_path")]
+    text_captures = [capture for capture in captures if not capture.get("image_path")]
+    for capture in [*image_captures, *text_captures][:8]:
         tags = ", ".join(str(tag_id) for tag_id in capture.get("visible_tag_ids") or []) or "none"
         incidents = capture.get("related_incident_ids") or []
         incident_text = f" / incidents {', '.join(incidents)}" if incidents else ""
@@ -3091,6 +3264,8 @@ def write_dashboard_html(run_dir: str | Path, *, robot_control_token: str | None
     root = Path(run_dir)
     state = _read_json(root / "state.json")
     report = _read_json(root / "report.json")
+    route_execution = _read_json_if_exists(root / "route_execution.json")
+    rerun_command = _read_json_if_exists(root / "rerun_command.json")
     authoring = load_map_authoring(
         root,
         site_id=str((state.get("site") or {}).get("site_id") or ""),
@@ -3103,6 +3278,8 @@ def write_dashboard_html(run_dir: str | Path, *, robot_control_token: str | None
             report,
             robot_control_token=robot_control_token,
             authoring=authoring,
+            route_execution=route_execution,
+            rerun_command=rerun_command,
         ),
         encoding="utf-8",
     )
@@ -3111,6 +3288,12 @@ def write_dashboard_html(run_dir: str | Path, *, robot_control_token: str | None
 
 def _read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _read_json_if_exists(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    return _read_json(path)
 
 
 def _latest_fact_value(observations: list[dict[str, Any]], key: str) -> object | None:

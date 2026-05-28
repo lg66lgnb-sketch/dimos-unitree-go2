@@ -199,6 +199,8 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert "INC-001" in content
     assert "Navigation Eval" in content
     assert "Route / POI Evidence" in content
+    assert "Test Flow Proof" in content
+    assert 'data-test-flow-proof' in content
     assert "Route Stops" in content
     assert "POI Evidence" in content
     assert "Robot Control" in content
@@ -1639,6 +1641,11 @@ def test_dashboard_route_follow_dry_run_uses_local_executor(tmp_path, monkeypatc
     base_url = f"http://127.0.0.1:{server.server_address[1]}"
 
     try:
+        status_mapping, mapping_result = _post_json(
+            f"{base_url}/api/rerun/replay",
+            {"action": "replay_mapping"},
+            headers=_robot_headers(server),
+        )
         status, result = _post_json(
             f"{base_url}/api/map/routes/follow",
             {"route_id": "DOGOPS_PHOTO_POI_ROUTE", "dry_run": True},
@@ -1651,11 +1658,14 @@ def test_dashboard_route_follow_dry_run_uses_local_executor(tmp_path, monkeypatc
             if str(capture["id"]).startswith("OBS-POI-")
         )
         evidence_status, evidence_body = _get_text(f"{base_url}/{poi_capture['image_path']}")
+        dashboard_status, dashboard_body = _get_text(f"{base_url}/")
     finally:
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
 
+    assert status_mapping == 200
+    assert mapping_result["ok"] is True
     assert status == 200
     assert result["ok"] is True
     assert result["transport"] == "dashboard_dry_run"
@@ -1668,6 +1678,14 @@ def test_dashboard_route_follow_dry_run_uses_local_executor(tmp_path, monkeypatc
     assert str(poi_capture["image_path"]).startswith("evidence/OBS-POI-")
     assert evidence_status == 200
     assert "<svg" in evidence_body
+    assert dashboard_status == 200
+    assert "Test Flow Proof" in dashboard_body
+    assert "Map area from scratch" in dashboard_body
+    assert "Capture POI images" in dashboard_body
+    assert "Execution: completed 4/4 transport=dry_run" in dashboard_body
+    assert dashboard_body.count("state-pass") >= 4
+    assert "captured" in dashboard_body
+    assert "returned" in dashboard_body
     assert (run_dir / "map_authoring.json").exists()
 
 
