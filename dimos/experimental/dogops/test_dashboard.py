@@ -1952,11 +1952,18 @@ def test_dashboard_robot_go_to_rejects_bad_target(tmp_path, monkeypatch) -> None
 
 
 def test_dashboard_route_follow_stop_and_status_endpoints(tmp_path, monkeypatch) -> None:
-    calls: list[tuple[str | None, bool]] = []
+    calls: list[tuple[str | None, bool, bool]] = []
     timeouts: list[float] = []
+    monkeypatch.setattr(dashboard._LIVE_MAP_ADAPTER, "snapshot", lambda: {})
 
-    def fake_follow(route_id: str | None, dry_run: bool) -> dict[str, object]:
-        calls.append((route_id, dry_run))
+    def fake_follow(
+        route_id: str | None,
+        dry_run: bool,
+        *,
+        use_planner: bool = False,
+        **_: object,
+    ) -> dict[str, object]:
+        calls.append((route_id, dry_run, use_planner))
         return {
             "transport": "dimos_mcp",
             "skill": "follow_route",
@@ -2036,7 +2043,7 @@ def test_dashboard_route_follow_stop_and_status_endpoints(tmp_path, monkeypatch)
     assert follow_result["command"] == "follow_route"
     assert follow_result["route_execution"]["state"] == "completed"  # type: ignore[index]
     assert follow_result["authoring"]["selected_route_id"] == "ROUTE_A"  # type: ignore[index]
-    assert calls == [("ROUTE_A", True)]
+    assert calls == [("ROUTE_A", True, False)]
     assert timeouts[0] == dashboard.DIMOS_ROUTE_CALL_TIMEOUT_S
     assert status_status == 200
     assert status_result["ok"] is True
@@ -2049,8 +2056,57 @@ def test_dashboard_route_follow_stop_and_status_endpoints(tmp_path, monkeypatch)
     assert stop_result["hard_stop"]["robot_ip"] == "192.168.12.1"  # type: ignore[index]
 
 
+def test_dashboard_route_follow_defaults_to_direct_for_live_runs(tmp_path, monkeypatch) -> None:
+    calls: list[tuple[str, str | None, bool]] = []
+
+    def fake_direct(
+        route_id: str | None,
+        *,
+        robot_ip: str,
+        run_dir: Path | None,
+    ) -> dict[str, object]:
+        assert robot_ip == "192.168.12.1"
+        assert run_dir == tmp_path
+        calls.append(("direct", route_id, False))
+        return {"ok": True, "transport": "direct_webrtc"}
+
+    def fake_planner(route_id: str | None, dry_run: bool) -> dict[str, object]:
+        calls.append(("planner", route_id, dry_run))
+        return {"ok": True, "transport": "dimos_mcp"}
+
+    monkeypatch.setattr(dashboard, "_run_robot_follow_route_direct", fake_direct)
+    monkeypatch.setattr(dashboard, "_run_robot_follow_route_with_planner", fake_planner)
+
+    assert dashboard._run_robot_follow_route(
+        "ROUTE_A",
+        False,
+        robot_ip="192.168.12.1",
+        run_dir=tmp_path,
+    )["transport"] == "direct_webrtc"
+    assert dashboard._run_robot_follow_route(
+        "ROUTE_A",
+        False,
+        use_planner=True,
+        robot_ip="192.168.12.1",
+        run_dir=tmp_path,
+    )["transport"] == "dimos_mcp"
+    assert dashboard._run_robot_follow_route(
+        "ROUTE_A",
+        True,
+        robot_ip="192.168.12.1",
+        run_dir=tmp_path,
+    )["transport"] == "dimos_mcp"
+    assert calls == [
+        ("direct", "ROUTE_A", False),
+        ("planner", "ROUTE_A", False),
+        ("planner", "ROUTE_A", True),
+    ]
+
+
 def test_dashboard_route_follow_reports_mcp_unavailable(tmp_path, monkeypatch) -> None:
-    def fail_follow(route_id: str | None, dry_run: bool) -> dict[str, object]:
+    monkeypatch.setattr(dashboard._LIVE_MAP_ADAPTER, "snapshot", lambda: {})
+
+    def fail_follow(route_id: str | None, dry_run: bool, **_: object) -> dict[str, object]:
         raise RuntimeError("dimos mcp call follow_route failed: no running MCP server")
 
     monkeypatch.setattr(dashboard, "_run_robot_follow_route", fail_follow)
