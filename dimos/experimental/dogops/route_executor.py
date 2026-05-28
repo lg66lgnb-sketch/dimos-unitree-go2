@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from html import escape
 import json
 import math
 import os
@@ -17,7 +18,7 @@ from dimos.experimental.dogops.map_authoring import (
     EditableRouteWaypoint,
     load_map_authoring,
 )
-from dimos.experimental.dogops.models import DogOpsModel, NavAction, NavEvent
+from dimos.experimental.dogops.models import DogOpsModel, NavAction, NavEvent, Observation, Pose2D
 from dimos.experimental.dogops.nav_eval import summarize_nav_events
 from dimos.experimental.dogops.store import DogOpsStore
 
@@ -198,6 +199,19 @@ class DogOpsRouteExecutor:
                 state.events.append(queued)
                 save_route_execution(self.run_dir, state)
                 if dry_run:
+                    state.waypoints_reached += 1
+                    state.events.append(
+                        self._event(
+                            state,
+                            waypoint,
+                            "reached",
+                            started_at,
+                            error_m=0.0,
+                            note="dry-run simulated arrival and photo capture",
+                        )
+                    )
+                    self._append_dry_run_poi_observation(waypoint)
+                    save_route_execution(self.run_dir, state)
                     continue
                 state = self._execute_waypoint(state, waypoint, started_at)
                 if state.state in {"failed", "stopped"}:
@@ -208,6 +222,7 @@ class DogOpsRouteExecutor:
                 state.active_waypoint_id = None
                 state.completed_at = self.time_fn()
                 save_route_execution(self.run_dir, state)
+                self._append_nav_events(state)
                 return state
 
             if state.state == "running":
@@ -469,6 +484,63 @@ class DogOpsRouteExecutor:
         state.nav_summary = summarize_nav_events(state.run.id, state.nav_events)
         store.write_state(state.run.id)
         store.write_report(state.run.id)
+
+    def _append_dry_run_poi_observation(self, waypoint: EditableRouteWaypoint) -> None:
+        state_path = self.run_dir / "state.json"
+        if not state_path.exists():
+            return
+        store = DogOpsStore.load_existing(self.run_dir)
+        state = store.state
+        assert state is not None
+        target_id = waypoint.target_id or waypoint.id
+        observation_id = f"OBS-POI-{len(state.observations) + 1:03d}"
+        image_path = f"evidence/{observation_id}.svg"
+        evidence_path = self.run_dir / image_path
+        evidence_path.parent.mkdir(parents=True, exist_ok=True)
+        evidence_path.write_text(
+            _dry_run_photo_svg(observation_id, target_id, waypoint.pose.x, waypoint.pose.y),
+            encoding="utf-8",
+        )
+        store.append_observation(
+            Observation(
+                id=observation_id,
+                ts=self.time_fn(),
+                run_id=state.run.id,
+                entity_id=target_id,
+                zone_id=target_id,
+                pose=Pose2D(
+                    x=waypoint.pose.x,
+                    y=waypoint.pose.y,
+                    frame=self.frame,
+                    source="dashboard_dry_run",
+                ),
+                image_path=image_path,
+                facts={
+                    "photo_poi": True,
+                    "target_id": target_id,
+                    "capture_status": "simulated",
+                },
+                source="dashboard_dry_run",
+            )
+        )
+        store.write_state(state.run.id)
+        store.write_report(state.run.id)
+
+
+def _dry_run_photo_svg(observation_id: str, target_id: str, x: float, y: float) -> str:
+    title = escape(f"{observation_id} {target_id}", quote=True)
+    target = escape(target_id)
+    coordinate = f"x={x:.2f} y={y:.2f}"
+    return f"""<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360" viewBox="0 0 640 360" role="img" aria-label="{title}">
+  <rect width="640" height="360" fill="#08111f"/>
+  <rect x="30" y="30" width="580" height="300" rx="16" fill="#0f1f33" stroke="#6ee7b7" stroke-width="3"/>
+  <circle cx="320" cy="166" r="58" fill="#1f7a8c" opacity="0.85"/>
+  <path d="M120 260 L240 184 L316 232 L398 132 L520 260 Z" fill="#2dd4bf" opacity="0.55"/>
+  <text x="54" y="76" fill="#e5e7eb" font-family="Arial, sans-serif" font-size="30" font-weight="700">{observation_id}</text>
+  <text x="54" y="116" fill="#a7f3d0" font-family="Arial, sans-serif" font-size="24">{target}</text>
+  <text x="54" y="304" fill="#d1d5db" font-family="Arial, sans-serif" font-size="20">{coordinate}</text>
+</svg>
+"""
 
 
 def route_execution_path(run_dir: str | Path) -> Path:

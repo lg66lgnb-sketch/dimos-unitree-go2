@@ -43,6 +43,11 @@ def _get_json(url: str) -> dict[str, object]:
         return json.loads(response.read().decode("utf-8"))
 
 
+def _get_text(url: str) -> tuple[int, str]:
+    with urllib.request.urlopen(url, timeout=5) as response:
+        return response.status, response.read().decode("utf-8")
+
+
 def _get_json_with_status(
     url: str,
     *,
@@ -1489,6 +1494,40 @@ def test_dashboard_robot_go_to_rejects_bad_target(tmp_path, monkeypatch) -> None
     assert result["error"] == "invalid_go_to_target"
 
 
+def test_dashboard_robot_go_to_uses_simulated_transport_in_rerun_mode(
+    tmp_path, monkeypatch
+) -> None:
+    def fail_go_to(*_: object) -> dict[str, object]:
+        raise AssertionError("rerun-sim go_to should not require DimOS MCP")
+
+    monkeypatch.setattr(dashboard, "_run_robot_go_to", fail_go_to)
+    monkeypatch.setenv("DOGOPS_RUNTIME_MODE", "rerun-sim")
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        status, result = _post_json(
+            f"{base_url}/api/robot/go_to",
+            {"command": "go_to", "x": 0.0, "y": 0.0, "source": "return_home"},
+            headers=_robot_headers(server),
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 200
+    assert result["ok"] is True
+    assert result["transport"] == "dashboard_dry_run"
+    assert result["skill"] == "go_to"
+    state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    assert state["nav_events"][-1]["target_id"] == "HOME"
+
+
 def test_dashboard_route_follow_stop_and_status_endpoints(tmp_path, monkeypatch) -> None:
     calls: list[tuple[str | None, bool]] = []
     timeouts: list[float] = []
@@ -1605,6 +1644,13 @@ def test_dashboard_route_follow_dry_run_uses_local_executor(tmp_path, monkeypatc
             {"route_id": "DOGOPS_PHOTO_POI_ROUTE", "dry_run": True},
             headers=_robot_headers(server),
         )
+        poi = _get_json(f"{base_url}/api/poi")
+        poi_capture = next(
+            capture
+            for capture in poi["captures"]  # type: ignore[index]
+            if str(capture["id"]).startswith("OBS-POI-")
+        )
+        evidence_status, evidence_body = _get_text(f"{base_url}/{poi_capture['image_path']}")
     finally:
         server.shutdown()
         server.server_close()
@@ -1615,7 +1661,13 @@ def test_dashboard_route_follow_dry_run_uses_local_executor(tmp_path, monkeypatc
     assert result["transport"] == "dashboard_dry_run"
     assert result["route_execution"]["state"] == "completed"  # type: ignore[index]
     assert result["route_execution"]["waypoints_total"] == 4  # type: ignore[index]
+    assert result["route_execution"]["waypoints_reached"] == 4  # type: ignore[index]
     assert result["authoring"]["selected_route_id"] == "DOGOPS_PHOTO_POI_ROUTE"  # type: ignore[index]
+    captures = poi["captures"]  # type: ignore[index]
+    assert any(str(capture["id"]).startswith("OBS-POI-") for capture in captures)
+    assert str(poi_capture["image_path"]).startswith("evidence/OBS-POI-")
+    assert evidence_status == 200
+    assert "<svg" in evidence_body
     assert (run_dir / "map_authoring.json").exists()
 
 

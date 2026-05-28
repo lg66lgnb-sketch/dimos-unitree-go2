@@ -515,6 +515,7 @@ def build_poi_data(state: dict[str, Any], report: dict[str, Any]) -> dict[str, A
                 "tag_id": observation.get("tag_id"),
                 "visible_tag_ids": _visible_tag_ids(observation),
                 "source": observation.get("source", "unknown"),
+                "image_path": observation.get("image_path"),
                 "related_incident_ids": related_incident_ids,
             }
         )
@@ -836,6 +837,20 @@ def render_dashboard_html(
       border-radius: 6px;
       background: #fbfcfd;
       padding: 8px 10px;
+    }}
+    .poi-capture {{
+      align-items: center;
+      display: grid;
+      gap: 0.65rem;
+      grid-template-columns: 96px 1fr;
+    }}
+    .poi-capture img {{
+      aspect-ratio: 16 / 9;
+      background: #03060b;
+      border: 1px solid #263244;
+      border-radius: 6px;
+      object-fit: cover;
+      width: 96px;
     }}
     .map-panel {{
       background: #07090d;
@@ -1422,7 +1437,7 @@ def render_dashboard_html(
         </div>
         <div>
           <h2>POI Evidence</h2>
-          {poi_list(poi_data)}
+          <div data-poi-evidence>{poi_list(poi_data)}</div>
         </div>
       </div>
     </section>
@@ -1440,6 +1455,7 @@ def render_dashboard_html(
       const rerunStandby = document.querySelector("[data-rerun-standby]");
       const rerunStatus = document.querySelector("[data-rerun-status]");
       const liveMapSvg = document.querySelector("[data-live-map-svg]");
+      const poiEvidence = document.querySelector("[data-poi-evidence]");
       const liveMapStatus = document.querySelector("[data-live-map-status]");
       const mapCommandStatus = document.querySelector("[data-map-command-status]");
       const mapAuthoringStatus = document.querySelector("[data-map-authoring-status]");
@@ -1695,6 +1711,62 @@ def render_dashboard_html(
         const error = state.last_error ? ` error=${{state.last_error}}` : "";
         return `Execution: ${{state.state}} ${{reached}}/${{total}}${{active}}${{transport}}${{error}}`;
       }};
+      const safeText = (value) => String(value == null ? "" : value);
+      const appendText = (parent, tagName, text, className = "") => {{
+        const element = document.createElement(tagName);
+        if (className) element.className = className;
+        element.textContent = safeText(text);
+        parent.appendChild(element);
+        return element;
+      }};
+      const evidenceImageSrc = (imagePath) => {{
+        const path = safeText(imagePath).replace(/^\\/+/, "");
+        return path ? `/${{path}}` : "";
+      }};
+      const renderPoiEvidence = (poi) => {{
+        if (!poiEvidence) return;
+        const list = document.createElement("ul");
+        list.className = "compact-list";
+        for (const capture of (poi.captures || []).slice(0, 8)) {{
+          const item = document.createElement("li");
+          const row = document.createElement("div");
+          row.className = "poi-capture";
+          const imageSrc = evidenceImageSrc(capture.image_path);
+          if (imageSrc) {{
+            const image = document.createElement("img");
+            image.src = imageSrc;
+            image.alt = `${{capture.id}} photo evidence`;
+            row.appendChild(image);
+          }}
+          const detail = document.createElement("div");
+          const title = appendText(detail, "strong", capture.id || "capture");
+          title.style.display = "block";
+          const tags = (capture.visible_tag_ids || []).length ? capture.visible_tag_ids.join(", ") : "none";
+          appendText(detail, "span", `${{capture.zone_id || "unknown"}} / tags ${{tags}}`);
+          row.appendChild(detail);
+          item.appendChild(row);
+          list.appendChild(item);
+        }}
+        for (const reading of (poi.readings || []).slice(0, 3)) {{
+          const item = document.createElement("li");
+          const label = reading.kind === "temperature"
+            ? `${{reading.asset_id}} ${{reading.reading_celsius}}C <= ${{reading.max_celsius}}C`
+            : `${{reading.asset_id}} ${{reading.state || "unknown"}}`;
+          appendText(item, "strong", reading.kind || "reading");
+          item.appendChild(document.createTextNode(` ${{label}}`));
+          list.appendChild(item);
+        }}
+        poiEvidence.replaceChildren(list);
+      }};
+      const refreshPoiEvidence = async () => {{
+        try {{
+          const response = await fetch("/api/poi");
+          if (!response.ok) return;
+          renderPoiEvidence(await response.json());
+        }} catch (_) {{
+          // Keep the static evidence if the live refresh is unavailable.
+        }}
+      }};
       const refreshRouteExecution = async () => {{
         if (routeExecutionPolling) return;
         routeExecutionPolling = true;
@@ -1753,7 +1825,7 @@ def render_dashboard_html(
           return;
         }}
         setMapCommandStatus("Return home target selected", "ok");
-        await sendGoToTarget({{x: Number(target.x), y: Number(target.y)}});
+        await sendGoToTarget({{x: Number(target.x), y: Number(target.y), source: "return_home"}});
       }};
       const runSelectedRoute = async (dryRun = false) => {{
         const route = selectedRoute();
@@ -1778,6 +1850,7 @@ def render_dashboard_html(
             throw new Error(result.message || result.error || "follow_route_failed");
           }}
           setRouteExecutionStatus(routeExecutionText(state), "ok");
+          await refreshPoiEvidence();
         }} catch (error) {{
           setRouteExecutionStatus(`Execution failed: ${{error.message}}`, "error");
         }} finally {{
@@ -1902,15 +1975,27 @@ def render_dashboard_html(
         }} else if (mapEditMode === "route") {{
           const current = mapAuthoring || {{}};
           const routes = Array.isArray(current.routes) ? [...current.routes] : [];
-          const route = routes.find((item) => item.id === current.selected_route_id) || routes[0] || {{id: "AUTHORED_ROUTE", label: "Authored Route", waypoints: [], mission_id: null}};
+          const route = routes.find((item) => item.id === "AUTHORED_POI_ROUTE") || {{id: "AUTHORED_POI_ROUTE", label: "Authored photo POI route", waypoints: [], mission_id: null}};
           const routeIndex = routes.indexOf(route);
-          route.waypoints = [...(route.waypoints || []), {{
+          const existingWaypoints = (route.waypoints || []).filter((waypoint) => waypoint.target_id !== "HOME");
+          const poiCount = existingWaypoints.length + 1;
+          route.waypoints = [...existingWaypoints, {{
             id: mapEditId("WP"),
-            label: `Waypoint ${{(route.waypoints || []).length + 1}}`,
+            label: `Photo POI ${{poiCount}}`,
             pose,
-            target_id: null,
+            target_id: `PHOTO_POI_${{poiCount}}`,
             required: true,
           }}];
+          const homePose = (mapAuthoring && mapAuthoring.home) || mapHomePose;
+          if (homePose) {{
+            route.waypoints.push({{
+              id: "HOME-RETURN",
+              label: "Return Home",
+              pose: {{x: Number(homePose.x), y: Number(homePose.y), source: "site_config"}},
+              target_id: "HOME",
+              required: true,
+            }});
+          }}
           routes[routeIndex >= 0 ? routeIndex : 0] = route;
           await postAuthoring("/api/map/authoring", {{...current, routes, selected_route_id: route.id}}, "PUT");
         }} else if (mapEditMode === "incident") {{
@@ -2121,7 +2206,7 @@ def render_dashboard_html(
         setMapCommandStatus(`Sending Go To x=${{target.x.toFixed(2)}} y=${{target.y.toFixed(2)}}...`, "");
         const result = await sendRobotAction(
           "/api/robot/go_to",
-          {{command: "go_to", x: target.x, y: target.y, source: "map_click"}},
+          {{command: "go_to", x: target.x, y: target.y, source: target.source || "map_click"}},
           () => `Go To sent x=${{target.x.toFixed(2)}} y=${{target.y.toFixed(2)}}`
         );
         setMapCommandStatus(
@@ -2972,11 +3057,22 @@ def poi_list(poi_data: dict[str, Any]) -> str:
         tags = ", ".join(str(tag_id) for tag_id in capture.get("visible_tag_ids") or []) or "none"
         incidents = capture.get("related_incident_ids") or []
         incident_text = f" / incidents {', '.join(incidents)}" if incidents else ""
+        image_path = str(capture.get("image_path") or "").lstrip("/")
+        image = (
+            f'<img src="/{escape(image_path, quote=True)}" '
+            f'alt="{escape(str(capture["id"]), quote=True)} photo evidence">'
+            if image_path
+            else ""
+        )
         items.append(
             "<li>"
+            '<div class="poi-capture">'
+            f"{image}"
+            "<div>"
             f"<strong>{escape(str(capture['id']))}</strong> "
-            f"{escape(str(capture.get('zone_id') or 'unknown'))} / tags {escape(tags)}"
-            f"{escape(incident_text)}"
+            f"<span>{escape(str(capture.get('zone_id') or 'unknown'))} / tags {escape(tags)}"
+            f"{escape(incident_text)}</span>"
+            "</div></div>"
             "</li>"
         )
     for reading in readings[:3]:

@@ -68,8 +68,9 @@ def test_dry_run_resolves_selected_route_without_publishing(tmp_path) -> None:
     assert state.state == "completed"
     assert state.route_id == "ROUTE_A"
     assert state.transport == "dry_run"
-    assert [event.waypoint_id for event in state.events] == ["WP-1", "WP-2"]
-    assert [event.state for event in state.events] == ["queued", "queued"]
+    assert [event.waypoint_id for event in state.events] == ["WP-1", "WP-1", "WP-2", "WP-2"]
+    assert [event.state for event in state.events] == ["queued", "reached", "queued", "reached"]
+    assert state.waypoints_reached == 2
     assert published == []
     assert load_route_execution(tmp_path).route_id == "ROUTE_A"
 

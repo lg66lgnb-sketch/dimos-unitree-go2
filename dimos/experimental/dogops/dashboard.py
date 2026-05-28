@@ -59,6 +59,7 @@ from dimos.experimental.dogops.route_executor import (
     load_route_execution,
     request_route_stop,
 )
+from dimos.experimental.dogops.models import NavAction, NavEvent
 from dimos.experimental.dogops.store import DogOpsStore
 
 try:  # pragma: no cover - exercised only inside a full DimOS checkout.
@@ -243,6 +244,8 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
                 Path(__file__).with_name("static") / "rerun-web-viewer.js",
                 "application/javascript; charset=utf-8",
             )
+        elif path.startswith("/evidence/"):
+            self._send_evidence_asset(path.removeprefix("/evidence/"))
         elif path.startswith("/assets/vendor/@rerun-io/web-viewer/"):
             relative = path.removeprefix("/assets/vendor/@rerun-io/web-viewer/")
             self._send_static_asset(
@@ -668,7 +671,9 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         state = self._read_json(self.run_dir / "state.json")
         authoring = self._load_authoring(state)
         save_map_authoring(self.run_dir, authoring)
-        return DogOpsRouteExecutor(self.run_dir).follow_route(route_id, dry_run=True)
+        result = DogOpsRouteExecutor(self.run_dir).follow_route(route_id, dry_run=True)
+        write_dashboard_html(self.run_dir, robot_control_token=self.robot_control_token)
+        return result
 
     def _route_execution_payload(
         self,
@@ -875,6 +880,19 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
             return
 
         source = str(payload.get("source") or "dashboard")
+        if os.environ.get("DOGOPS_RUNTIME_MODE") == "rerun-sim":
+            result = self._simulate_go_to(x, y, source)
+            self._send_json(
+                {
+                    "ok": True,
+                    "command": "go_to",
+                    "x": x,
+                    "y": y,
+                    "source": source,
+                    **result,
+                }
+            )
+            return
         try:
             result = _run_robot_call(lambda: _run_robot_go_to(x, y))
         except ModuleNotFoundError as exc:
@@ -910,6 +928,28 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
                 **(result or {}),
             }
         )
+
+    def _simulate_go_to(self, x: float, y: float, source: str) -> dict[str, Any]:
+        store = DogOpsStore.load_existing(self.run_dir)
+        state = store.state
+        assert state is not None
+        nav_event = NavEvent(
+            id=f"NAV-{len(state.nav_events) + 1:03d}",
+            run_id=state.run.id,
+            ts=time.time(),
+            action=NavAction.goto,
+            target_id="HOME" if source == "return_home" else source,
+            success=True,
+            elapsed_s=0.0,
+            retries=0,
+            guided=False,
+            error_m=0.0,
+            note=f"dashboard simulation go_to x={x:.2f} y={y:.2f}",
+        )
+        store.append_nav_event(nav_event)
+        store.write_state(state.run.id)
+        store.write_report(state.run.id)
+        return {"transport": "dashboard_dry_run", "skill": "go_to"}
 
     def _robot_map_start(self) -> None:
         robot_ip = self.robot_ip
@@ -1042,6 +1082,19 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "missing_file", "path": str(path)}, HTTPStatus.NOT_FOUND)
             return
         self._send_file(resolved, content_type)
+
+    def _send_evidence_asset(self, relative: str) -> None:
+        try:
+            resolved = (self.run_dir / "evidence" / relative).resolve()
+            evidence_root = (self.run_dir / "evidence").resolve()
+        except OSError:
+            self._send_json({"error": "missing_file", "path": relative}, HTTPStatus.NOT_FOUND)
+            return
+        if evidence_root not in resolved.parents:
+            self._send_json({"error": "invalid_evidence_path"}, HTTPStatus.BAD_REQUEST)
+            return
+        content_type = "image/svg+xml" if resolved.suffix == ".svg" else "application/octet-stream"
+        self._send_static_asset(resolved, content_type)
 
     def _send_json(self, payload: Any, status: HTTPStatus = HTTPStatus.OK) -> None:
         raw = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
