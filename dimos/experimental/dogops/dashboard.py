@@ -120,11 +120,11 @@ class DogOpsDashboardServer(ThreadingHTTPServer):
         *,
         live_map_adapter: DogOpsLiveMapAdapter,
     ) -> None:
-        super().__init__(server_address, handler_class)
         self.live_map_adapter = live_map_adapter
+        super().__init__(server_address, handler_class)
 
     def server_close(self) -> None:
-        stop = getattr(self.live_map_adapter, "stop", None)
+        stop = getattr(getattr(self, "live_map_adapter", None), "stop", None)
         if stop is not None:
             stop()
         with _ROBOT_SESSIONS_LOCK:

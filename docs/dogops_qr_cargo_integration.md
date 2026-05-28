@@ -135,6 +135,26 @@ DOGOPS_DASHBOARD_TOKEN=dev-qr-token \
   --url http://127.0.0.1:8765/api/qr/events
 ```
 
+To rehearse "the robot scanned this QR at this map position" without the real
+Go2, override the payload and detection pose:
+
+```bash
+DOGOPS_DASHBOARD_TOKEN=dev-qr-token \
+  uv run python scripts/dogops_post_sample_qr_event.py \
+  --url http://127.0.0.1:8765/api/qr/events \
+  --cargo-id BOX-QR-MAP-TEST \
+  --location-node-id COOLING_1 \
+  --pose-x 3.25 \
+  --pose-y 0.25 \
+  --pose-yaw 0.1
+```
+
+`/api/map` should then include a `qr_cargo_events` item whose `map_position`
+uses `robot_pose_at_detection`, and the dashboard map should render a QR cargo
+marker at that pose. If the event omits `pose-x`/`pose-y` but its
+`location_node_id` matches a DogOps zone, asset, package, or authored entity,
+the map falls back to that static node pose.
+
 Equivalent curl:
 
 ```bash

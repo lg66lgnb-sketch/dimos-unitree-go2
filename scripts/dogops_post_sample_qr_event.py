@@ -30,9 +30,57 @@ def main() -> int:
         default=os.environ.get("DOGOPS_DASHBOARD_TOKEN", ""),
         help="DogOps dashboard write token; defaults to DOGOPS_DASHBOARD_TOKEN",
     )
+    parser.add_argument(
+        "--cargo-id",
+        help="Override qr_payload.cargo_id for the posted sample event",
+    )
+    parser.add_argument(
+        "--location-node-id",
+        help="Override qr_payload.location_node_id for the posted sample event",
+    )
+    parser.add_argument(
+        "--pose-x",
+        type=float,
+        help="Map-frame x coordinate where the QR was detected",
+    )
+    parser.add_argument(
+        "--pose-y",
+        type=float,
+        help="Map-frame y coordinate where the QR was detected",
+    )
+    parser.add_argument(
+        "--pose-yaw",
+        type=float,
+        help="Map-frame yaw where the QR was detected",
+    )
     args = parser.parse_args()
 
     event = json.loads(args.event_file.read_text(encoding="utf-8"))
+    payload = event.get("qr_payload")
+    if not isinstance(payload, dict):
+        payload = {}
+    payload = dict(payload)
+    if args.cargo_id:
+        payload["cargo_id"] = args.cargo_id
+    if args.location_node_id:
+        payload["location_node_id"] = args.location_node_id
+    if payload:
+        event["qr_payload"] = payload
+        event["qr_payload_raw"] = json.dumps(payload, separators=(",", ":"))
+    if args.pose_x is not None or args.pose_y is not None or args.pose_yaw is not None:
+        pose = event.get("robot_pose_at_detection")
+        if not isinstance(pose, dict):
+            pose = {}
+        pose = dict(pose)
+        pose["frame"] = str(pose.get("frame") or "map")
+        if args.pose_x is not None:
+            pose["x"] = args.pose_x
+        if args.pose_y is not None:
+            pose["y"] = args.pose_y
+        if args.pose_yaw is not None:
+            pose["yaw"] = args.pose_yaw
+        event["robot_pose_at_detection"] = pose
+
     headers = {"Content-Type": "application/json"}
     if args.token:
         headers["X-DogOps-Control-Token"] = args.token
