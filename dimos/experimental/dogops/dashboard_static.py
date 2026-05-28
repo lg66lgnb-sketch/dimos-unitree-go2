@@ -39,18 +39,19 @@ def build_map_data(
     *,
     live_overlay: dict[str, Any] | None = None,
     authoring: dict[str, Any] | None = None,
+    include_static_site: bool = True,
 ) -> dict[str, Any]:
     site = state.get("site") or {}
     authoring = authoring or {}
     authored_entities = _authoring_entities(authoring)
     authored_incidents = _authoring_incidents(authoring)
-    zones = site.get("zones") or []
-    assets = site.get("assets") or []
-    site_packages = site.get("packages") or []
-    observations = state.get("observations") or []
-    nav_events = state.get("nav_events") or []
-    incidents = report.get("incidents") or []
-    report_packages = report.get("packages") or []
+    zones = (site.get("zones") or []) if include_static_site else []
+    assets = (site.get("assets") or []) if include_static_site else []
+    site_packages = (site.get("packages") or []) if include_static_site else []
+    observations = (state.get("observations") or []) if include_static_site else []
+    nav_events = (state.get("nav_events") or []) if include_static_site else []
+    incidents = (report.get("incidents") or []) if include_static_site else []
+    report_packages = (report.get("packages") or []) if include_static_site else []
 
     zone_points: dict[str, tuple[float, float]] = {}
     map_zones: list[dict[str, Any]] = []
@@ -297,6 +298,20 @@ def build_map_data(
     points.extend(_no_go_shape_points(authoring))
     points.extend(_live_overlay_points(live))
     bounds = _map_bounds(points)
+    has_semantic_layer = any(
+        (
+            map_zones,
+            map_assets,
+            map_packages,
+            map_route,
+            map_observations,
+            map_incidents,
+            authoring.get("no_go_shapes") or [],
+        )
+    )
+    has_heatmap_layer = bool((live.get("costmap") or {}).get("cells")) if isinstance(live, dict) else False
+    has_path_layer = bool(live.get("path") or live.get("route")) if isinstance(live, dict) else False
+    has_robot_layer = bool(live.get("robot_pose")) if isinstance(live, dict) else False
     return {
         "site_id": site.get("site_id"),
         "site_name": site.get("site_name"),
@@ -319,11 +334,15 @@ def build_map_data(
         },
         "bounds": bounds,
         "live": live,
+        "static_site_included": include_static_site,
+        "native_empty": not include_static_site
+        and not has_semantic_layer
+        and not any((has_heatmap_layer, has_path_layer, has_robot_layer)),
         "layers": {
-            "semantic": True,
-            "heatmap": bool((live.get("costmap") or {}).get("cells")) if isinstance(live, dict) else False,
-            "path": bool(live.get("path") or live.get("route")) if isinstance(live, dict) else False,
-            "robot": bool(live.get("robot_pose")) if isinstance(live, dict) else False,
+            "semantic": has_semantic_layer,
+            "heatmap": has_heatmap_layer,
+            "path": has_path_layer,
+            "robot": has_robot_layer,
         },
     }
 
@@ -453,8 +472,14 @@ def build_route_data(
     report: dict[str, Any],
     *,
     authoring: dict[str, Any] | None = None,
+    include_static_site: bool = True,
 ) -> dict[str, Any]:
-    map_data = build_map_data(state, report, authoring=authoring)
+    map_data = build_map_data(
+        state,
+        report,
+        authoring=authoring,
+        include_static_site=include_static_site,
+    )
     checkpoints = {
         str(checkpoint.get("target_id")): checkpoint
         for checkpoint in report.get("checkpoint_verifications") or []
@@ -572,8 +597,14 @@ def render_site_map(
     authoring: dict[str, Any] | None = None,
     route_execution: dict[str, Any] | None = None,
 ) -> str:
-    map_data = build_map_data(state, report, authoring=authoring)
-    if not map_data["zones"]:
+    include_static_site = _include_static_site_map()
+    map_data = build_map_data(
+        state,
+        report,
+        authoring=authoring,
+        include_static_site=include_static_site,
+    )
+    if include_static_site and not map_data["zones"]:
         return '<div class="map-empty">Map data unavailable</div>'
 
     bounds = map_data["bounds"]
@@ -667,8 +698,11 @@ def render_site_map(
         "</div>"
     )
     route_execution_status = _route_execution_status_text(route_execution)
+    static_site_attr = "true" if include_static_site else "false"
+    native_empty_attr = "true" if map_data["native_empty"] else "false"
+    semantic_hidden_attr = "" if map_data["layers"]["semantic"] else " hidden"
     return f"""
-      <div class="map-shell" data-map-surface>
+      <div class="map-shell" data-map-surface data-map-static-site="{static_site_attr}" data-map-native-empty="{native_empty_attr}">
         {_render_rerun_surface(rerun_source_url, rerun_web_url, rerun_view_mode)}
         {layer_controls}
         {edit_controls}
@@ -690,7 +724,7 @@ def render_site_map(
           </defs>
           <rect class="map-bg" x="0" y="0" width="{MAP_WIDTH}" height="{MAP_HEIGHT}" rx="8" />
           <g data-layer="heatmap" data-live-heatmap></g>
-          <g data-layer="semantic">
+          <g data-layer="semantic"{semantic_hidden_attr}>
             {floor_cells}
             {grid}
             {point_cloud}
@@ -753,7 +787,13 @@ def render_dashboard_html(
         authoring=authoring,
         route_execution=route_execution,
     )
-    route_data = build_route_data(state, report, authoring=authoring)
+    include_static_site = _include_static_site_map()
+    route_data = build_route_data(
+        state,
+        report,
+        authoring=authoring,
+        include_static_site=include_static_site,
+    )
     poi_data = build_poi_data(state, report)
     proof_data = build_test_flow_proof(
         state,
@@ -2605,6 +2645,10 @@ def _trusted_rerun_view_mode(raw_view_mode: str | None) -> str:
     return "native-3d" if raw_view_mode == "native-3d" else "dogops-2d"
 
 
+def _include_static_site_map() -> bool:
+    return _trusted_rerun_view_mode(os.environ.get("DOGOPS_RERUN_VIEW_MODE")) != "native-3d"
+
+
 def _route_execution_status_text(route_execution: dict[str, Any] | None) -> str:
     if not route_execution or not route_execution.get("state"):
         return "Execution: idle"
@@ -3308,7 +3352,8 @@ def write_dashboard_html(run_dir: str | Path, *, robot_control_token: str | None
         root,
         site_id=str((state.get("site") or {}).get("site_id") or ""),
     ).model_dump(mode="json")
-    authoring = _with_default_route_authoring(authoring, state, report)
+    if _include_static_site_map():
+        authoring = _with_default_route_authoring(authoring, state, report)
     html_path = root / "dashboard.html"
     html_path.write_text(
         render_dashboard_html(

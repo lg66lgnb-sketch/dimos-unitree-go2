@@ -119,6 +119,10 @@ def _rerun_view_mode() -> str:
     return "native-3d" if os.environ.get("DOGOPS_RERUN_VIEW_MODE") == "native-3d" else "dogops-2d"
 
 
+def _include_static_site_map() -> bool:
+    return _rerun_view_mode() != "native-3d"
+
+
 class DogOpsDashboardServer(ThreadingHTTPServer):
     def __init__(
         self,
@@ -223,6 +227,7 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
                     report,
                     live_overlay=_LIVE_MAP_ADAPTER.snapshot(),
                     authoring=authoring.model_dump(mode="json"),
+                    include_static_site=_include_static_site_map(),
                 )
             )
         elif path == "/api/map/authoring":
@@ -376,7 +381,7 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
             state = self._read_json(self.run_dir / "state.json")
         site_id = str((state.get("site") or {}).get("site_id") or "")
         authoring = load_map_authoring(self.run_dir, site_id=site_id)
-        if include_default_route and not authoring.routes:
+        if include_default_route and not authoring.routes and _include_static_site_map():
             report = self._read_json(self.run_dir / "report.json")
             authoring = _with_default_inspection_route(authoring, state, report)
         return authoring
@@ -394,6 +399,7 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
                     report,
                     live_overlay=_LIVE_MAP_ADAPTER.snapshot(),
                     authoring=payload,
+                    include_static_site=_include_static_site_map(),
                 ),
             }
         )

@@ -245,6 +245,21 @@ def test_dashboard_static_html_can_use_native_rerun_view_mode(tmp_path, monkeypa
     assert "Native 3D mapping uses the live DimOS/MuJoCo stream." in content
 
 
+def test_dashboard_native_rerun_lower_map_starts_empty(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("DOGOPS_RERUN_VIEW_MODE", "native-3d")
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+
+    content = write_dashboard_html(run_dir).read_text(encoding="utf-8")
+
+    assert 'data-map-static-site="false"' in content
+    assert 'data-map-native-empty="true"' in content
+    assert '<g data-layer="semantic" hidden>' in content
+    assert '<rect class="map-free-cell"' not in content
+    assert '<g data-edit-kind="zone" data-edit-id="HOME"' not in content
+    assert "Photo POI 1: HOME" not in content
+
+
 def test_dashboard_static_embeds_full_authoring_state(tmp_path) -> None:
     run_dir = tmp_path / "latest"
     run_offline_simulation(out=run_dir)
@@ -998,6 +1013,83 @@ def test_dashboard_map_data_bounds_include_live_overlay(tmp_path) -> None:
     assert map_data["bounds"]["y_min"] <= -40.0
     assert map_data["bounds"]["x_max"] >= 120.0
     assert map_data["bounds"]["y_max"] >= 130.0
+
+
+def test_dashboard_map_data_can_exclude_static_site_for_native_rerun(tmp_path) -> None:
+    run_dir = tmp_path / "latest"
+    state = run_offline_simulation(out=run_dir)
+    report = json.loads((run_dir / "report.json").read_text(encoding="utf-8"))
+
+    map_data = build_map_data(
+        state.model_dump(mode="json"),
+        report,
+        include_static_site=False,
+    )
+
+    assert map_data["static_site_included"] is False
+    assert map_data["native_empty"] is True
+    assert map_data["zones"] == []
+    assert map_data["assets"] == []
+    assert map_data["packages"] == []
+    assert map_data["route"] == []
+    assert map_data["observations"] == []
+    assert map_data["incidents"] == []
+    assert map_data["layers"]["semantic"] is False  # type: ignore[index]
+
+
+def test_dashboard_native_api_excludes_static_site_but_keeps_live_map(
+    tmp_path, monkeypatch
+) -> None:
+    class FakeLiveMapAdapter:
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "ok": True,
+                "source": "DimOS live LCM topics",
+                "status": "receiving",
+                "error": "",
+                "topics": {"global_costmap": {"received": True}},
+                "costmap": {
+                    "source": "DimOS live costmap",
+                    "columns": 1,
+                    "rows": 1,
+                    "cells": [{"x": 4.0, "y": 5.0, "width": 0.5, "height": 0.5, "cost": 0.7}],
+                },
+                "path": [{"x": 4.0, "y": 5.0}, {"x": 4.5, "y": 5.5}],
+                "route": [],
+                "robot_pose": {"x": 4.1, "y": 5.1, "theta_deg": 10.0, "source": "odom"},
+                "target": None,
+            }
+
+        def stop(self) -> None:
+            return None
+
+    monkeypatch.setenv("DOGOPS_RERUN_VIEW_MODE", "native-3d")
+    monkeypatch.setattr(dashboard, "_LIVE_MAP_ADAPTER", FakeLiveMapAdapter())
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        map_data = _get_json(f"{base_url}/api/map")
+        authoring = _get_json(f"{base_url}/api/map/authoring")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert authoring["routes"] == []
+    assert map_data["static_site_included"] is False
+    assert map_data["native_empty"] is False
+    assert map_data["zones"] == []
+    assert map_data["packages"] == []
+    assert map_data["observations"] == []
+    assert map_data["live"]["ok"] is True  # type: ignore[index]
+    assert map_data["layers"]["heatmap"] is True  # type: ignore[index]
+    assert map_data["layers"]["path"] is True  # type: ignore[index]
+    assert map_data["layers"]["robot"] is True  # type: ignore[index]
 
 
 def test_live_map_adapter_does_not_assume_local_dimos_checkout(monkeypatch) -> None:
