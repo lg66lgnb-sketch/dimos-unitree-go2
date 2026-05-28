@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dimos.experimental.dogops.heatmap_runs import gather_heatmap_run
+from dimos.experimental.dogops.heatmap_runs import gather_heatmap_run, heatmap_snapshot_for_route_run
 
 
 def _snapshot(cost: float) -> dict[str, object]:
@@ -46,3 +46,7 @@ def test_gather_heatmap_samples_for_duration_and_merges_max_cost(tmp_path) -> No
     cells = result["heatmap"]["costmap"]["cells"]  # type: ignore[index]
     assert cells[0]["cost"] == 0.8
     assert result["heatmap"]["area_id"] == "AISLE_1"  # type: ignore[index]
+    assert heatmap_snapshot_for_route_run(
+        tmp_path / ".dogops" / "runs" / "latest",
+        str(result["route_run_id"]),
+    )["costmap"]["cells"][0]["cost"] == 0.8
