@@ -33,7 +33,6 @@
 - Name task branches `<github-login>/<short-task>`, not `codex/...`.
 - Before committing, inspect `git diff` and commit only relevant files.
 - Before pushing, fetch again, verify branch/account, inspect commits for privacy/security issues, get explicit confirmation, and push only the current task branch.
-- If GitHub SSH returns `Permission denied (publickey)` and `ssh-add -l` shows no identities, retry with the matching GitHub `IdentityFile` from `~/.ssh/config` via `GIT_SSH_COMMAND='ssh -i <IdentityFile> -o IdentitiesOnly=yes -o AddKeysToAgent=yes -o UseKeychain=yes'`.
 - Open draft PRs for non-trivial work; include summary, checks run, failures, and risks.
 - If `gh` is available when opening a PR, pass explicit `--title` and `--body`; do not rely on defaults.
 - For PR review requests, suggest `$simple-pr-review-loop` for standard review/fix cycles or `$deep-pr-review-loop` for adversarial subagent-backed review.

@@ -263,29 +263,6 @@ class Observation(DogOpsModel):
     source: str = "simulation"
 
 
-class OperatorPointOfInterest(DogOpsModel):
-    id: str
-    label: str
-    x: float
-    y: float
-    frame_id: str = "map"
-    created_at: float
-    status: str = "planned"
-
-
-class PoiCapture(DogOpsModel):
-    id: str
-    poi_id: str
-    ts: float
-    x: float
-    y: float
-    frame_id: str = "map"
-    image_path: str | None = None
-    source: str = "robot_observe"
-    status: str = "captured"
-    note: str = ""
-
-
 class Incident(DogOpsModel):
     id: str
     run_id: str
@@ -376,8 +353,6 @@ class DogOpsState(DogOpsModel):
     nav_events: list[NavEvent] = Field(default_factory=list)
     nav_summary: NavSummary | None = None
     what_changed: list[str] = Field(default_factory=list)
-    operator_pois: list[OperatorPointOfInterest] = Field(default_factory=list)
-    poi_captures: list[PoiCapture] = Field(default_factory=list)
 
 
 class DogOpsConfig(DogOpsModel):

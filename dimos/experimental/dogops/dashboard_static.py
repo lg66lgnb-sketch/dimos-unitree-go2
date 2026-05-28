@@ -39,21 +39,21 @@ def build_map_data(
     report: dict[str, Any],
     *,
     live_overlay: dict[str, Any] | None = None,
+    heatmap_snapshot: dict[str, Any] | None = None,
     authoring: dict[str, Any] | None = None,
     qr_events: list[dict[str, Any]] | None = None,
-    include_static_site: bool = True,
 ) -> dict[str, Any]:
     site = state.get("site") or {}
     authoring = authoring or {}
     authored_entities = _authoring_entities(authoring)
     authored_incidents = _authoring_incidents(authoring)
-    zones = site.get("zones") or [] if include_static_site else []
-    assets = site.get("assets") or [] if include_static_site else []
-    site_packages = site.get("packages") or [] if include_static_site else []
-    observations = state.get("observations") or [] if include_static_site else []
-    nav_events = state.get("nav_events") or [] if include_static_site else []
-    incidents = report.get("incidents") or [] if include_static_site else []
-    report_packages = report.get("packages") or [] if include_static_site else []
+    zones = site.get("zones") or []
+    assets = site.get("assets") or []
+    site_packages = site.get("packages") or []
+    observations = state.get("observations") or []
+    nav_events = state.get("nav_events") or []
+    incidents = report.get("incidents") or []
+    report_packages = report.get("packages") or []
 
     zone_points: dict[str, tuple[float, float]] = {}
     map_zones: list[dict[str, Any]] = []
@@ -294,6 +294,7 @@ def build_map_data(
         "robot_pose": None,
         "target": None,
     }
+    live = _live_with_gathered_heatmap(live, heatmap_snapshot)
     points = [
         (item["x"], item["y"])
         for group in (map_zones, map_assets, map_packages, map_route, map_observations)
@@ -307,20 +308,9 @@ def build_map_data(
     points.extend(_no_go_shape_points(authoring))
     points.extend(_live_overlay_points(live))
     bounds = _map_bounds(points)
-    semantic_visible = bool(
-        map_zones
-        or map_assets
-        or map_packages
-        or map_observations
-        or map_incidents
-        or map_qr_cargo_events
-        or authoring.get("no_go_shapes")
-    )
     return {
         "site_id": site.get("site_id"),
         "site_name": site.get("site_name"),
-        "static_site_included": include_static_site,
-        "native_empty": not include_static_site and not semantic_visible and not _live_overlay_points(live),
         "zones": map_zones,
         "assets": map_assets,
         "packages": map_packages,
@@ -341,13 +331,51 @@ def build_map_data(
         },
         "bounds": bounds,
         "live": live,
+        "gathered_heatmap": _gathered_heatmap_summary(heatmap_snapshot),
         "layers": {
-            "semantic": semantic_visible,
+            "semantic": True,
             "heatmap": bool((live.get("costmap") or {}).get("cells")) if isinstance(live, dict) else False,
             "path": bool(live.get("path") or live.get("route")) if isinstance(live, dict) else False,
             "robot": bool(live.get("robot_pose")) if isinstance(live, dict) else False,
             "qr": bool(map_qr_cargo_events),
         },
+    }
+
+
+def _live_with_gathered_heatmap(
+    live: dict[str, Any],
+    heatmap_snapshot: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not isinstance(heatmap_snapshot, dict):
+        return live
+    costmap = heatmap_snapshot.get("costmap")
+    cells = costmap.get("cells") if isinstance(costmap, dict) else None
+    if not isinstance(cells, list) or not cells:
+        return live
+    result = dict(live)
+    result["costmap"] = {
+        **costmap,
+        "source": f"Gathered heatmap {heatmap_snapshot.get('route_run_id') or ''}".strip(),
+    }
+    result["source"] = result["costmap"]["source"]
+    result["status"] = "gathered_heatmap"
+    result["gathered_heatmap"] = _gathered_heatmap_summary(heatmap_snapshot)
+    if not result.get("ok"):
+        result["ok"] = True
+    return result
+
+
+def _gathered_heatmap_summary(snapshot: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(snapshot, dict):
+        return None
+    costmap = snapshot.get("costmap") if isinstance(snapshot.get("costmap"), dict) else {}
+    cells = costmap.get("cells") if isinstance(costmap, dict) else []
+    return {
+        "route_run_id": snapshot.get("route_run_id"),
+        "area_id": snapshot.get("area_id"),
+        "collected_at": snapshot.get("collected_at"),
+        "cells": len(cells) if isinstance(cells, list) else 0,
+        "source": snapshot.get("source"),
     }
 
 
@@ -663,27 +691,94 @@ def build_poi_data(state: dict[str, Any], report: dict[str, Any]) -> dict[str, A
     }
 
 
+def _route_action_count(route: dict[str, Any]) -> int:
+    return sum(
+        len(waypoint.get("actions") or [])
+        for waypoint in route.get("waypoints") or []
+        if isinstance(waypoint, dict)
+    )
+
+
+def _route_action_rows(route: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for waypoint in route.get("waypoints") or []:
+        if not isinstance(waypoint, dict):
+            continue
+        for action in waypoint.get("actions") or []:
+            if not isinstance(action, dict):
+                continue
+            rows.append(
+                {
+                    "waypoint": waypoint.get("label") or waypoint.get("id") or "-",
+                    "kind": action.get("kind") or "-",
+                    "label": action.get("label") or action.get("kind") or "-",
+                    "args": action.get("args") or {},
+                }
+            )
+    return rows
+
+
+def _render_saved_route_rows(authoring: dict[str, Any]) -> str:
+    routes = [route for route in authoring.get("routes") or [] if isinstance(route, dict)]
+    if not routes:
+        return '<tr><td colspan="6">No saved routes</td></tr>'
+    selected_route_id = authoring.get("selected_route_id")
+    rows: list[str] = []
+    for route in routes:
+        route_id = str(route.get("id") or "")
+        selected = route_id == selected_route_id
+        waypoints = route.get("waypoints") or []
+        rows.append(
+            f'<tr class="{"is-selected-route" if selected else ""}">'
+            f"<td><strong>{escape(str(route.get('label') or route_id))}</strong><br>"
+            f"<span>{escape(route_id or '-')}</span></td>"
+            f"<td>{'Yes' if selected else ''}</td>"
+            f"<td>{len(waypoints)}</td>"
+            f"<td>{_route_action_count(route)}</td>"
+            "<td>-</td>"
+            '<td><div class="route-table-actions">'
+            f'<button type="button" data-route-table-action="select" data-route-id="{escape(route_id, quote=True)}">Select</button>'
+            f'<button type="button" data-route-table-action="rename" data-route-id="{escape(route_id, quote=True)}">Rename</button>'
+            f'<button type="button" data-route-table-action="duplicate" data-route-id="{escape(route_id, quote=True)}">Duplicate</button>'
+            f'<button type="button" data-route-table-action="delete" data-route-id="{escape(route_id, quote=True)}">Delete</button>'
+            "</div></td></tr>"
+        )
+        if selected:
+            action_rows = _route_action_rows(route)
+            if action_rows:
+                detail = (
+                    '<ol class="route-actions-list">'
+                    + "".join(
+                        "<li>"
+                        f"<strong>{escape(str(action['waypoint']))}</strong>: "
+                        f"{escape(str(action['label']))} "
+                        f"<span>({escape(str(action['kind']))})</span> "
+                        f"<code>{escape(json.dumps(action['args'], sort_keys=True))}</code>"
+                        "</li>"
+                        for action in action_rows
+                    )
+                    + "</ol>"
+                )
+            else:
+                detail = "No actions saved for this route"
+            rows.append(f'<tr class="route-actions-subrow"><td colspan="6">{detail}</td></tr>')
+    return "".join(rows)
+
+
 def render_site_map(
     state: dict[str, Any],
     report: dict[str, Any],
     *,
     authoring: dict[str, Any] | None = None,
     qr_events: list[dict[str, Any]] | None = None,
-    include_static_site: bool = True,
 ) -> str:
-    map_data = build_map_data(
-        state,
-        report,
-        authoring=authoring,
-        qr_events=qr_events,
-        include_static_site=include_static_site,
-    )
+    map_data = build_map_data(state, report, authoring=authoring, qr_events=qr_events)
+    if not map_data["zones"]:
+        return '<div class="map-empty">Map data unavailable</div>'
 
     bounds = map_data["bounds"]
     bounds_attr = escape(json.dumps(bounds, separators=(",", ":")), quote=True)
     authoring_attr = escape(json.dumps(authoring or {}, separators=(",", ":")), quote=True)
-    static_site_attr = "true" if map_data.get("static_site_included") else "false"
-    native_empty_attr = "true" if map_data.get("native_empty") else "false"
     projector = _MapProjector(bounds)
     route_points = " ".join(
         f"{projector.x(point['x']):.1f},{projector.y(point['y']):.1f}"
@@ -709,7 +804,6 @@ def render_site_map(
         _render_qr_cargo_event(projector, event)
         for event in map_data["qr_cargo_events"]
     )
-    semantic_hidden_attr = "" if map_data["layers"]["semantic"] else " hidden"
     route = ""
     if route_points:
         route = (
@@ -717,7 +811,6 @@ def render_site_map(
             + "".join(_render_route_stop(projector, stop, index) for index, stop in enumerate(map_data["route"], 1))
         )
     robot = _render_live_robot_pose()
-    scan_items = "".join(_render_scan_item(observation) for observation in map_data["observations"])
     rerun_web_url = _trusted_rerun_web_url(os.environ.get("DOGOPS_RERUN_WEB_URL"))
     rerun_source_url = _trusted_rerun_source_url(os.environ.get("DOGOPS_RERUN_SOURCE_URL"))
     rerun_view_mode = _trusted_rerun_view_mode(os.environ.get("DOGOPS_RERUN_VIEW_MODE"))
@@ -775,11 +868,24 @@ def render_site_map(
         '<div class="map-edit-row" data-map-edit-route-row>'
         '<button type="button" data-map-edit-mode="route" aria-pressed="false">Route</button>'
         '<button type="button" data-map-edit-action="route_select">Select Route</button>'
-        '<button type="button" data-map-edit-action="run_route">Run Route</button>'
+        '<button type="button" data-map-edit-action="dry_run_route">Dry Run Route</button>'
+        '<button type="button" data-map-edit-action="run_route">Run Live Route</button>'
         '<button type="button" data-map-edit-action="stop_route">Stop Route</button>'
+        '<button type="button" data-map-edit-action="heatmap_run">Heatmap Run</button>'
         '<button type="button" data-map-edit-action="route_up">Route Up</button>'
         '<button type="button" data-map-edit-action="route_down">Route Down</button>'
         '<span class="map-route-summary" data-map-route-summary>Selected route: none. Next: Route1</span>'
+        "</div>"
+        '<div class="map-edit-row map-route-action-row" data-route-action-row hidden>'
+        '<span class="map-route-summary" data-route-action-summary>Select a waypoint to add actions</span>'
+        '<button type="button" data-route-action-kind="capture_image">Capture Image</button>'
+        '<button type="button" data-route-action-kind="gemini_inspect_image">Gemini Inspect</button>'
+        '<button type="button" data-route-action-kind="scan_qr">Scan QR</button>'
+        '<button type="button" data-route-action-kind="scan_tags">Scan Tags</button>'
+        '<button type="button" data-route-action-kind="wait">Wait</button>'
+        '<button type="button" data-route-action-kind="inspect_asset">Inspect Asset</button>'
+        '<button type="button" data-route-action-kind="verify_work_order">Verify Work Order</button>'
+        '<button type="button" data-route-action-kind="operator_prompt">Operator Prompt</button>'
         "</div>"
         "</div>"
     )
@@ -789,7 +895,6 @@ def render_site_map(
         {edit_controls}
         <svg class="site-map" role="img" aria-label="DogOps mission map"
           data-live-map-svg data-map-bounds="{bounds_attr}" data-map-authoring="{authoring_attr}"
-          data-map-static-site="{static_site_attr}" data-map-native-empty="{native_empty_attr}"
           viewBox="0 0 {MAP_WIDTH} {MAP_HEIGHT}">
           <defs>
             <filter id="dogops-map-glow" x="-50%" y="-50%" width="200%" height="200%">
@@ -805,7 +910,7 @@ def render_site_map(
           </defs>
           <rect class="map-bg" x="0" y="0" width="{MAP_WIDTH}" height="{MAP_HEIGHT}" rx="8" />
           <g data-layer="heatmap" data-live-heatmap></g>
-          <g data-layer="semantic"{semantic_hidden_attr}>
+          <g data-layer="semantic">
             {floor_cells}
             {grid}
             {point_cloud}
@@ -835,30 +940,7 @@ def render_site_map(
         </div>
         <div class="map-authoring-status" data-map-authoring-status>Map authoring idle</div>
         <div class="map-route-execution-status" data-route-execution-status>Execution: idle</div>
-        <div class="route-run-history">
-          <strong>Route Run History</strong>
-          <table>
-            <thead>
-              <tr><th>Time</th><th>Run</th><th>Route</th><th>State</th><th>Progress</th></tr>
-            </thead>
-            <tbody data-route-run-history>
-              <tr><td colspan="5">No route runs recorded</td></tr>
-            </tbody>
-          </table>
-        </div>
-        <div class="route-run-timeline">
-          <strong>Current Timeline</strong>
-          <table>
-            <thead>
-              <tr><th>#</th><th>Kind</th><th>State</th><th>Target</th><th>Note</th></tr>
-            </thead>
-            <tbody data-route-run-timeline>
-              <tr><td colspan="5">No active route timeline</td></tr>
-            </tbody>
-          </table>
-        </div>
         <div class="map-live-status" data-live-map-status>Live odom: waiting for Go2</div>
-        <ol class="scan-strip">{scan_items}</ol>
       </div>
     """
 
@@ -876,8 +958,6 @@ def render_dashboard_html(
     packages = report.get("packages") or []
     incidents = report.get("incidents") or []
     work_orders = report.get("work_orders") or []
-    checkpoints = report.get("checkpoint_verifications") or []
-    what_changed = report.get("what_changed") or []
     packages_metric = f"{report['packages_observed']}/{report['packages_expected']}"
     nav_metric = f"{nav.get('waypoints_reached', 0)}/{nav.get('waypoints_total', 0)}"
     checkpoint_metric = f"{report.get('checkpoints_verified', 0)}/{report.get('checkpoints_total', 0)}"
@@ -888,21 +968,9 @@ def render_dashboard_html(
     mean_target_time_metric = f"{nav.get('mean_elapsed_s', 0):.1f}s"
     route_coverage_metric = f"{float(nav.get('route_coverage', 0.0)) * 100:.0f}%"
     qr_events = qr_events or []
-    include_static_site = _include_static_site_map()
-    map_html = render_site_map(
-        state,
-        report,
-        authoring=authoring,
-        qr_events=qr_events,
-        include_static_site=include_static_site,
-    )
-    qr_map_data = build_map_data(
-        state,
-        report,
-        authoring=authoring,
-        qr_events=qr_events,
-        include_static_site=include_static_site,
-    )
+    map_html = render_site_map(state, report, authoring=authoring, qr_events=qr_events)
+    route_table_rows = _render_saved_route_rows(authoring or {})
+    qr_map_data = build_map_data(state, report, authoring=authoring, qr_events=qr_events)
     route_data = build_route_data(state, report, authoring=authoring)
     poi_data = build_poi_data(state, report)
     return f"""<!doctype html>
@@ -955,6 +1023,7 @@ def render_dashboard_html(
       border-radius: 8px;
       padding: 12px;
     }}
+    .map-stack {{ display: grid; gap: 16px; }}
     .ops-stack {{ display: grid; gap: 10px; }}
     .wide {{ grid-column: 1 / -1; }}
     .metric-row {{
@@ -985,6 +1054,30 @@ def render_dashboard_html(
       gap: 12px;
       grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
     }}
+    .saved-image-grid {{
+      display: grid;
+      gap: 12px;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    }}
+    .saved-image {{
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fbfcfd;
+      overflow: hidden;
+    }}
+    .saved-image img {{
+      display: block;
+      width: 100%;
+      aspect-ratio: 4 / 3;
+      object-fit: cover;
+      background: #111827;
+    }}
+    .saved-image figcaption {{
+      padding: 7px 9px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+    }}
     .compact-list {{
       display: grid;
       gap: 8px;
@@ -1007,13 +1100,70 @@ def render_dashboard_html(
     }}
     .map-panel h2 {{ color: #eef2f8; }}
     .map-shell {{ display: grid; gap: 10px; }}
+    .camera-panel {{
+      background: #07090d;
+      border-color: #1d2430;
+      color: #d8dee9;
+      display: grid;
+      gap: 10px;
+    }}
+    .camera-header {{
+      align-items: center;
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+    }}
+    .camera-header h2 {{ color: #eef2f8; }}
+    .camera-health {{ color: #fbbf24; font-weight: 650; }}
+    .camera-view {{
+      background: #03060b;
+      border: 1px solid #1d2430;
+      border-radius: 8px;
+      display: grid;
+      min-height: 260px;
+      overflow: hidden;
+      place-items: center;
+      position: relative;
+    }}
+    .camera-view img {{
+      background: #03060b;
+      height: 100%;
+      object-fit: contain;
+      width: 100%;
+    }}
+    .camera-view img[hidden] {{ display: none; }}
+    .camera-empty {{
+      align-items: center;
+      background: #03060b;
+      color: #c8d0dc;
+      display: grid;
+      inset: 0;
+      justify-items: center;
+      padding: 18px;
+      position: absolute;
+      text-align: center;
+    }}
+    .camera-empty[hidden] {{ display: none; }}
+    .camera-empty strong {{
+      color: #eef2f8;
+      display: block;
+      margin-bottom: 6px;
+    }}
+    .camera-meta {{
+      color: #c8d0dc;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      font-size: 12px;
+    }}
     .rerun-surface {{
       background: #03060b;
       border: 1px solid #1d2430;
       border-radius: 8px;
       display: grid;
-      height: clamp(320px, 38vh, 460px);
-      min-height: 320px;
+      grid-template-rows: minmax(260px, 42vh);
+      height: clamp(300px, 44vh, 520px);
+      min-height: 300px;
       overflow: hidden;
       position: relative;
     }}
@@ -1021,6 +1171,7 @@ def render_dashboard_html(
       background: #03060b;
       display: block;
       height: 100%;
+      min-height: 0;
       width: 100%;
     }}
     .rerun-canvas[hidden] {{ display: none; }}
@@ -1041,7 +1192,6 @@ def render_dashboard_html(
       text-align: center;
       z-index: 1;
     }}
-    .viewer-offline[hidden] {{ display: none; }}
     .rerun-standby[hidden] {{ display: none; }}
     .rerun-chip {{
       border: 1px solid #2d3a4f;
@@ -1074,46 +1224,54 @@ def render_dashboard_html(
       text-decoration: none;
     }}
     .rerun-controls button:hover, .rerun-controls a:hover {{ border-color: #52e0c4; }}
+    .viewer-offline[hidden] {{ display: none; }}
     .live-video-panel {{
       background: rgba(3, 6, 11, 0.88);
-      border: 1px solid #334155;
-      border-radius: 6px;
+      border: 1px solid #263348;
+      border-radius: 8px;
       bottom: 12px;
-      box-shadow: 0 14px 40px rgba(0, 0, 0, 0.35);
-      color: #e5edf5;
+      box-shadow: 0 12px 30px rgba(0, 0, 0, 0.35);
+      color: #d8dee9;
       display: grid;
-      grid-template-rows: auto 1fr;
-      min-height: 112px;
+      gap: 6px;
       overflow: hidden;
+      padding: 8px;
       position: absolute;
       right: 12px;
       width: min(260px, calc(100% - 24px));
       z-index: 2;
     }}
     .live-video-panel strong {{
-      background: rgba(15, 23, 42, 0.88);
-      border-bottom: 1px solid #334155;
-      color: #d8fff6;
+      color: #eef2f8;
       font-size: 12px;
-      padding: 6px 8px;
+      line-height: 1.1;
     }}
-    .live-video-panel iframe {{
-      background: #05070c;
+    .live-video-panel iframe, .live-video-panel img {{
+      aspect-ratio: 16 / 9;
+      background: #01030a;
       border: 0;
-      height: 100%;
-      min-height: 84px;
+      border-radius: 5px;
+      display: block;
+      object-fit: contain;
       width: 100%;
     }}
+    .live-video-panel img[hidden] {{ display: none; }}
     .live-video-placeholder {{
       align-items: center;
-      color: #a9b4c4;
-      display: flex;
+      aspect-ratio: 16 / 9;
+      background:
+        linear-gradient(135deg, rgba(82, 224, 196, 0.10), rgba(96, 165, 250, 0.08)),
+        #05070c;
+      border: 1px dashed #2d3a4f;
+      border-radius: 5px;
+      color: #94a3b8;
+      display: grid;
       font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace;
-      justify-content: center;
-      min-height: 84px;
+      justify-items: center;
       padding: 10px;
       text-align: center;
     }}
+    .live-video-placeholder[hidden] {{ display: none; }}
     .site-map {{
       aspect-ratio: 23 / 14;
       background: #03060b;
@@ -1148,7 +1306,14 @@ def render_dashboard_html(
       stroke-linejoin: round;
       stroke-width: 4;
     }}
-    .map-route-stop {{ fill: #05070c; stroke: #52e0c4; stroke-width: 2; }}
+    .map-route-stop {{ fill: #05070c; stroke: #52e0c4; stroke-width: 2; transition: fill 120ms ease, r 120ms ease, stroke-width 120ms ease; }}
+    .map-route-stop-marker {{ cursor: pointer; }}
+    .map-route-stop-marker.is-selected .map-route-stop {{
+      fill: #145c52;
+      stroke: #d8fff6;
+      stroke-width: 3;
+    }}
+    .map-route-stop-marker.is-selected .map-route-index {{ fill: #ffffff; font-size: 13px; }}
     .map-route-index {{
       dominant-baseline: central;
       fill: #d8fff6;
@@ -1329,6 +1494,71 @@ def render_dashboard_html(
       color: #d8fff6;
       font-weight: 700;
     }}
+    .map-route-action-row[hidden] {{ display: none; }}
+    .map-route-action-row {{
+      background: rgba(8, 13, 22, 0.72);
+      border: 1px solid #243244;
+      border-radius: 8px;
+      padding: 8px;
+    }}
+    .map-route-action-row button {{
+      background: #123b36;
+      border-color: #52e0c4;
+      color: #d8fff6;
+    }}
+    .map-route-table {{
+      background: #ffffff;
+      border: 1px solid #d1d5db;
+      border-radius: 8px;
+      color: #111827;
+      overflow: hidden;
+    }}
+    .map-route-table strong {{
+      display: block;
+      padding: 8px 10px;
+    }}
+    .map-route-table table {{
+      border-collapse: collapse;
+      width: 100%;
+    }}
+    .map-route-table th,
+    .map-route-table td {{
+      border-top: 1px solid #d1d5db;
+      color: #111827;
+      padding: 6px 8px;
+      text-align: left;
+      vertical-align: top;
+    }}
+    .map-route-table th {{
+      background: #f3f4f6;
+      color: #111827;
+      font-size: 11px;
+      text-transform: uppercase;
+    }}
+    .map-route-table tr.is-selected-route > td {{
+      background: #dbeafe;
+    }}
+    .route-table-actions {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }}
+    .route-table-actions button {{
+      background: #ffffff;
+      border: 1px solid #9ca3af;
+      border-radius: 999px;
+      color: #111827;
+      cursor: pointer;
+      font: inherit;
+      padding: 4px 8px;
+    }}
+    .route-actions-subrow td {{
+      background: #f9fafb;
+    }}
+    .route-actions-list {{
+      margin: 0;
+      padding-left: 18px;
+    }}
     .map-route-summary {{
       color: #a9b4c4;
       font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -1356,45 +1586,45 @@ def render_dashboard_html(
     .map-route-execution-status.ok {{ color: #86efac; }}
     .map-route-execution-status.error {{ color: #fca5a5; }}
     .route-run-history, .route-run-timeline {{
-      color: #cbd5e1;
+      background: #ffffff;
+      border: 1px solid #d1d5db;
+      border-radius: 8px;
+      color: #111827;
       display: grid;
       gap: 6px;
       font-size: 12px;
+      overflow: hidden;
     }}
-    .route-run-history strong, .route-run-timeline strong {{ color: #eef2f8; }}
     .route-run-history table, .route-run-timeline table {{
       border-collapse: collapse;
       width: 100%;
     }}
     .route-run-history th, .route-run-history td,
     .route-run-timeline th, .route-run-timeline td {{
-      border-bottom: 1px solid #1d2430;
+      border-bottom: 1px solid #d1d5db;
+      color: #111827;
       padding: 5px 4px;
       text-align: left;
       vertical-align: top;
     }}
     .route-run-history th, .route-run-timeline th {{
-      color: #93a4b8;
+      background: #f3f4f6;
+      color: #111827;
       font-size: 10px;
       text-transform: uppercase;
     }}
-    .scan-strip {{
-      color: #b8c4d4;
-      display: grid;
-      gap: 6px;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      list-style: none;
-      margin: 0;
-      padding: 0;
+    .route-run-history tr.is-selected-route > td {{
+      background: #ecfeff;
     }}
-    .scan-strip li {{
-      background: #0d1119;
-      border: 1px solid #1d2430;
-      border-radius: 6px;
-      min-height: 36px;
-      padding: 7px 9px;
+    .route-run-history button {{
+      background: #ffffff;
+      border: 1px solid #9ca3af;
+      border-radius: 999px;
+      color: #111827;
+      cursor: pointer;
+      font: inherit;
+      padding: 4px 8px;
     }}
-    .scan-strip strong {{ color: #eef2f8; }}
     .map-empty {{
       align-items: center;
       background: #101721;
@@ -1560,7 +1790,6 @@ def render_dashboard_html(
       .metric-row {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       .evidence-grid {{ grid-template-columns: 1fr; }}
       .site-map {{ min-height: 330px; }}
-      .scan-strip {{ grid-template-columns: 1fr; }}
     }}
   </style>
 </head>
@@ -1573,10 +1802,29 @@ def render_dashboard_html(
     <div>State: <strong>{escape(str(run["state"]))}</strong></div>
   </header>
   <main>
-    <section class="map-panel">
-      <h2>Mission Map</h2>
-      {map_html}
-    </section>
+    <div class="map-stack">
+      <section class="map-panel">
+        <h2>Mission Map</h2>
+        {map_html}
+      </section>
+      <section class="camera-panel">
+        <div class="camera-header">
+          <h2>DimOS Camera</h2>
+          <span class="camera-health" data-camera-health>Waiting for /color_image</span>
+        </div>
+        <div class="camera-view">
+          <img src="about:blank" alt="Latest DimOS color_image frame" hidden data-camera-frame>
+          <div class="camera-empty" data-camera-empty>
+            <span><strong>No camera frame yet</strong>Waiting for DimOS color_image on /color_image.</span>
+          </div>
+        </div>
+        <div class="camera-meta">
+          <span data-camera-topic>Topic: /color_image</span>
+          <span data-camera-shape>Frame: pending</span>
+          <span data-camera-age>Age: pending</span>
+        </div>
+      </section>
+    </div>
     <div class="ops-stack">
       <section>
         <h2>Run Summary</h2>
@@ -1602,7 +1850,9 @@ def render_dashboard_html(
           <button type="button" data-posture="sleep">Sleep</button>
         </div>
         <div class="map-controls" data-map-controls>
-          <button type="button" data-map-action="map_from_scratch">Map From Scratch</button>
+          <button type="button" data-map-action="start">Start Live Map</button>
+          <button type="button" data-map-action="gather_heatmap">Gather Heatmap</button>
+          <button type="button" data-map-action="scan_zone">Scan Zone</button>
           <button type="button" data-map-action="origin">Set Map Origin</button>
           <button type="button" data-map-action="arm_go_to" aria-pressed="false">Arm Go To</button>
         </div>
@@ -1634,22 +1884,54 @@ def render_dashboard_html(
         <div class="robot-status" data-robot-status>Idle</div>
       </section>
       <section>
-        <h2>Checkpoint Sign-In</h2>
-        {checkpoint_table(checkpoints)}
-      </section>
-      <section>
-        <h2>Mission Timeline</h2>
-        <div class="timeline">
-          <div>Inbound scan completed</div>
-          <div>COOLING_1 inspected</div>
-          <div>INC-001 / WO-001 opened</div>
-          <div>Human remediation simulated</div>
-          <div>Verification completed</div>
+        <h2>Saved Routes</h2>
+        <div class="map-route-table" data-route-table-panel>
+          <table>
+            <thead>
+              <tr><th>Route</th><th>Selected</th><th>Waypoints</th><th>Actions</th><th>Last Run</th><th>Manage</th></tr>
+            </thead>
+            <tbody data-route-table>{route_table_rows}</tbody>
+          </table>
         </div>
       </section>
       <section>
-        <h2>What Changed</h2>
-        <ul>{''.join(f"<li>{escape(str(item))}</li>" for item in what_changed)}</ul>
+        <h2>Route Run History</h2>
+        <div class="route-run-history">
+          <table>
+            <thead>
+              <tr><th>Time</th><th>Run</th><th>Route</th><th>Mode</th><th>State</th><th>Progress</th><th>Map</th></tr>
+            </thead>
+            <tbody data-route-run-history>
+              <tr><td colspan="7">No route runs recorded</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+      <section>
+        <h2>Current Run Timeline</h2>
+        <div class="route-run-timeline">
+          <table>
+            <thead>
+              <tr><th>#</th><th>Kind</th><th>State</th><th>Target</th><th>Note</th></tr>
+            </thead>
+            <tbody data-route-run-timeline>
+              <tr><td colspan="5">No active route timeline</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+      <section>
+        <h2>Gemini Vision Evidence</h2>
+        <div class="route-run-timeline">
+          <table>
+            <thead>
+              <tr><th>Waypoint</th><th>Summary</th><th>Change</th><th>Severity</th><th>Confidence</th><th>Baseline</th></tr>
+            </thead>
+            <tbody data-gemini-evidence>
+              <tr><td colspan="6">No Gemini analysis recorded</td></tr>
+            </tbody>
+          </table>
+        </div>
       </section>
     </div>
     <section class="wide">
@@ -1688,6 +1970,12 @@ def render_dashboard_html(
         </div>
       </div>
     </section>
+    <section class="wide">
+      <h2>Saved Images</h2>
+      <div class="saved-image-grid" data-saved-images>
+        <p class="muted">No saved route images yet</p>
+      </div>
+    </section>
   </main>
   <script>
     (() => {{
@@ -1697,6 +1985,9 @@ def render_dashboard_html(
       const mapControls = document.querySelector("[data-map-controls]");
       const layerControls = document.querySelector("[data-map-layer-controls]");
       const mapEditControls = document.querySelector("[data-map-edit-controls]");
+      const routeActionRow = document.querySelector("[data-route-action-row]");
+      const routeActionSummary = document.querySelector("[data-route-action-summary]");
+      const routeTable = document.querySelector("[data-route-table]");
       const rerunSurface = document.querySelector("[data-rerun-surface]");
       const rerunConnect = document.querySelector("[data-rerun-connect]");
       const rerunStandby = document.querySelector("[data-rerun-standby]");
@@ -1709,6 +2000,8 @@ def render_dashboard_html(
       const routeSummary = document.querySelector("[data-map-route-summary]");
       const routeRunHistory = document.querySelector("[data-route-run-history]");
       const routeRunTimeline = document.querySelector("[data-route-run-timeline]");
+      const geminiEvidence = document.querySelector("[data-gemini-evidence]");
+      const savedImages = document.querySelector("[data-saved-images]");
       const liveHeatmap = liveMapSvg ? liveMapSvg.querySelector("[data-live-heatmap]") : null;
       const livePath = liveMapSvg ? liveMapSvg.querySelector("[data-live-path]") : null;
       const liveTrace = liveMapSvg ? liveMapSvg.querySelector("[data-live-trace]") : null;
@@ -1718,6 +2011,14 @@ def render_dashboard_html(
       const qrCargoLayer = liveMapSvg ? liveMapSvg.querySelector("[data-qr-cargo-layer]") : null;
       const qrCargoRows = document.querySelector("[data-qr-cargo-events]");
       const qrCargoStatus = document.querySelector("[data-qr-cargo-status]");
+      const cameraFrame = document.querySelector("[data-camera-frame]");
+      const cameraEmpty = document.querySelector("[data-camera-empty]");
+      const cameraHealth = document.querySelector("[data-camera-health]");
+      const cameraTopic = document.querySelector("[data-camera-topic]");
+      const cameraShape = document.querySelector("[data-camera-shape]");
+      const cameraAge = document.querySelector("[data-camera-age]");
+      const liveVideoFrame = document.querySelector("[data-live-video-frame]");
+      const liveVideoEmpty = document.querySelector("[data-live-video-empty]");
       const status = document.querySelector("[data-robot-status]");
       if (!controls || !status) return;
       let motionProfile = "nudge";
@@ -1733,6 +2034,9 @@ def render_dashboard_html(
       let dragMapObject = null;
       let liveMapBounds = null;
       let liveOverlayBounds = null;
+      let latestRouteRuns = [];
+      let savedImageUrls = [];
+      let selectedRouteRunId = "";
       let latestQrEventsById = new Map();
       try {{
         liveMapBounds = liveMapSvg ? JSON.parse(liveMapSvg.dataset.mapBounds || "{{}}") : null;
@@ -1793,6 +2097,65 @@ def render_dashboard_html(
         const current = mapAuthoring || {{}};
         return Array.isArray(current.routes) ? current.routes : [];
       }};
+      const escapeCell = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({{
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;",
+      }}[char]));
+      const routeActionCount = (route) => (route.waypoints || []).reduce(
+        (total, waypoint) => total + ((waypoint.actions || []).length),
+        0
+      );
+      const lastRunForRoute = (routeId) => latestRouteRuns.find((run) => run.route_id === routeId);
+      const formatRouteTableTime = (seconds) => {{
+        if (!seconds) return "-";
+        try {{
+          return new Date(Number(seconds) * 1000).toLocaleTimeString();
+        }} catch (_) {{
+          return "-";
+        }}
+      }};
+      const routeActionRows = (route) => {{
+        const rows = [];
+        for (const waypoint of route.waypoints || []) {{
+          for (const action of waypoint.actions || []) {{
+            rows.push({{
+              waypoint: waypoint.label || waypoint.id || "-",
+              kind: action.kind || "-",
+              label: action.label || action.kind || "-",
+              args: action.args || {{}},
+            }});
+          }}
+        }}
+        return rows;
+      }};
+      const renderRouteTable = () => {{
+        if (!routeTable) return;
+        const current = mapAuthoring || {{}};
+        const routes = routeList();
+        if (!routes.length) {{
+          routeTable.innerHTML = '<tr><td colspan="6">No saved routes</td></tr>';
+          return;
+        }}
+        routeTable.innerHTML = routes.map((route) => {{
+          const selected = route.id === current.selected_route_id;
+          const waypoints = (route.waypoints || []).length;
+          const actions = routeActionCount(route);
+          const lastRun = lastRunForRoute(route.id);
+          const lastRunText = lastRun
+            ? `${{formatRouteTableTime(lastRun.started_at)}} / ${{lastRun.state || "-"}}`
+            : "-";
+          const mainRow = `<tr class="${{selected ? "is-selected-route" : ""}}"><td><strong>${{escapeCell(route.label || route.id)}}</strong><br><span>${{escapeCell(route.id || "-")}}</span></td><td>${{selected ? "Yes" : ""}}</td><td>${{waypoints}}</td><td>${{actions}}</td><td>${{escapeCell(lastRunText)}}</td><td><div class="route-table-actions"><button type="button" data-route-table-action="select" data-route-id="${{escapeCell(route.id)}}">Select</button><button type="button" data-route-table-action="rename" data-route-id="${{escapeCell(route.id)}}">Rename</button><button type="button" data-route-table-action="duplicate" data-route-id="${{escapeCell(route.id)}}">Duplicate</button><button type="button" data-route-table-action="delete" data-route-id="${{escapeCell(route.id)}}">Delete</button></div></td></tr>`;
+          if (!selected) return mainRow;
+          const actionRows = routeActionRows(route);
+          const detail = actionRows.length
+            ? `<ol class="route-actions-list">${{actionRows.map((action) => `<li><strong>${{escapeCell(action.waypoint)}}</strong>: ${{escapeCell(action.label)}} <span>(${{escapeCell(action.kind)}})</span> <code>${{escapeCell(JSON.stringify(action.args))}}</code></li>`).join("")}}</ol>`
+            : "No actions saved for this route";
+          return `${{mainRow}}<tr class="route-actions-subrow"><td colspan="6">${{detail}}</td></tr>`;
+        }}).join("");
+      }};
       const nextRouteId = (routes = routeList()) => {{
         const used = new Set(routes.map((route) => String(route.id || "")));
         let index = 1;
@@ -1800,11 +2163,11 @@ def render_dashboard_html(
         return `Route${{index}}`;
       }};
       const updateRouteSummary = () => {{
-        if (!routeSummary) return;
         const current = mapAuthoring || {{}};
         const routes = routeList();
         if (!routes.length) {{
-          routeSummary.textContent = `Selected route: none. Next: ${{nextRouteId(routes)}}`;
+          if (routeSummary) routeSummary.textContent = `Selected route: none. Next: ${{nextRouteId(routes)}}`;
+          renderRouteTable();
           return;
         }}
         const selected = routes.find((route) => route.id === current.selected_route_id) || null;
@@ -1812,7 +2175,8 @@ def render_dashboard_html(
           ? `${{selected.id}} (${{(selected.waypoints || []).length}} waypoint${{(selected.waypoints || []).length === 1 ? "" : "s"}})`
           : "none";
         const routeIds = routes.map((route) => route.id).join(", ");
-        routeSummary.textContent = `Selected route: ${{selectedText}}. Routes: ${{routeIds}}. Next: ${{nextRouteId(routes)}}`;
+        if (routeSummary) routeSummary.textContent = `Selected route: ${{selectedText}}. Routes: ${{routeIds}}. Next: ${{nextRouteId(routes)}}`;
+        renderRouteTable();
       }};
       updateRouteSummary();
       const setRerunStatus = (text) => {{
@@ -1821,74 +2185,22 @@ def render_dashboard_html(
       const loadRerunViewer = async () => {{
         if (window.DogOpsRerunWebViewer) return window.DogOpsRerunWebViewer;
         const module = await import("/static/rerun-web-viewer.js?v=dogops-3d-view");
+        window.DogOpsRerunWebViewer = module;
         return module;
       }};
-      const isNativeRerunView = () => rerunSurface && rerunSurface.dataset.rerunViewMode === "native-3d";
       const connectRerunSurface = async () => {{
         if (!rerunSurface) return false;
+        if (rerunStandby) rerunStandby.hidden = true;
+        setRerunStatus("Connecting 3D View...");
         try {{
-          setRerunStatus("Connecting 3D View...");
           const viewer = await loadRerunViewer();
-          await viewer.mount(rerunSurface);
-          if (rerunStandby) rerunStandby.hidden = true;
+          await viewer.mountDogOpsRerunViewer(rerunSurface);
           return true;
         }} catch (error) {{
-          setRerunStatus(`3D View unavailable: ${{error.message}}`);
+          if (rerunStandby) rerunStandby.hidden = false;
+          setRerunStatus(`3D View unavailable: ${{error && error.message ? error.message : error}}`);
           return false;
         }}
-      }};
-      const requestRerunReplay = async (action) => {{
-        try {{
-          const response = await fetch("/api/rerun/replay", {{
-            method: "POST",
-            headers: {{
-              "Content-Type": "application/json",
-              "X-DogOps-Control-Token": robotControlToken,
-            }},
-            body: JSON.stringify({{action}}),
-          }});
-          const result = await response.json();
-          if (!response.ok || result.ok === false) {{
-            throw new Error(result.message || result.error || "rerun_replay_failed");
-          }}
-          window.sessionStorage.setItem("dogops:rerun-replay", action);
-          const viewer = await loadRerunViewer();
-          if (viewer.replay) await viewer.replay(rerunSurface);
-          return result;
-        }} catch (error) {{
-          setRerunStatus(`3D View replay failed: ${{error.message}}`);
-          return null;
-        }}
-      }};
-      const mapFromScratch = async () => {{
-        setMapCommandStatus("Starting map from scratch...", "");
-        await connectRerunSurface();
-        if (isNativeRerunView()) {{
-          try {{
-            const response = await fetch("/api/map/explore/start", {{
-              method: "POST",
-              headers: {{
-                "Content-Type": "application/json",
-                "X-DogOps-Control-Token": robotControlToken,
-              }},
-              body: "{{}}",
-            }});
-            const result = await response.json();
-            if (!response.ok || result.ok === false) {{
-              throw new Error(result.message || result.error || "explore_start_failed");
-            }}
-            setMapCommandStatus("Map from scratch started using live DimOS map data", "ok");
-          }} catch (error) {{
-            setMapCommandStatus(`Map from scratch failed: ${{error.message}}`, "error");
-          }}
-        }} else {{
-          const result = await requestRerunReplay("replay_mapping");
-          setMapCommandStatus(
-            result ? "Map replay started" : "Map replay failed",
-            result ? "ok" : "error"
-          );
-        }}
-        await refreshDimOSMap();
       }};
       const projectPoseWithBounds = (pose, bounds) => {{
         if (!bounds || !pose) return null;
@@ -1978,12 +2290,36 @@ def render_dashboard_html(
         }}
         setMapAuthoringStatus(mapEditMode === "select" ? "Map authoring idle" : `Map authoring: ${{mapEditMode}}`, mapEditMode === "select" ? "" : "ok");
       }};
+      const clearRouteStopSelection = () => {{
+        if (!liveMapSvg) return;
+        liveMapSvg.querySelectorAll(".map-route-stop-marker.is-selected").forEach((item) => {{
+          item.classList.remove("is-selected");
+          const circle = item.querySelector(".map-route-stop");
+          if (circle) circle.setAttribute("r", "9");
+        }});
+      }};
+      const updateRouteActionControls = () => {{
+        const hasRouteStop = selectedMapObject && selectedMapObject.kind === "route_stop";
+        if (routeActionRow) routeActionRow.hidden = !hasRouteStop;
+        if (routeActionSummary) {{
+          routeActionSummary.textContent = hasRouteStop
+            ? `Actions for ${{selectedMapObject.id}}`
+            : "Select a waypoint to add actions";
+        }}
+      }};
       const selectMapObject = (target) => {{
         const item = target ? target.closest("[data-edit-kind][data-edit-id]") : null;
+        clearRouteStopSelection();
         selectedMapObject = item ? {{
           kind: item.getAttribute("data-edit-kind"),
           id: item.getAttribute("data-edit-id"),
         }} : null;
+        if (selectedMapObject && selectedMapObject.kind === "route_stop") {{
+          item.classList.add("is-selected");
+          const circle = item.querySelector(".map-route-stop");
+          if (circle) circle.setAttribute("r", "18");
+        }}
+        updateRouteActionControls();
         setMapAuthoringStatus(
           selectedMapObject ? `Selected ${{selectedMapObject.kind}} ${{selectedMapObject.id}}` : "Map authoring idle",
           selectedMapObject ? "ok" : ""
@@ -2060,16 +2396,31 @@ def render_dashboard_html(
         '"': "&quot;",
         "'": "&#39;",
       }}[char]));
+      const routeApiErrorText = (result, fallback) => {{
+        const error = result && result.error ? String(result.error) : "";
+        const message = result && result.message ? String(result.message) : "";
+        if (error && message) return `${{error}}: ${{message}}`;
+        return message || error || fallback;
+      }};
       const renderRouteRunHistory = (runs) => {{
         if (!routeRunHistory) return;
         if (!Array.isArray(runs) || !runs.length) {{
-          routeRunHistory.innerHTML = '<tr><td colspan="5">No route runs recorded</td></tr>';
+          routeRunHistory.innerHTML = '<tr><td colspan="7">No route runs recorded</td></tr>';
           return;
         }}
         routeRunHistory.innerHTML = runs.slice(0, 8).map((run) => {{
           const progress = `${{Number(run.waypoints_reached || 0)}}/${{Number(run.waypoints_total || 0)}} wp, ${{Number(run.actions_completed || 0)}}/${{Number(run.actions_total || 0)}} act`;
-          return `<tr><td>${{htmlEscape(formatRouteRunTime(run.started_at))}}</td><td>${{htmlEscape(run.dogops_run_id || "-")}}</td><td>${{htmlEscape(run.route_id || "-")}}</td><td>${{htmlEscape(run.state || "-")}}</td><td>${{htmlEscape(progress)}}</td></tr>`;
+          const mode = routeRunMode(run);
+          const routeRunId = htmlEscape(run.route_run_id || "");
+          const selectedClass = selectedRouteRunId && selectedRouteRunId === run.route_run_id ? ' class="is-selected-route"' : "";
+          return `<tr${{selectedClass}}><td>${{htmlEscape(formatRouteRunTime(run.started_at))}}</td><td>${{htmlEscape(run.dogops_run_id || "-")}}</td><td>${{htmlEscape(run.route_id || "-")}}</td><td>${{htmlEscape(mode)}}</td><td>${{htmlEscape(run.state || "-")}}</td><td>${{htmlEscape(progress)}}</td><td><button type="button" data-route-run-select="${{routeRunId}}">Show</button></td></tr>`;
         }}).join("");
+      }};
+      const routeRunMode = (run) => {{
+        if (run && (run.route_id === "GATHER_HEATMAP" || run.transport === "dimos_costmap_snapshot")) {{
+          return "Costmap snapshot";
+        }}
+        return run && run.dry_run ? "Dry run" : "Live";
       }};
       const renderRouteRunTimeline = (events) => {{
         if (!routeRunTimeline) return;
@@ -2082,6 +2433,83 @@ def render_dashboard_html(
           return `<tr><td>${{htmlEscape(event.sequence || "")}}</td><td>${{htmlEscape(event.kind || "-")}}</td><td>${{htmlEscape(event.state || "-")}}</td><td>${{htmlEscape(target)}}</td><td>${{htmlEscape(event.note || "")}}</td></tr>`;
         }}).join("");
       }};
+      const renderGeminiEvidence = (evidence) => {{
+        if (!geminiEvidence) return;
+        const rows = Array.isArray(evidence)
+          ? evidence.filter((item) => item.kind === "gemini_vision_analysis")
+          : [];
+        if (!rows.length) {{
+          geminiEvidence.innerHTML = '<tr><td colspan="6">No Gemini analysis recorded</td></tr>';
+          return;
+        }}
+        geminiEvidence.innerHTML = rows.slice(-6).map((item) => {{
+          const metadata = item.metadata || {{}};
+          const changed = metadata.changed === true ? "Changed" : metadata.changed === false ? "No change" : "-";
+          const confidence = Number.isFinite(Number(metadata.confidence)) ? Number(metadata.confidence).toFixed(2) : "-";
+          const baseline = `${{metadata.baseline_match || "none"}}${{metadata.baseline_evidence_id ? ` / ${{metadata.baseline_evidence_id}}` : ""}}`;
+          const summary = metadata.summary || metadata.change_summary || item.path || "-";
+          return `<tr><td>${{htmlEscape(metadata.waypoint_id || "-")}}</td><td>${{htmlEscape(summary)}}</td><td>${{htmlEscape(changed)}}</td><td>${{htmlEscape(metadata.severity || "-")}}</td><td>${{htmlEscape(confidence)}}</td><td>${{htmlEscape(baseline)}}</td></tr>`;
+        }}).join("");
+      }};
+      const renderSavedImages = async (images) => {{
+        if (!savedImages) return;
+        savedImageUrls.forEach((url) => URL.revokeObjectURL(url));
+        savedImageUrls = [];
+        const rows = Array.isArray(images) ? images.filter((item) => item.url) : [];
+        if (!rows.length) {{
+          savedImages.innerHTML = '<p class="muted">No saved route images yet</p>';
+          return;
+        }}
+        const cards = await Promise.all(rows.slice(0, 12).map(async (item) => {{
+          try {{
+            const response = await fetch(item.url, {{
+              cache: "no-store",
+              headers: {{"X-DogOps-Control-Token": robotControlToken}},
+            }});
+            if (!response.ok) throw new Error("image_fetch_failed");
+            const blob = await response.blob();
+            const url = URL.createObjectURL(blob);
+            savedImageUrls.push(url);
+            const metadata = item.metadata || {{}};
+            const runLabel = item.dogops_run_id || item.route_run_id || "-";
+            const waypoint = metadata.waypoint_id || "-";
+            const source = metadata.source || "image";
+            return `<figure class="saved-image"><img src="${{url}}" alt="Saved route image"><figcaption>Run ${{htmlEscape(runLabel)}}<br>${{htmlEscape(waypoint)}} / ${{htmlEscape(source)}}</figcaption></figure>`;
+          }} catch (_) {{
+            return "";
+          }}
+        }}));
+        savedImages.innerHTML = cards.filter(Boolean).join("") || '<p class="muted">No saved route images available</p>';
+      }};
+      const selectRouteRunOnMap = async (routeRunId) => {{
+        if (!routeRunId) return;
+        try {{
+          const response = await fetch("/api/route-runs/" + encodeURIComponent(routeRunId), {{
+            cache: "no-store",
+            headers: {{"X-DogOps-Control-Token": robotControlToken}},
+          }});
+          const detail = await response.json();
+          if (!response.ok || detail.ok === false) {{
+            throw new Error(routeApiErrorText(detail, "route_run_detail_failed"));
+          }}
+          selectedRouteRunId = routeRunId;
+          renderRouteRunTimeline(detail.timeline || detail.events || []);
+          if (detail.map) {{
+            updateDimOSMapLayers(detail.map);
+            const heatmap = detail.map.gathered_heatmap;
+            const cells = heatmap ? Number(heatmap.cells || 0) : 0;
+            setMapCommandStatus(
+              `Showing route run ${{routeRunId}}${{cells ? ` with saved heatmap (${{cells}} cells)` : ""}}`,
+              "ok"
+            );
+          }} else {{
+            setMapCommandStatus(`Route run ${{routeRunId}} has no saved map files`, "error");
+          }}
+          renderRouteRunHistory(latestRouteRuns);
+        }} catch (error) {{
+          setMapCommandStatus(`Route run load failed: ${{error.message}}`, "error");
+        }}
+      }};
       const refreshRouteRunHistory = async () => {{
         try {{
           const currentResponse = await fetch("/api/route-runs/current", {{
@@ -2091,6 +2519,7 @@ def render_dashboard_html(
           const current = await currentResponse.json();
           if (currentResponse.ok && current.ok !== false) {{
             renderRouteRunTimeline(current.timeline || current.events || []);
+            renderGeminiEvidence(current.evidence || []);
           }}
           const listResponse = await fetch("/api/route-runs", {{
             cache: "no-store",
@@ -2098,7 +2527,17 @@ def render_dashboard_html(
           }});
           const list = await listResponse.json();
           if (listResponse.ok && list.ok !== false) {{
+            latestRouteRuns = Array.isArray(list.route_runs) ? list.route_runs : [];
             renderRouteRunHistory(list.route_runs || []);
+            renderRouteTable();
+          }}
+          const imagesResponse = await fetch("/api/route-runs/images", {{
+            cache: "no-store",
+            headers: {{"X-DogOps-Control-Token": robotControlToken}},
+          }});
+          const imageList = await imagesResponse.json();
+          if (imagesResponse.ok && imageList.ok !== false) {{
+            await renderSavedImages(imageList.images || []);
           }}
         }} catch (_) {{
           // Keep the latest rendered history visible if polling fails.
@@ -2114,7 +2553,7 @@ def render_dashboard_html(
           }});
           const result = await response.json();
           if (!response.ok || result.ok === false) {{
-            throw new Error(result.message || result.error || "route_status_failed");
+            throw new Error(routeApiErrorText(result, "route_status_failed"));
           }}
           const state = result.route_execution || {{}};
           setRouteExecutionStatus(routeExecutionText(state), state.state === "failed" ? "error" : "ok");
@@ -2125,13 +2564,64 @@ def render_dashboard_html(
           routeExecutionPolling = false;
         }}
       }};
-      const runSelectedRoute = async () => {{
+      const updateCamera = async () => {{
+        try {{
+          const response = await fetch("/api/camera/status");
+          const camera = await response.json();
+          if (cameraTopic) cameraTopic.textContent = `Topic: ${{camera.topic || "/color_image"}}`;
+          if (cameraShape) {{
+            cameraShape.textContent = camera.received
+              ? `Frame: ${{camera.width}}x${{camera.height}} ${{camera.format || ""}}`
+              : "Frame: pending";
+          }}
+          if (cameraAge) {{
+            cameraAge.textContent = camera.age_s === null || camera.age_s === undefined
+              ? "Age: pending"
+              : `Age: ${{camera.age_s}}s`;
+          }}
+          if (cameraHealth) {{
+            cameraHealth.textContent = camera.received
+              ? "Receiving color_image"
+              : `Waiting for ${{camera.topic || "/color_image"}}`;
+          }}
+          if (cameraFrame && cameraEmpty) {{
+            if (camera.received) {{
+              cameraFrame.src = `/api/camera/frame.jpg?ts=${{Date.now()}}`;
+              cameraFrame.hidden = false;
+              cameraEmpty.hidden = true;
+            }} else {{
+              cameraFrame.hidden = true;
+              cameraFrame.src = "about:blank";
+              cameraEmpty.hidden = false;
+            }}
+          }}
+          if (liveVideoFrame && liveVideoEmpty) {{
+            if (camera.received) {{
+              liveVideoFrame.src = `/api/camera/frame.jpg?view=top&ts=${{Date.now()}}`;
+              liveVideoFrame.hidden = false;
+              liveVideoEmpty.hidden = true;
+            }} else {{
+              liveVideoFrame.hidden = true;
+              liveVideoFrame.src = "about:blank";
+              liveVideoEmpty.hidden = false;
+            }}
+          }}
+        }} catch (error) {{
+          if (cameraHealth) cameraHealth.textContent = `Camera unavailable (${{error.message}})`;
+          if (cameraFrame) cameraFrame.hidden = true;
+          if (cameraEmpty) cameraEmpty.hidden = false;
+          if (liveVideoFrame) liveVideoFrame.hidden = true;
+          if (liveVideoEmpty) liveVideoEmpty.hidden = false;
+        }}
+      }};
+      const runSelectedRoute = async (dryRun) => {{
         const route = selectedRoute();
         if (!route) {{
           setRouteExecutionStatus("Execution: select or author a route first", "error");
           return;
         }}
-        setRouteExecutionStatus(`Execution: starting ${{route.id}}...`, "");
+        const modeText = dryRun ? "dry run" : "live run";
+        setRouteExecutionStatus(`Execution: starting ${{modeText}} ${{route.id}}...`, "");
         try {{
           const response = await fetch("/api/map/routes/follow", {{
             method: "POST",
@@ -2139,16 +2629,16 @@ def render_dashboard_html(
               "Content-Type": "application/json",
               "X-DogOps-Control-Token": robotControlToken,
             }},
-            body: JSON.stringify({{route_id: route.id, dry_run: false}}),
+            body: JSON.stringify({{route_id: route.id, dry_run: !!dryRun}}),
           }});
           const result = await response.json();
           const state = (result.mcp_result && result.mcp_result.route_execution) || result.route_execution || {{}};
           if (!response.ok || result.ok === false) {{
-            throw new Error(result.message || result.error || "follow_route_failed");
+            throw new Error(routeApiErrorText(result, "follow_route_failed"));
           }}
           setRouteExecutionStatus(routeExecutionText(state), "ok");
         }} catch (error) {{
-          setRouteExecutionStatus(`Execution failed: ${{error.message}}`, "error");
+          setRouteExecutionStatus(`Execution failed (${{modeText}}): ${{error.message}}`, "error");
         }} finally {{
           await refreshRouteExecution();
         }}
@@ -2166,7 +2656,7 @@ def render_dashboard_html(
           }});
           const result = await response.json();
           if (!response.ok || result.ok === false) {{
-            throw new Error(result.message || result.error || "stop_route_failed");
+            throw new Error(routeApiErrorText(result, "stop_route_failed"));
           }}
           setRouteExecutionStatus(routeExecutionText(result.route_execution || {{}}), "ok");
         }} catch (error) {{
@@ -2179,13 +2669,72 @@ def render_dashboard_html(
         if (!route || !Array.isArray(route.waypoints)) return -1;
         return route.waypoints.findIndex((waypoint) => waypoint.id === targetId || waypoint.target_id === targetId);
       }};
-      const saveRoutes = async (routes, selectedRouteId = null) => {{
+      const saveRoutes = async (routes, selectedRouteId = undefined) => {{
         const current = mapAuthoring || {{}};
         await postAuthoring("/api/map/authoring", {{
           ...current,
           routes,
-          selected_route_id: selectedRouteId || current.selected_route_id || (routes[0] && routes[0].id) || null,
+          selected_route_id: selectedRouteId !== undefined ? selectedRouteId : current.selected_route_id || (routes[0] && routes[0].id) || null,
         }}, "PUT");
+      }};
+      const routeById = (routeId) => routeList().find((route) => route.id === routeId);
+      const selectRouteFromTable = async (routeId) => {{
+        if (!routeById(routeId)) return;
+        await postAuthoring(`/api/map/routes/${{encodeURIComponent(routeId)}}/select`, {{}});
+      }};
+      const renameRouteFromTable = async (routeId) => {{
+        const routes = routeList();
+        const route = routes.find((item) => item.id === routeId);
+        if (!route) return;
+        const newId = (window.prompt("Route id", route.id) || "").trim();
+        if (!newId) return;
+        if (newId !== route.id && routes.some((item) => item.id === newId)) {{
+          setMapAuthoringStatus("Route id already exists", "error");
+          return;
+        }}
+        const newLabel = (window.prompt("Route label", route.label || newId) || newId).trim() || newId;
+        const renamed = routes.map((item) => item.id === routeId ? {{...item, id: newId, label: newLabel}} : item);
+        const selectedRouteId = (mapAuthoring || {{}}).selected_route_id === routeId ? newId : (mapAuthoring || {{}}).selected_route_id;
+        await saveRoutes(renamed, selectedRouteId);
+      }};
+      const duplicateRouteFromTable = async (routeId) => {{
+        const routes = routeList();
+        const route = routes.find((item) => item.id === routeId);
+        if (!route) return;
+        const defaultId = `${{route.id || "Route"}}_COPY`;
+        const newId = (window.prompt("New route id", defaultId) || "").trim();
+        if (!newId) return;
+        if (routes.some((item) => item.id === newId)) {{
+          setMapAuthoringStatus("Route id already exists", "error");
+          return;
+        }}
+        const copy = JSON.parse(JSON.stringify(route));
+        copy.id = newId;
+        copy.label = `${{route.label || route.id || "Route"}} Copy`;
+        await saveRoutes([...routes, copy], newId);
+      }};
+      const deleteRouteFromTable = async (routeId) => {{
+        const routes = routeList();
+        const route = routes.find((item) => item.id === routeId);
+        if (!route) return;
+        if (!window.confirm(`Delete route ${{routeId}}?`)) return;
+        const remaining = routes.filter((item) => item.id !== routeId);
+        const currentSelected = (mapAuthoring || {{}}).selected_route_id;
+        const selectedRouteId = currentSelected === routeId ? ((remaining[0] && remaining[0].id) || null) : currentSelected;
+        await saveRoutes(remaining, selectedRouteId);
+      }};
+      const handleRouteTableAction = async (button) => {{
+        const routeId = button.getAttribute("data-route-id") || "";
+        const action = button.getAttribute("data-route-table-action") || "";
+        if (action === "select") {{
+          await selectRouteFromTable(routeId);
+        }} else if (action === "rename") {{
+          await renameRouteFromTable(routeId);
+        }} else if (action === "duplicate") {{
+          await duplicateRouteFromTable(routeId);
+        }} else if (action === "delete") {{
+          await deleteRouteFromTable(routeId);
+        }}
       }};
       const removeRouteWaypoint = async (targetId) => {{
         const current = mapAuthoring || {{}};
@@ -2214,6 +2763,83 @@ def render_dashboard_html(
         route.waypoints = waypoints;
         routes[routeIndex] = route;
         await saveRoutes(routes, route.id);
+      }};
+      const routeActionArgs = (kind, waypoint) => {{
+        if (kind === "scan_tags") {{
+          const raw = window.prompt("Expected AprilTag IDs, comma separated", "");
+          const expected = (raw || "").split(",").map((item) => Number(item.trim())).filter((item) => Number.isFinite(item));
+          return {{expected}};
+        }}
+        if (kind === "scan_qr") {{
+          const raw = window.prompt("Expected QR payloads, comma separated", "");
+          const expected = (raw || "").split(",").map((item) => item.trim()).filter(Boolean);
+          return {{expected}};
+        }}
+        if (kind === "capture_image") {{
+          return {{target: waypoint.target_id || waypoint.id}};
+        }}
+        if (kind === "gemini_inspect_image") {{
+          return {{
+            target: waypoint.target_id || waypoint.id,
+            prompt: "Inspect this waypoint for physical changes, safety issues, package changes, and work-order evidence.",
+            baseline_policy: "same_waypoint_latest_previous",
+            require_baseline: false,
+            model: "gemini-2.5-flash",
+            max_image_bytes_inline: 20000000,
+          }};
+        }}
+        if (kind === "wait") {{
+          const seconds = Number(window.prompt("Wait seconds", "2") || 2);
+          return {{seconds: Number.isFinite(seconds) ? seconds : 2}};
+        }}
+        return {{target: waypoint.target_id || waypoint.id}};
+      }};
+      const routeActionLabels = {{
+        capture_image: "Capture Image",
+        gemini_inspect_image: "Gemini Inspect",
+        scan_qr: "Scan QR",
+        scan_tags: "Scan Tags",
+        wait: "Wait",
+        inspect_asset: "Inspect Asset",
+        verify_work_order: "Verify Work Order",
+        operator_prompt: "Operator Prompt",
+      }};
+      const addActionToSelectedRouteWaypoint = async (kind) => {{
+        if (!selectedMapObject || selectedMapObject.kind !== "route_stop") {{
+          setMapAuthoringStatus("Select a route waypoint before adding an action", "error");
+          return;
+        }}
+        const allowed = new Set(Object.keys(routeActionLabels));
+        if (!allowed.has(kind)) {{
+          setMapAuthoringStatus("Unsupported route action kind", "error");
+          return;
+        }}
+        const current = mapAuthoring || {{}};
+        const routes = Array.isArray(current.routes) ? [...current.routes] : [];
+        const route = routes.find((item) => item.id === current.selected_route_id) || routes[0];
+        const routeIndex = routes.indexOf(route);
+        const waypointIndex = routeIndex >= 0 ? routeIndexForTarget(route, selectedMapObject.id) : -1;
+        if (!route || waypointIndex < 0) {{
+          setMapAuthoringStatus("Selected route waypoint was not found", "error");
+          return;
+        }}
+        const waypoints = [...(route.waypoints || [])];
+        const waypoint = {{...waypoints[waypointIndex]}};
+        const actionId = mapEditId(kind.toUpperCase());
+        const label = routeActionLabels[kind] || kind;
+        waypoint.actions = [...(waypoint.actions || []), {{
+          id: actionId,
+          kind,
+          label,
+          required: true,
+          timeout_s: 5.0,
+          args: routeActionArgs(kind, waypoint),
+        }}];
+        waypoints[waypointIndex] = waypoint;
+        route.waypoints = waypoints;
+        routes[routeIndex] = route;
+        await saveRoutes(routes, route.id);
+        setMapAuthoringStatus(`Added ${{kind}} to ${{waypoint.id}}`, "ok");
       }};
       const selectRouteByPrompt = async () => {{
         const current = mapAuthoring || {{}};
@@ -2561,7 +3187,12 @@ def render_dashboard_html(
         if (!live) return;
         if (data.bounds) liveOverlayBounds = data.bounds;
         const heatmapCells = renderLiveHeatmap(live.costmap);
-        const pathPoints = renderDimOSPath(live.path || live.route || []);
+        const overlayPath = Array.isArray(live.path) && live.path.length
+          ? live.path
+          : Array.isArray(live.route) && live.route.length
+            ? live.route
+            : data.route || [];
+        const pathPoints = renderDimOSPath(overlayPath);
         renderDimOSTarget(live.target);
         const qrEvents = Array.isArray(data.qr_cargo_events) ? data.qr_cargo_events : [];
         renderQrCargoMarkers(qrEvents);
@@ -2700,6 +3331,77 @@ def render_dashboard_html(
         );
         await refreshLiveMap();
       }};
+      const gatherHeatmap = async () => {{
+        if (robotBusy) return;
+        const areaId = (window.prompt("Heatmap area label", "CURRENT_AREA") || "").trim();
+        const durationRaw = window.prompt("Gather duration in seconds", "10");
+        const durationS = Number(durationRaw || 10);
+        robotBusy = true;
+        setBusy(true);
+        setStatus("Gathering heatmap...", "");
+        setMapCommandStatus("Gathering heatmap from DimOS costmap...", "");
+        try {{
+          const headers = {{"Content-Type": "application/json"}};
+          if (robotControlToken) headers["X-DogOps-Control-Token"] = robotControlToken;
+          const response = await fetch("/api/map/heatmap/gather", {{
+            method: "POST",
+            headers,
+            body: JSON.stringify({{
+              command: "gather_heatmap",
+              area_id: areaId,
+              duration_s: Number.isFinite(durationS) ? durationS : 10,
+            }}),
+          }});
+          const result = await response.json();
+          if (!response.ok || result.ok === false) {{
+            throw new Error(result.message || result.error || "gather_heatmap_failed");
+          }}
+          const cells = result.heatmap && result.heatmap.costmap && Array.isArray(result.heatmap.costmap.cells)
+            ? result.heatmap.costmap.cells.length
+            : 0;
+          setStatus(`Gathered heatmap (${{cells}} cells)`, "ok");
+          setMapCommandStatus(`Gathered heatmap run ${{result.route_run_id || ""}}`, "ok");
+          await refreshDimOSMap();
+          await refreshRouteRunHistory();
+        }} catch (error) {{
+          setStatus(`Gather heatmap failed: ${{error.message}}`, "error");
+          setMapCommandStatus(`Gather heatmap failed: ${{error.message}}`, "error");
+        }} finally {{
+          robotBusy = false;
+          setBusy(false);
+        }}
+      }};
+      const scanSelectedZone = async () => {{
+        if (robotBusy) return;
+        const defaultZone = selectedMapObject && selectedMapObject.kind === "zone"
+          ? selectedMapObject.id
+          : "INBOUND_DOCK";
+        const zoneId = (window.prompt("Zone id to scan", defaultZone) || "").trim();
+        if (!zoneId) return;
+        setMapCommandStatus(`Scanning ${{zoneId}}...`, "");
+        const result = await sendRobotAction(
+          "/api/robot/scan_zone",
+          {{command: "scan_zone", zone_id: zoneId}},
+          (response) => {{
+            const mcp = response.mcp_result || {{}};
+            const tags = Array.isArray(mcp.visible_tag_ids) ? mcp.visible_tag_ids.join(",") : "";
+            const packages = Array.isArray(mcp.package_ids) ? mcp.package_ids.join(",") : "";
+            const source = mcp.source || response.transport || "mcp";
+            return `Scan ${{zoneId}} via ${{source}} / tags=${{tags || "none"}} packages=${{packages || "none"}}`;
+          }}
+        );
+        if (result) {{
+          const mcp = result.mcp_result || {{}};
+          setMapCommandStatus(
+            `Scan ${{zoneId}}: ${{mcp.source || result.transport || "mcp"}} tags=${{(mcp.visible_tag_ids || []).join(",") || "none"}}`,
+            "ok"
+          );
+          await refreshDimOSMap();
+          await refreshRouteRunHistory();
+        }} else {{
+          setMapCommandStatus(`Scan ${{zoneId}} failed`, "error");
+        }}
+      }};
       const sendRobotAction = async (url, body, successText) => {{
         robotBusy = true;
         setBusy(true);
@@ -2759,6 +3461,11 @@ def render_dashboard_html(
           }}, "PUT");
         }});
         liveMapSvg.addEventListener("click", async (event) => {{
+          const selected = selectMapObject(event.target);
+          if (selected) {{
+            event.preventDefault();
+            return;
+          }}
           if (mapEditMode !== "select") {{
             event.preventDefault();
             const target = worldFromSvgEvent(event);
@@ -2769,7 +3476,6 @@ def render_dashboard_html(
             await applyMapEditAt(target);
             return;
           }}
-          if (selectMapObject(event.target)) return;
           if (!goToArmed) return;
           event.preventDefault();
           const target = worldFromSvgEvent(event);
@@ -2820,22 +3526,52 @@ def render_dashboard_html(
           if (!button) return;
           const action = button.getAttribute("data-map-action");
           button.blur();
-          if (action === "map_from_scratch") {{
-            await mapFromScratch();
+          if (action === "start") {{
+            await sendRobotAction(
+              "/api/robot/map_start",
+              {{command: "map_start"}},
+              () => "Live map connected"
+            );
           }} else if (action === "origin") {{
             await sendRobotAction(
               "/api/robot/map_origin",
               {{command: "map_origin"}},
               () => "Map origin set"
             );
+          }} else if (action === "gather_heatmap") {{
+            await gatherHeatmap();
+          }} else if (action === "scan_zone") {{
+            await scanSelectedZone();
           }} else if (action === "arm_go_to") {{
             setGoToArmed(!goToArmed);
           }}
           await refreshLiveMap();
         }});
       }}
+      if (routeTable) {{
+        routeTable.addEventListener("click", async (event) => {{
+          const routeTableButton = event.target.closest("button[data-route-table-action]");
+          if (!routeTableButton) return;
+          routeTableButton.blur();
+          await handleRouteTableAction(routeTableButton);
+        }});
+      }}
+      if (routeRunHistory) {{
+        routeRunHistory.addEventListener("click", async (event) => {{
+          const routeRunButton = event.target.closest("button[data-route-run-select]");
+          if (!routeRunButton) return;
+          routeRunButton.blur();
+          await selectRouteRunOnMap(routeRunButton.getAttribute("data-route-run-select") || "");
+        }});
+      }}
       if (mapEditControls) {{
         mapEditControls.addEventListener("click", async (event) => {{
+          const routeActionButton = event.target.closest("button[data-route-action-kind]");
+          if (routeActionButton) {{
+            routeActionButton.blur();
+            await addActionToSelectedRouteWaypoint(routeActionButton.getAttribute("data-route-action-kind") || "");
+            return;
+          }}
           const modeButton = event.target.closest("button[data-map-edit-mode]");
           if (modeButton) {{
             setGoToArmed(false);
@@ -2873,10 +3609,15 @@ def render_dashboard_html(
             await placeSelectedFromObservation();
           }} else if (action === "route_select") {{
             await selectRouteByPrompt();
+          }} else if (action === "dry_run_route") {{
+            await runSelectedRoute(true);
           }} else if (action === "run_route") {{
-            await runSelectedRoute();
+            await runSelectedRoute(false);
           }} else if (action === "stop_route") {{
             await stopRouteExecution();
+          }} else if (action === "heatmap_run") {{
+            await gatherHeatmap();
+            await refreshLiveMap();
           }} else if (action === "route_up") {{
             await moveSelectedRouteWaypoint(-1);
           }} else if (action === "route_down") {{
@@ -2918,10 +3659,12 @@ def render_dashboard_html(
       }}
       refreshLiveMap();
       refreshDimOSMap();
+      updateCamera();
       refreshRouteExecution();
       refreshRouteRunHistory();
       window.setInterval(refreshLiveMap, 1000);
       window.setInterval(refreshDimOSMap, 1500);
+      window.setInterval(updateCamera, 750);
       window.setInterval(refreshRouteExecution, 1500);
       window.setInterval(refreshRouteRunHistory, 5000);
     }})();
@@ -3030,15 +3773,8 @@ def _trusted_rerun_source_url(raw_url: str | None) -> str:
     return raw_url
 
 
-def _trusted_rerun_view_mode(raw_value: str | None) -> str:
-    return "dogops-2d" if raw_value == "dogops-2d" else "native-3d"
-
-
-def _include_static_site_map() -> bool:
-    raw_value = os.environ.get("DOGOPS_INCLUDE_STATIC_SITE_MAP")
-    if raw_value is None:
-        return True
-    return raw_value.strip().lower() not in {"0", "false", "no", "off"}
+def _trusted_rerun_view_mode(raw_mode: str | None) -> str:
+    return "dogops-2d" if raw_mode == "dogops-2d" else "native-3d"
 
 
 def _trusted_camera_stream_url(raw_url: str | None) -> str:
@@ -3057,20 +3793,19 @@ def _trusted_camera_stream_url(raw_url: str | None) -> str:
 
 
 def _render_live_video_panel(camera_stream_url: str) -> str:
-    if not camera_stream_url:
+    if camera_stream_url:
+        camera_stream_url_attr = escape(camera_stream_url, quote=True)
         return (
-            '<div class="live-video-panel is-waiting" data-live-video-panel>'
-            "<strong>Live video</strong>"
-            '<div class="live-video-placeholder" data-live-video-placeholder>'
-            "Waiting for local Go2 camera stream"
-            "</div>"
+            '<div class="live-video-panel" data-live-video-panel>'
+            "<strong>Live Video</strong>"
+            f'<iframe src="{camera_stream_url_attr}" title="Dog live video stream" loading="lazy"></iframe>'
             "</div>"
         )
-    camera_stream_url_attr = escape(camera_stream_url, quote=True)
     return (
         '<div class="live-video-panel" data-live-video-panel>'
-        "<strong>Live video</strong>"
-        f'<iframe data-live-video-frame title="Live Go2 camera" src="{camera_stream_url_attr}" loading="lazy"></iframe>'
+        "<strong>Live Video</strong>"
+        '<img data-live-video-frame alt="Dog live video stream" hidden />'
+        '<div class="live-video-placeholder" data-live-video-empty>Waiting for camera stream</div>'
         "</div>"
     )
 
@@ -3085,7 +3820,7 @@ def _render_rerun_surface(
     rerun_web_url_attr = escape(rerun_web_url, quote=True)
     rerun_view_mode_attr = escape(rerun_view_mode, quote=True)
     return (
-        '<div class="rerun-surface" data-map-viewer data-rerun-surface '
+        '<div class="rerun-surface" data-rerun-surface '
         f'data-rerun-source-url="{rerun_source_url_attr}" '
         f'data-rerun-view-mode="{rerun_view_mode_attr}" '
         'data-rerun-asset-base-url="/assets/vendor/@rerun-io/web-viewer/">'
@@ -3095,10 +3830,10 @@ def _render_rerun_surface(
         '<div class="rerun-status" data-rerun-status>3D View standby</div>'
         '<div class="rerun-controls">'
         '<button type="button" data-rerun-connect>Connect 3D View</button>'
-        f'<a href="{rerun_web_url_attr}" target="_blank" rel="noreferrer">Open 3D View</a>'
+        f'<a href="{rerun_web_url_attr}" target="_blank" rel="noreferrer">Open</a>'
         "</div>"
         "</div>"
-        '<div class="viewer-offline" data-viewer-offline hidden></div>'
+        '<div class="viewer-offline" data-viewer-offline hidden>3D View unavailable</div>'
         f"{_render_live_video_panel(camera_stream_url)}"
         "</div>"
     )
@@ -3427,7 +4162,8 @@ def _render_route_stop(projector: _MapProjector, stop: dict[str, Any], index: in
     y = projector.y(float(stop["y"]))
     title = escape(str(stop.get("target_id") or "route stop"))
     return (
-        f'<g data-edit-kind="route_stop" data-edit-id="{escape(str(stop.get("target_id") or ""))}"><title>{title}</title>'
+        f'<g class="map-route-stop-marker" data-edit-kind="route_stop" '
+        f'data-edit-id="{escape(str(stop.get("target_id") or ""))}"><title>{title}</title>'
         f'<circle class="map-route-stop" cx="{x:.1f}" cy="{y:.1f}" r="9" />'
         f'<text class="map-route-index" x="{x:.1f}" y="{y + 1:.1f}">{index}</text>'
         "</g>"

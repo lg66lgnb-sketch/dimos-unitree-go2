@@ -13,7 +13,6 @@ from dimos.experimental.dogops.config_loader import (
 from dimos.experimental.dogops.dashboard import serve_dashboard
 from dimos.experimental.dogops.mission_engine import run_offline_simulation
 from dimos.experimental.dogops.report import render_report_markdown
-from dimos.experimental.dogops.rerun_sim import DEFAULT_RERUN_SOURCE_URL, serve_rerun_sim
 from dimos.experimental.dogops.store import DogOpsStore
 
 
@@ -36,19 +35,6 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--run", default=".dogops/runs/latest")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8765)
-
-    rerun_sim = subparsers.add_parser(
-        "rerun-sim",
-        help="Publish the DogOps simulator map to a local Rerun stream",
-    )
-    rerun_sim.add_argument("--run", default=".dogops/runs/latest")
-    rerun_sim.add_argument("--source-url", default=DEFAULT_RERUN_SOURCE_URL)
-    rerun_sim.add_argument("--poll-interval-s", type=float, default=0.5)
-    rerun_sim.add_argument(
-        "--view-mode",
-        choices=["dogops-2d", "native-3d"],
-        default="dogops-2d",
-    )
 
     return parser
 
@@ -100,15 +86,6 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "serve":
         serve_dashboard(args.run, host=args.host, port=args.port)
-        return 0
-
-    if args.command == "rerun-sim":
-        serve_rerun_sim(
-            args.run,
-            source_url=args.source_url,
-            poll_interval_s=args.poll_interval_s,
-            view_mode=args.view_mode,
-        )
         return 0
 
     parser.error(f"unknown command: {args.command}")

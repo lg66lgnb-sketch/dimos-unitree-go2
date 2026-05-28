@@ -43,8 +43,6 @@ uv run python -m dimos.experimental.dogops.cli serve --run .dogops/runs/latest -
 
 Open <http://127.0.0.1:8765/> to view the dashboard.
 
-For MuJoCo-aligned 3D evidence, run the full DimOS Go2 simulation with Rerun Web and serve the dashboard with `DOGOPS_RERUN_VIEW_MODE=native-3d`. In that mode, **Map From Scratch** publishes DimOS `/explore_cmd` and connects to the live DimOS/MuJoCo stream instead of replaying the synthetic DogOps map.
-
 API checks:
 
 ```bash

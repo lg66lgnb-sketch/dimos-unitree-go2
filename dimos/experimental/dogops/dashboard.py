@@ -27,14 +27,18 @@ from dimos.experimental.dogops.dashboard_static import (
     build_route_data,
     write_dashboard_html,
 )
-from dimos.experimental.dogops.live_map import DogOpsLiveMapAdapter, _extend_dimos_package_path
+from dimos.experimental.dogops.heatmap_runs import (
+    gather_heatmap_run,
+    heatmap_snapshot_for_route_run,
+    latest_heatmap_snapshot,
+)
+from dimos.experimental.dogops.live_camera import DogOpsLiveCameraAdapter
+from dimos.experimental.dogops.live_map import DogOpsLiveMapAdapter
 from dimos.experimental.dogops.map_authoring import (
     EditableIncidentLocation,
     EditableMapEntity,
-    EditableMapPoint,
     EditableNoGoShape,
     EditableRoute,
-    EditableRouteWaypoint,
     EditableTagBinding,
     MapAuthoringState,
     delete_entity,
@@ -60,12 +64,7 @@ from dimos.experimental.dogops.qr_cargo import (
     load_qr_events,
     qr_events_path,
 )
-from dimos.experimental.dogops.route_executor import (
-    DogOpsRouteExecutor,
-    RouteExecutionError,
-    load_route_execution,
-    request_route_stop,
-)
+from dimos.experimental.dogops.route_executor import load_route_execution, request_route_stop
 from dimos.experimental.dogops.route_run_store import RouteRunStore
 from dimos.experimental.dogops.store import DogOpsStore
 
@@ -87,6 +86,13 @@ ROBOT_CALL_TIMEOUT_S = 8.0
 DIMOS_MCP_CALL_TIMEOUT_S = 12.0
 DIMOS_ROUTE_CALL_TIMEOUT_S = 180.0
 WEBRTC_COMMAND_TIMEOUT_S = 2.0
+MCP_UNAVAILABLE_MARKERS = (
+    "no running mcp server",
+    "mcp server is not running",
+    "connection refused",
+    "failed to connect",
+    "tool not found",
+)
 HARD_STOP_REPEATS = 6
 HARD_STOP_INTERVAL_S = 0.05
 ROBOT_POSE_HISTORY_LIMIT = 240
@@ -109,7 +115,6 @@ ROBOT_JOG_COMMANDS: dict[str, tuple[float, float, float]] = {
 HARD_STOP_COMMANDS = {"hard_stop", "stop"}
 ROBOT_POSTURE_COMMANDS = {"wake", "balance", "sleep"}
 ROBOT_CONTROL_TOKEN_HEADER = "X-DogOps-Control-Token"
-RERUN_COMMAND_FILENAME = "rerun_command.json"
 DEFAULT_ROBOT_IP = (
     os.environ.get("DOGOPS_ROBOT_IP")
     or os.environ.get("GO2_IP")
@@ -121,17 +126,7 @@ _ROBOT_SESSIONS_LOCK = threading.Lock()
 _AUTHORING_LOCK = threading.Lock()
 _QR_EVENTS_LOCK = threading.Lock()
 _LIVE_MAP_ADAPTER = DogOpsLiveMapAdapter()
-
-
-def _rerun_view_mode() -> str:
-    return "dogops-2d" if os.environ.get("DOGOPS_RERUN_VIEW_MODE") == "dogops-2d" else "native-3d"
-
-
-def _include_static_site_map() -> bool:
-    raw_value = os.environ.get("DOGOPS_INCLUDE_STATIC_SITE_MAP")
-    if raw_value is None:
-        return True
-    return raw_value.strip().lower() not in {"0", "false", "no", "off"}
+_LIVE_CAMERA_ADAPTER = DogOpsLiveCameraAdapter()
 
 
 class DogOpsDashboardServer(ThreadingHTTPServer):
@@ -141,14 +136,17 @@ class DogOpsDashboardServer(ThreadingHTTPServer):
         handler_class: type[BaseHTTPRequestHandler],
         *,
         live_map_adapter: DogOpsLiveMapAdapter,
+        live_camera_adapter: DogOpsLiveCameraAdapter | None = None,
     ) -> None:
         self.live_map_adapter = live_map_adapter
+        self.live_camera_adapter = live_camera_adapter
         super().__init__(server_address, handler_class)
 
     def server_close(self) -> None:
-        stop = getattr(getattr(self, "live_map_adapter", None), "stop", None)
-        if stop is not None:
-            stop()
+        for adapter_name in ("live_map_adapter", "live_camera_adapter"):
+            stop = getattr(getattr(self, adapter_name, None), "stop", None)
+            if stop is not None:
+                stop()
         with _ROBOT_SESSIONS_LOCK:
             sessions = list(_ROBOT_SESSIONS.values())
             _ROBOT_SESSIONS.clear()
@@ -168,7 +166,12 @@ def make_dashboard_server(run_dir: str | Path, host: str, port: int) -> Threadin
         robot_control_token = token
         robot_ip = DEFAULT_ROBOT_IP
 
-    return DogOpsDashboardServer((host, port), Handler, live_map_adapter=_LIVE_MAP_ADAPTER)
+    return DogOpsDashboardServer(
+        (host, port),
+        Handler,
+        live_map_adapter=_LIVE_MAP_ADAPTER,
+        live_camera_adapter=_LIVE_CAMERA_ADAPTER,
+    )
 
 
 def serve_dashboard(run_dir: str | Path, host: str = "127.0.0.1", port: int = 8765) -> None:
@@ -229,6 +232,12 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/nav":
             report = self._read_json(self.run_dir / "report.json")
             self._send_json(report.get("nav_summary") or {})
+        elif path == "/api/camera/status":
+            if self._authorize_local_read():
+                self._send_json(_LIVE_CAMERA_ADAPTER.status())
+        elif path == "/api/camera/frame.jpg":
+            if self._authorize_local_read():
+                self._send_camera_frame()
         elif path == "/api/map":
             state = self._read_json(self.run_dir / "state.json")
             report = self._read_json(self.run_dir / "report.json")
@@ -238,9 +247,9 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
                     state,
                     report,
                     live_overlay=_LIVE_MAP_ADAPTER.snapshot(),
+                    heatmap_snapshot=latest_heatmap_snapshot(self.run_dir),
                     authoring=authoring.model_dump(mode="json"),
                     qr_events=load_qr_events(self.run_dir),
-                    include_static_site=_include_static_site_map(),
                 )
             )
         elif path == "/api/map/authoring":
@@ -261,6 +270,9 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/route-runs/current":
             if self._authorize_map_authoring_write():
                 self._route_runs_current()
+        elif path == "/api/route-runs/images":
+            if self._authorize_map_authoring_write():
+                self._route_run_images()
         elif path.startswith("/api/route-runs/"):
             if self._authorize_map_authoring_write():
                 self._route_runs_detail(path)
@@ -281,8 +293,6 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
                 Path(__file__).with_name("static") / "rerun-web-viewer.js",
                 "application/javascript; charset=utf-8",
             )
-        elif path.startswith("/evidence/"):
-            self._send_evidence_asset(path.removeprefix("/evidence/"))
         elif path.startswith("/assets/vendor/@rerun-io/web-viewer/"):
             relative = path.removeprefix("/assets/vendor/@rerun-io/web-viewer/")
             self._send_static_asset(
@@ -326,6 +336,12 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/robot/map_origin":
             if self._authorize_robot_control():
                 self._robot_map_origin()
+        elif path == "/api/robot/scan_zone":
+            if self._authorize_robot_control():
+                self._robot_scan_zone()
+        elif path == "/api/map/heatmap/gather":
+            if self._authorize_robot_control():
+                self._gather_heatmap()
         elif path == "/api/map/entities":
             if self._authorize_map_authoring_write():
                 self._upsert_map_entity()
@@ -341,12 +357,6 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/map/routes/stop":
             if self._authorize_map_authoring_write():
                 self._stop_map_route()
-        elif path == "/api/map/explore/start":
-            if self._authorize_map_authoring_write():
-                self._start_map_exploration()
-        elif path == "/api/rerun/replay":
-            if self._authorize_map_authoring_write():
-                self._replay_rerun()
         elif path.startswith("/api/map/incidents/") and path.endswith("/location"):
             if self._authorize_map_authoring_write():
                 parts = path.split("/")
@@ -429,9 +439,9 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
                     state,
                     report,
                     live_overlay=_LIVE_MAP_ADAPTER.snapshot(),
+                    heatmap_snapshot=latest_heatmap_snapshot(self.run_dir),
                     authoring=payload,
                     qr_events=load_qr_events(self.run_dir),
-                    include_static_site=_include_static_site_map(),
                 ),
             }
         )
@@ -571,36 +581,28 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
             return
         self._send_authoring(authoring)
 
+    def _gather_heatmap(self) -> None:
+        payload = self._read_body_json()
+        area_id = str(payload.get("area_id") or "").strip()
+        try:
+            duration_s = float(payload.get("duration_s") or 0.0)
+        except (TypeError, ValueError):
+            duration_s = 0.0
+        result = gather_heatmap_run(
+            self.run_dir,
+            live_snapshot=_LIVE_MAP_ADAPTER.snapshot(),
+            live_snapshot_reader=_LIVE_MAP_ADAPTER.snapshot,
+            area_id=area_id,
+            duration_s=max(0.0, duration_s),
+        )
+        status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
+        self._send_json(result, status)
+
     def _follow_map_route(self) -> None:
         payload = self._read_body_json()
         route_id = payload.get("route_id")
         route_id_arg = str(route_id).strip() if route_id is not None else None
         dry_run = bool(payload.get("dry_run", False))
-        if dry_run:
-            try:
-                state = self._run_dashboard_dry_route(route_id_arg)
-            except RouteExecutionError as exc:
-                self._send_json(
-                    {
-                        "ok": False,
-                        "error": "route_execution_rejected",
-                        "message": str(exc),
-                        **self._route_execution_payload(),
-                    },
-                    HTTPStatus.BAD_REQUEST,
-                )
-                return
-            self._send_json(
-                {
-                    "ok": True,
-                    "command": "follow_route",
-                    "transport": "dashboard_dry_run",
-                    **self._route_execution_payload(
-                        route_execution=state.model_dump(mode="json")
-                    ),
-                }
-            )
-            return
         try:
             result = _run_robot_call(
                 lambda: _run_robot_follow_route(route_id_arg, dry_run),
@@ -629,6 +631,17 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
             )
             return
         except Exception as exc:
+            if _is_mcp_unavailable_error(exc):
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": "dimos_mcp_unavailable",
+                        "message": str(exc),
+                        **self._route_execution_payload(),
+                    },
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+                return
             self._send_json(
                 {
                     "ok": False,
@@ -686,6 +699,18 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
             )
             return
         except Exception as exc:
+            if _is_mcp_unavailable_error(exc):
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": "dimos_mcp_unavailable",
+                        "message": str(exc),
+                        "hard_stop": hard_stop,
+                        **self._route_execution_payload(),
+                    },
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+                return
             self._send_json(
                 {
                     "ok": False,
@@ -712,14 +737,6 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
     def _route_execution_status(self) -> None:
         self._send_json({"ok": True, **self._route_execution_payload()})
 
-    def _run_dashboard_dry_route(self, route_id: str | None) -> Any:
-        state = self._read_json(self.run_dir / "state.json")
-        authoring = self._load_authoring(state)
-        save_map_authoring(self.run_dir, authoring)
-        result = DogOpsRouteExecutor(self.run_dir).follow_route(route_id, dry_run=True)
-        write_dashboard_html(self.run_dir, robot_control_token=self.robot_control_token)
-        return result
-
     def _route_runs_list(self) -> None:
         store = RouteRunStore(self.run_dir)
         self._send_json({"ok": True, "route_runs": store.list_route_runs()})
@@ -738,6 +755,32 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
             }
         )
 
+    def _route_run_images(self) -> None:
+        store = RouteRunStore(self.run_dir)
+        images: list[dict[str, Any]] = []
+        for route_run in store.list_route_runs(limit=12):
+            route_run_id = str(route_run.get("route_run_id") or "")
+            if not route_run_id:
+                continue
+            for evidence in store.route_run_evidence(route_run_id):
+                if evidence.get("kind") != "image" or not evidence.get("path"):
+                    continue
+                evidence_id = str(evidence.get("evidence_id") or "")
+                images.append(
+                    {
+                        "evidence_id": evidence_id,
+                        "route_run_id": route_run_id,
+                        "dogops_run_id": route_run.get("dogops_run_id"),
+                        "route_id": route_run.get("route_id"),
+                        "created_at": evidence.get("created_at"),
+                        "mime_type": evidence.get("mime_type"),
+                        "metadata": evidence.get("metadata") or {},
+                        "url": f"/api/route-runs/{route_run_id}/evidence/{evidence_id}/file",
+                    }
+                )
+        images.sort(key=lambda item: float(item.get("created_at") or 0.0), reverse=True)
+        self._send_json({"ok": True, "images": images[:12]})
+
     def _route_runs_detail(self, path: str) -> None:
         parts = [part for part in path.split("/") if part]
         route_run_id = parts[2] if len(parts) >= 3 else ""
@@ -755,15 +798,90 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         if len(parts) == 4 and parts[3] == "evidence":
             self._send_json({"ok": True, "evidence": store.route_run_evidence(route_run_id)})
             return
+        if len(parts) == 6 and parts[3] == "evidence" and parts[5] == "file":
+            self._send_route_run_evidence_file(store, route_run, parts[4])
+            return
         route_events = store.route_run_events(route_run_id)
+        evidence = store.route_run_evidence(route_run_id)
         self._send_json(
             {
                 "ok": True,
                 "route_run": route_run,
                 "events": route_events,
                 "timeline": self._unified_timeline(route_events, route_run),
-                "evidence": store.route_run_evidence(route_run_id),
+                "evidence": evidence,
+                "map": self._route_run_map(route_run, evidence),
             }
+        )
+
+    def _send_route_run_evidence_file(
+        self,
+        store: RouteRunStore,
+        route_run: dict[str, Any],
+        evidence_id: str,
+    ) -> None:
+        evidence = next(
+            (
+                item
+                for item in store.route_run_evidence(str(route_run["route_run_id"]))
+                if item.get("evidence_id") == evidence_id
+            ),
+            None,
+        )
+        if evidence is None or evidence.get("kind") != "image" or not evidence.get("path"):
+            self._send_json({"ok": False, "error": "evidence_image_not_found"}, HTTPStatus.NOT_FOUND)
+            return
+        mime_type = str(evidence.get("mime_type") or "")
+        if mime_type not in {"image/jpeg", "image/png", "image/webp"}:
+            self._send_json({"ok": False, "error": "unsupported_evidence_image_type"}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+            return
+        run_root = Path(str(route_run.get("run_dir") or self.run_dir)).resolve()
+        evidence_path = Path(str(evidence["path"]))
+        resolved = evidence_path.resolve()
+        try:
+            resolved.relative_to(run_root)
+        except ValueError:
+            self._send_json({"ok": False, "error": "evidence_path_outside_run"}, HTTPStatus.FORBIDDEN)
+            return
+        self._send_file(resolved, mime_type)
+
+    def _route_run_map(
+        self,
+        route_run: dict[str, Any],
+        evidence: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        timeline_run_dir = Path(str(route_run.get("run_dir") or self.run_dir))
+        state_path = timeline_run_dir / "state.json"
+        report_path = timeline_run_dir / "report.json"
+        if not state_path.exists() or not report_path.exists():
+            return None
+        state = self._read_json(state_path)
+        report = self._read_json(report_path)
+        authoring = load_map_authoring(
+            timeline_run_dir,
+            site_id=str((state.get("site") or {}).get("site_id") or ""),
+        ).model_dump(mode="json")
+        route_snapshot = route_run.get("selected_route_snapshot")
+        if isinstance(route_snapshot, dict) and route_snapshot.get("waypoints"):
+            routes = [
+                route
+                for route in authoring.get("routes") or []
+                if isinstance(route, dict) and route.get("id") != route_snapshot.get("id")
+            ]
+            routes.append(route_snapshot)
+            authoring["routes"] = routes
+            authoring["selected_route_id"] = route_snapshot.get("id")
+        heatmap_snapshot = heatmap_snapshot_for_route_run(
+            timeline_run_dir,
+            str(route_run.get("route_run_id") or ""),
+            evidence=evidence,
+        )
+        return build_map_data(
+            state,
+            report,
+            heatmap_snapshot=heatmap_snapshot,
+            authoring=authoring,
+            qr_events=load_qr_events(timeline_run_dir),
         )
 
     def _unified_timeline(
@@ -1218,6 +1336,53 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
             }
         )
 
+    def _robot_scan_zone(self) -> None:
+        payload = self._read_body_json()
+        zone_id = str(payload.get("zone_id") or "").strip()
+        if not zone_id:
+            self._send_json(
+                {"ok": False, "error": "missing_zone_id"},
+                HTTPStatus.BAD_REQUEST,
+            )
+            return
+
+        try:
+            result = _run_robot_call(lambda: _run_robot_scan_zone(zone_id))
+        except ModuleNotFoundError as exc:
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": "dimos_mcp_unavailable",
+                    "message": str(exc),
+                },
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            return
+        except TimeoutError as exc:
+            self._send_json(
+                {"ok": False, "error": "scan_zone_timeout", "message": str(exc)},
+                HTTPStatus.GATEWAY_TIMEOUT,
+            )
+            return
+        except Exception as exc:
+            if _is_mcp_unavailable_error(exc):
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": "dimos_mcp_unavailable",
+                        "message": str(exc),
+                    },
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+                return
+            self._send_json(
+                {"ok": False, "error": "scan_zone_failed", "message": str(exc)},
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            return
+
+        self._send_json({"ok": True, "command": "scan_zone", "zone_id": zone_id, **(result or {})})
+
     def _robot_map_start(self) -> None:
         robot_ip = self.robot_ip
         try:
@@ -1265,71 +1430,6 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
             return
 
         self._send_json({"ok": bool(result), "command": "map_origin"})
-
-    def _start_map_exploration(self) -> None:
-        try:
-            result = _publish_explore_command()
-        except ModuleNotFoundError as exc:
-            self._send_json(
-                {
-                    "ok": False,
-                    "error": "dimos_explore_unavailable",
-                    "message": str(exc),
-                },
-                HTTPStatus.SERVICE_UNAVAILABLE,
-            )
-            return
-        except Exception as exc:
-            self._send_json(
-                {"ok": False, "error": "explore_start_failed", "message": str(exc)},
-                HTTPStatus.INTERNAL_SERVER_ERROR,
-            )
-            return
-        self._send_json({"ok": True, "command": "explore_start", **result})
-
-    def _replay_rerun(self) -> None:
-        payload = self._read_body_json()
-        action = str(payload.get("action") or "").strip()
-        if action not in {"replay_mapping", "replay_route"}:
-            self._send_json(
-                {"ok": False, "error": "unsupported_rerun_action"},
-                HTTPStatus.BAD_REQUEST,
-            )
-            return
-        if _rerun_view_mode() == "native-3d" and action == "replay_mapping":
-            self._send_json(
-                {
-                    "ok": False,
-                    "error": "native_rerun_uses_live_map",
-                    "message": "Native 3D mode uses the live DimOS/MuJoCo map stream instead of synthetic mapping replay.",
-                },
-                HTTPStatus.CONFLICT,
-            )
-            return
-        command_path = self.run_dir / RERUN_COMMAND_FILENAME
-        history: list[str] = []
-        if command_path.exists():
-            try:
-                existing = json.loads(command_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                existing = {}
-            if isinstance(existing, dict):
-                history = [
-                    str(item)
-                    for item in existing.get("history", [])
-                    if isinstance(item, str)
-                ]
-                previous_action = existing.get("action")
-                if isinstance(previous_action, str) and previous_action not in history:
-                    history.append(previous_action)
-        history.append(action)
-        command_id = str(time.time_ns())
-        command_path.write_text(
-            json.dumps({"action": action, "history": history[-20:], "id": command_id}, sort_keys=True)
-            + "\n",
-            encoding="utf-8",
-        )
-        self._send_json({"ok": True, "action": action, "command_id": command_id, "replay_after_ms": 850})
 
     def _authorize_local_read(self) -> bool:
         host = self.headers.get("Host", "")
@@ -1399,19 +1499,6 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
             return
         self._send_file(resolved, content_type)
 
-    def _send_evidence_asset(self, relative: str) -> None:
-        try:
-            resolved = (self.run_dir / "evidence" / relative).resolve()
-            evidence_root = (self.run_dir / "evidence").resolve()
-        except OSError:
-            self._send_json({"error": "missing_file", "path": relative}, HTTPStatus.NOT_FOUND)
-            return
-        if evidence_root not in resolved.parents:
-            self._send_json({"error": "invalid_evidence_path"}, HTTPStatus.BAD_REQUEST)
-            return
-        content_type = "image/svg+xml" if resolved.suffix == ".svg" else "application/octet-stream"
-        self._send_static_asset(resolved, content_type)
-
     def _send_json(self, payload: Any, status: HTTPStatus = HTTPStatus.OK) -> None:
         raw = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
         self.send_response(status)
@@ -1420,6 +1507,29 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         self._send_browser_isolation_headers()
         self.end_headers()
         self.wfile.write(raw)
+
+    def _send_camera_frame(self) -> None:
+        try:
+            payload = _LIVE_CAMERA_ADAPTER.frame_jpeg()
+        except Exception as exc:
+            self._send_json(
+                {"ok": False, "error": "camera_frame_unavailable", "message": str(exc)},
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            return
+        if payload is None:
+            self._send_json(
+                {"ok": False, "error": "camera_frame_pending"},
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            return
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store")
+        self._send_browser_isolation_headers()
+        self.end_headers()
+        self.wfile.write(payload)
 
     def _send_browser_isolation_headers(self) -> None:
         self.send_header("Cross-Origin-Opener-Policy", "same-origin")
@@ -1662,42 +1772,6 @@ def _static_content_type(relative: str) -> str:
     return "application/octet-stream"
 
 
-def _with_default_inspection_route(
-    authoring: MapAuthoringState,
-    state: dict[str, Any],
-    report: dict[str, Any],
-) -> MapAuthoringState:
-    route_data = build_route_data(state, report, authoring=authoring.model_dump(mode="json"))
-    waypoints: list[EditableRouteWaypoint] = []
-    for index, stop in enumerate(route_data.get("stops") or [], 1):
-        try:
-            x = float(stop["x"])
-            y = float(stop["y"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        target_id = str(stop.get("target_id") or f"POI_{index}")
-        waypoints.append(
-            EditableRouteWaypoint(
-                id=f"POI-{index}",
-                label=f"Photo POI {index}: {target_id}",
-                target_id=target_id,
-                pose=EditableMapPoint(x=x, y=y, source="site_config"),
-            )
-        )
-    if not waypoints:
-        return authoring
-    authoring.routes = [
-        EditableRoute(
-            id="DOGOPS_PHOTO_POI_ROUTE",
-            label="DogOps photo POI route",
-            mission_id=str(state.get("mission_id") or report.get("mission_id") or ""),
-            waypoints=waypoints,
-        )
-    ]
-    authoring.selected_route_id = authoring.routes[0].id
-    return MapAuthoringState.model_validate(authoring.model_dump(mode="json"))
-
-
 def _publish_robot_jog(
     linear_x: float,
     linear_y: float,
@@ -1726,25 +1800,12 @@ def _run_robot_go_to(x: float, y: float) -> dict[str, Any]:
     return _call_dimos_mcp_skill("go_to", {"x": x, "y": y})
 
 
+def _run_robot_scan_zone(zone_id: str) -> dict[str, Any]:
+    return _call_dimos_mcp_skill("scan_zone", {"zone_id": zone_id})
+
+
 def _run_route_hard_stop(robot_ip: str) -> dict[str, Any]:
     return _publish_robot_hard_stop(robot_ip)
-
-
-def _publish_explore_command() -> dict[str, Any]:
-    try:
-        from dimos.core.transport import LCMTransport
-        from dimos.msgs.std_msgs.Bool import Bool
-    except ModuleNotFoundError:
-        _extend_dimos_package_path()
-        from dimos.core.transport import LCMTransport
-        from dimos.msgs.std_msgs.Bool import Bool
-
-    transport = LCMTransport("/explore_cmd", Bool)
-    try:
-        transport.publish(Bool(data=True))
-    finally:
-        transport.stop()
-    return {"transport": "lcm", "topic": "/explore_cmd"}
 
 
 def _run_robot_follow_route(route_id: str | None, dry_run: bool) -> dict[str, Any]:
@@ -1771,6 +1832,11 @@ def _mcp_route_execution(result: Any) -> dict[str, Any] | None:
     if isinstance(result.get("route_execution"), dict):
         return result["route_execution"]
     return None
+
+
+def _is_mcp_unavailable_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(marker in message for marker in MCP_UNAVAILABLE_MARKERS)
 
 
 def _call_dimos_mcp_skill(

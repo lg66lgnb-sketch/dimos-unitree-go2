@@ -14,6 +14,7 @@ DOGOPS_REQUIRED_TOOLS=(
   follow_route
   stop_route
   route_status
+  gather_heatmap
   scan_zone
   read_gauge
   check_clearance

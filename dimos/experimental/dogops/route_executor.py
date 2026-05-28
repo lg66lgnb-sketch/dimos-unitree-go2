@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from html import escape
 import json
 import math
 import os
@@ -18,9 +17,14 @@ from dimos.experimental.dogops.map_authoring import (
     EditableRouteWaypoint,
     load_map_authoring,
 )
-from dimos.experimental.dogops.models import DogOpsModel, NavAction, NavEvent, Observation, Pose2D
+from dimos.experimental.dogops.models import DogOpsModel, NavAction, NavEvent
 from dimos.experimental.dogops.nav_eval import summarize_nav_events
-from dimos.experimental.dogops.route_actions import EditableRouteAction, execute_route_action
+from dimos.experimental.dogops.route_actions import (
+    CaptureImageHandler,
+    EditableRouteAction,
+    ScanZoneHandler,
+    execute_route_action,
+)
 from dimos.experimental.dogops.route_run_store import RouteRunStore, new_route_run_id
 from dimos.experimental.dogops.store import DogOpsStore
 
@@ -75,24 +79,15 @@ class CallableGoalPublisher:
 class ClickedPointGoalPublisher:
     transport_name = "clicked_point"
 
-    def __init__(
-        self,
-        publisher: Any,
-        point_type: type[Any],
-        *,
-        on_publish: Callable[[Any], None] | None = None,
-    ) -> None:
+    def __init__(self, publisher: Any, point_type: type[Any]) -> None:
         self._publisher = publisher
         self._point_type = point_type
-        self._on_publish = on_publish
 
     def publish_goal(self, *, x: float, y: float, z: float, frame_id: str) -> dict[str, Any]:
         if self._publisher is None or not hasattr(self._publisher, "publish"):
             raise RouteExecutionError("DogOps follow_route needs the DimOS clicked_point stream.")
         point = self._point_type(ts=time.time(), frame_id=frame_id, x=x, y=y, z=z)
         self._publisher.publish(point)
-        if self._on_publish is not None:
-            self._on_publish(point)
         return {"transport": self.transport_name}
 
 
@@ -153,6 +148,8 @@ class DogOpsRouteExecutor:
         goal_publisher: GoalPublisher | None = None,
         live_snapshot_reader: Callable[[], dict[str, Any]] | None = None,
         stop_handler: StopHandler | None = None,
+        scan_zone_handler: ScanZoneHandler | None = None,
+        capture_image_handler: CaptureImageHandler | None = None,
         frame: str = "map",
         reach_radius_m: float = 0.35,
         waypoint_timeout_s: float = 20.0,
@@ -166,6 +163,8 @@ class DogOpsRouteExecutor:
         self.goal_publisher = goal_publisher
         self.live_snapshot_reader = live_snapshot_reader
         self.stop_handler = stop_handler
+        self.scan_zone_handler = scan_zone_handler
+        self.capture_image_handler = capture_image_handler
         self.frame = frame or "map"
         self.reach_radius_m = reach_radius_m
         self.waypoint_timeout_s = waypoint_timeout_s
@@ -222,20 +221,6 @@ class DogOpsRouteExecutor:
                 save_route_execution(self.run_dir, state)
                 route_run_store.sync_execution_state(state)
                 if dry_run:
-                    state.waypoints_reached += 1
-                    state.events.append(
-                        self._event(
-                            state,
-                            waypoint,
-                            "reached",
-                            started_at,
-                            error_m=0.0,
-                            note="dry-run simulated arrival and photo capture",
-                        )
-                    )
-                    self._append_dry_run_poi_observation(waypoint)
-                    save_route_execution(self.run_dir, state)
-                    route_run_store.sync_execution_state(state)
                     state = self._execute_waypoint_actions(state, waypoint, started_at, route_run_store)
                     route_run_store.sync_execution_state(state)
                     if state.state in {"failed", "stopped"}:
@@ -448,6 +433,11 @@ class DogOpsRouteExecutor:
                     run_dir=self.run_dir,
                     route_run_id=state.route_run_id or "",
                     waypoint_id=waypoint.id,
+                    route_id=state.route_id,
+                    target_id=waypoint.target_id or waypoint.id,
+                    pose=waypoint.pose.model_dump(mode="json"),
+                    scan_zone_handler=self.scan_zone_handler,
+                    capture_image_handler=self.capture_image_handler,
                 )
                 result_ok = result.ok
                 result_note = result.note
@@ -473,8 +463,9 @@ class DogOpsRouteExecutor:
             save_route_execution(self.run_dir, state)
             route_run_store.sync_execution_state(state)
             action_event_id = f"{state.route_run_id}-{state.events[-1].id}" if state.route_run_id else state.events[-1].id
+            recorded_evidence: list[dict[str, Any]] = []
             for evidence in result_evidence:
-                route_run_store.record_evidence(
+                recorded_evidence.append(route_run_store.record_evidence(
                     route_run_id=state.route_run_id or "",
                     event_id=action_event_id,
                     observation_id=evidence.get("observation_id"),
@@ -482,7 +473,16 @@ class DogOpsRouteExecutor:
                     path=evidence.get("path"),
                     metadata=evidence.get("metadata") or {},
                     mime_type=evidence.get("mime_type"),
-                )
+                ))
+            if recorded_evidence:
+                state.events[-1].payload["evidence"] = recorded_evidence
+                analysis_evidence = [
+                    item for item in recorded_evidence if item.get("kind") == "gemini_vision_analysis"
+                ]
+                if analysis_evidence:
+                    state.events[-1].payload["analysis_evidence_id"] = analysis_evidence[0]["evidence_id"]
+                save_route_execution(self.run_dir, state)
+                route_run_store.sync_execution_state(state)
             if not result_ok and action.required:
                 state.state = "failed"
                 state.last_error = result_note or f"required action failed: {action.id}"
@@ -638,63 +638,6 @@ class DogOpsRouteExecutor:
         state.nav_summary = summarize_nav_events(state.run.id, state.nav_events)
         store.write_state(state.run.id)
         store.write_report(state.run.id)
-
-    def _append_dry_run_poi_observation(self, waypoint: EditableRouteWaypoint) -> None:
-        state_path = self.run_dir / "state.json"
-        if not state_path.exists():
-            return
-        store = DogOpsStore.load_existing(self.run_dir)
-        state = store.state
-        assert state is not None
-        target_id = waypoint.target_id or waypoint.id
-        observation_id = f"OBS-POI-{len(state.observations) + 1:03d}"
-        image_path = f"evidence/{observation_id}.svg"
-        evidence_path = self.run_dir / image_path
-        evidence_path.parent.mkdir(parents=True, exist_ok=True)
-        evidence_path.write_text(
-            _dry_run_photo_svg(observation_id, target_id, waypoint.pose.x, waypoint.pose.y),
-            encoding="utf-8",
-        )
-        store.append_observation(
-            Observation(
-                id=observation_id,
-                ts=self.time_fn(),
-                run_id=state.run.id,
-                entity_id=target_id,
-                zone_id=target_id,
-                pose=Pose2D(
-                    x=waypoint.pose.x,
-                    y=waypoint.pose.y,
-                    frame=self.frame,
-                    source="dashboard_dry_run",
-                ),
-                image_path=image_path,
-                facts={
-                    "photo_poi": True,
-                    "target_id": target_id,
-                    "capture_status": "simulated",
-                },
-                source="dashboard_dry_run",
-            )
-        )
-        store.write_state(state.run.id)
-        store.write_report(state.run.id)
-
-
-def _dry_run_photo_svg(observation_id: str, target_id: str, x: float, y: float) -> str:
-    title = escape(f"{observation_id} {target_id}", quote=True)
-    target = escape(target_id)
-    coordinate = f"x={x:.2f} y={y:.2f}"
-    return f"""<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360" viewBox="0 0 640 360" role="img" aria-label="{title}">
-  <rect width="640" height="360" fill="#08111f"/>
-  <rect x="30" y="30" width="580" height="300" rx="16" fill="#0f1f33" stroke="#6ee7b7" stroke-width="3"/>
-  <circle cx="320" cy="166" r="58" fill="#1f7a8c" opacity="0.85"/>
-  <path d="M120 260 L240 184 L316 232 L398 132 L520 260 Z" fill="#2dd4bf" opacity="0.55"/>
-  <text x="54" y="76" fill="#e5e7eb" font-family="Arial, sans-serif" font-size="30" font-weight="700">{observation_id}</text>
-  <text x="54" y="116" fill="#a7f3d0" font-family="Arial, sans-serif" font-size="24">{target}</text>
-  <text x="54" y="304" fill="#d1d5db" font-family="Arial, sans-serif" font-size="20">{coordinate}</text>
-</svg>
-"""
 
 
 def route_execution_path(run_dir: str | Path) -> Path:

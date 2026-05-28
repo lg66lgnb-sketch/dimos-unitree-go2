@@ -4,8 +4,10 @@ from collections.abc import Callable
 import json
 import math
 from pathlib import Path
+import struct
 import time
 from typing import Any, TypeVar
+import zlib
 
 from dimos.experimental.dogops.config_loader import (
     DEFAULT_MANIFEST,
@@ -16,6 +18,8 @@ from dimos.experimental.dogops.config_loader import (
     load_mission as read_mission,
     load_site_config as read_site_config,
 )
+from dimos.experimental.dogops.detector import DetectedTag, DogOpsTagDetector
+from dimos.experimental.dogops.heatmap_runs import gather_heatmap_run
 from dimos.experimental.dogops.mission_engine import run_offline_simulation
 from dimos.experimental.dogops.models import (
     Asset,
@@ -25,6 +29,7 @@ from dimos.experimental.dogops.models import (
     IncidentType,
     MissionState,
     Observation,
+    PackageState,
     Severity,
     WorkOrder,
     WorkOrderState,
@@ -38,6 +43,11 @@ from dimos.experimental.dogops.route_executor import (
     RouteExecutionError,
 )
 from dimos.experimental.dogops.store import DogOpsStore
+
+try:  # pragma: no cover - exercised only inside a full DimOS checkout.
+    from reactivex.disposable import Disposable as RxDisposable
+except ModuleNotFoundError:  # pragma: no cover - local project-pack fallback.
+    RxDisposable = None
 
 try:  # pragma: no cover - exercised only inside a full DimOS checkout.
     from dimos.agents.annotation import skill
@@ -60,15 +70,24 @@ try:  # pragma: no cover - exercised only inside a full DimOS checkout.
 except ModuleNotFoundError:
 
     class Module:
+        def __init__(self, **_: object) -> None:
+            pass
+
         @classmethod
         def blueprint(cls, **kwargs: object) -> dict[str, object]:
             return {"module": cls.__name__, "kwargs": kwargs}
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
 
 
 try:  # pragma: no cover - exercised only inside a full DimOS checkout.
     from dimos.core.stream import In, Out
     from dimos.msgs.geometry_msgs.PointStamped import PointStamped
-    from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
+    from dimos.msgs.sensor_msgs.Image import Image
 except ModuleNotFoundError:  # pragma: no cover - local project-pack fallback.
 
     class In:
@@ -95,15 +114,14 @@ except ModuleNotFoundError:  # pragma: no cover - local project-pack fallback.
             self.y = y
             self.z = z
 
-    class PoseStamped:
-        pass
+    Image = Any  # type: ignore[misc, assignment]
 
 
 class DogOpsSkillContainer(Module):
     """Deterministic SiteOps skills exposed through DimOS MCP or direct tests."""
 
+    color_image: In[Image]
     clicked_point: Out[PointStamped]
-    odom: In[PoseStamped]
 
     def __init__(
         self,
@@ -128,27 +146,19 @@ class DogOpsSkillContainer(Module):
         self._go_to_handler = go_to_handler
         self._route_stop_handler = route_stop_handler
         self._live_map_adapter = live_map_adapter
-        self._latest_odom: tuple[float, Any] | None = None
-        self._latest_clicked_point: tuple[float, Any] | None = None
-        self._fallback_unsubscribers: list[Callable[[], object]] = []
+        self._latest_camera_image: object | None = None
+        self._latest_camera_received_at: float | None = None
 
-    def start(self) -> None:  # pragma: no cover - exercised inside full DimOS.
-        odom = getattr(self, "odom", None)
-        if odom is not None and hasattr(odom, "subscribe"):
-            unsubscribe = odom.subscribe(self._record_odom)
-            self._register_unsubscribe(unsubscribe)
+    def start(self) -> None:  # pragma: no cover - lifecycle exercised in full DimOS.
+        super().start()
+        color_image = getattr(self, "color_image", None)
+        if color_image is not None and hasattr(color_image, "subscribe"):
+            subscription = color_image.subscribe(self.ingest_camera_image)
+            _register_subscription(self, subscription)
 
-    def stop(self) -> None:  # pragma: no cover - exercised inside full DimOS.
-        unsubscribers = list(self._fallback_unsubscribers)
-        self._fallback_unsubscribers.clear()
-        for unsubscribe in unsubscribers:
-            try:
-                unsubscribe()
-            except Exception:
-                pass
-        stop = getattr(super(), "stop", None)
-        if stop is not None:
-            stop()
+    def ingest_camera_image(self, image: object) -> None:
+        self._latest_camera_image = image
+        self._latest_camera_received_at = time.time()
 
     @skill
     def load_site_config(self, path: str = str(DEFAULT_SITE)) -> str:
@@ -279,11 +289,14 @@ class DogOpsSkillContainer(Module):
                 error="navigation_stream_unavailable",
                 message="DogOps follow_route needs the DimOS clicked_point stream or a handler.",
             )
+        live_adapter = self._live_map_adapter or DogOpsLiveMapAdapter()
         executor = DogOpsRouteExecutor(
             self.run_dir,
             goal_publisher=publisher,
             stop_handler=self._route_stop_handler,
-            live_snapshot_reader=self._route_live_snapshot if not dry_run else None,
+            scan_zone_handler=self.scan_zone,
+            capture_image_handler=self._capture_latest_camera_image,
+            live_snapshot_reader=live_adapter.snapshot if not dry_run else None,
         )
         try:
             state = executor.follow_route(route_id, dry_run=dry_run)
@@ -350,8 +363,25 @@ class DogOpsSkillContainer(Module):
         )
 
     @skill
+    def gather_heatmap(self, area_id: str = "", duration_s: float = 0.0) -> str:
+        """Snapshot the current DimOS costmap as a DogOps gather-heatmap run."""
+        live_adapter = self._live_map_adapter or DogOpsLiveMapAdapter()
+        result = gather_heatmap_run(
+            self.run_dir,
+            live_snapshot=live_adapter.snapshot(),
+            live_snapshot_reader=live_adapter.snapshot,
+            area_id=area_id,
+            duration_s=duration_s,
+        )
+        return _json(skill="gather_heatmap", **result)
+
+    @skill
     def scan_zone(self, zone_id: str) -> str:
-        """Scan a configured site zone and return visible tags and packages."""
+        """Scan a zone using the live camera when available, otherwise deterministic fixtures."""
+        camera_result = self._scan_zone_with_latest_camera(zone_id)
+        if camera_result is not None:
+            return camera_result
+
         mission = read_mission(self.mission_path)
         observations = [
             obs for obs in mission.simulation_observations.values() if obs.zone_id == zone_id
@@ -371,7 +401,42 @@ class DogOpsSkillContainer(Module):
             zone_id=zone_id,
             visible_tag_ids=visible_tag_ids,
             package_ids=package_ids,
+            source="simulation",
         )
+
+    @skill
+    def camera_stream_status(self) -> str:
+        """Return whether DogOps has received a live camera frame."""
+        return _json(skill="camera_stream_status", **self._camera_stream_status())
+
+    def _capture_latest_camera_image(self, context: dict[str, Any]) -> dict[str, Any] | None:
+        if self._latest_camera_image is None:
+            raise RuntimeError("no live Go2 camera frame is available for capture_image")
+        action = context.get("action") if isinstance(context.get("action"), dict) else {}
+        action_args = action.get("args") if isinstance(action, dict) and isinstance(action.get("args"), dict) else {}
+        max_age_s = _positive_float(action_args.get("max_camera_frame_age_s"), default=2.0)
+        frame_age_s = self._camera_frame_age_s()
+        if frame_age_s is None or frame_age_s > max_age_s:
+            raise RuntimeError(
+                f"latest Go2 camera frame is stale for capture_image: age={frame_age_s}s max={max_age_s}s"
+            )
+        evidence_dir = Path(context["evidence_dir"])
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        waypoint_id = str(context["waypoint_id"])
+        action_id = str(context["action_id"])
+        path = evidence_dir / f"{waypoint_id}-{action_id}.png"
+        _write_camera_frame_png(path, self._latest_camera_image)
+        return {
+            "path": str(path),
+            "source": "go2_camera_live",
+            "mime_type": "image/png",
+            "metadata": {
+                "camera_frame_age_s": frame_age_s,
+                "camera_frame_id": getattr(self._latest_camera_image, "frame_id", None),
+                "camera_shape": _image_shape(self._latest_camera_image),
+                "camera_encoding": getattr(self._latest_camera_image, "encoding", None),
+            },
+        }
 
     @skill
     def read_gauge(self, asset_id: str = "TEMP_1") -> str:
@@ -780,6 +845,94 @@ class DogOpsSkillContainer(Module):
         assert store.state is not None
         return store.state
 
+    def _scan_zone_with_latest_camera(self, zone_id: str) -> str | None:
+        if self._latest_camera_image is None:
+            return None
+
+        site = read_site_config(self.site_path)
+        if zone_id not in site.zone_by_id():
+            return _json(ok=False, skill="scan_zone", error="unknown_zone", zone_id=zone_id)
+
+        try:
+            detections = DogOpsTagDetector(site).detect_dimos_image(self._latest_camera_image)
+        except RuntimeError as exc:
+            return _json(
+                ok=False,
+                skill="scan_zone",
+                error="camera_detector_unavailable",
+                message=str(exc),
+                zone_id=zone_id,
+                source="camera",
+            )
+
+        visible_tag_ids = sorted({detection.tag_id for detection in detections})
+        package_ids = _package_ids_from_detections(detections)
+        evidence_observation_ids = self._persist_camera_observations(
+            detections,
+            zone_id=zone_id,
+        )
+        return _json(
+            ok=True,
+            skill="scan_zone",
+            zone_id=zone_id,
+            visible_tag_ids=visible_tag_ids,
+            package_ids=package_ids,
+            source="camera",
+            detection_count=len(detections),
+            camera_frame_age_s=self._camera_frame_age_s(),
+            evidence_observation_ids=evidence_observation_ids,
+        )
+
+    def _persist_camera_observations(
+        self,
+        detections: list[DetectedTag],
+        *,
+        zone_id: str,
+    ) -> list[str]:
+        if not detections or not self._state_file().exists():
+            return []
+
+        store = DogOpsStore.load_existing(self.run_dir)
+        state = store.state
+        assert state is not None
+        evidence_ids: list[str] = []
+        observed_at = time.time()
+        for index, detection in enumerate(detections, start=1):
+            observation = _camera_observation(
+                detection,
+                zone_id=zone_id,
+                run_id=state.run.id,
+                observed_at=observed_at,
+                index=index,
+            )
+            store.append_observation(observation)
+            _apply_observation_package_facts(state, observation)
+            evidence_ids.append(observation.id)
+
+        store.write_state(state.run.id)
+        store.write_report(state.run.id)
+        return evidence_ids
+
+    def _camera_stream_status(self) -> dict[str, object]:
+        if self._latest_camera_image is None:
+            return {
+                "ok": False,
+                "mode": "not_subscribed",
+                "fallback": "scan_zone uses deterministic fixtures until a camera frame arrives",
+            }
+        return {
+            "ok": True,
+            "mode": "latest_frame",
+            "frame_age_s": self._camera_frame_age_s(),
+            "frame_id": getattr(self._latest_camera_image, "frame_id", None),
+            "shape": _image_shape(self._latest_camera_image),
+        }
+
+    def _camera_frame_age_s(self) -> float | None:
+        if self._latest_camera_received_at is None:
+            return None
+        return round(time.time() - self._latest_camera_received_at, 3)
+
     def _require_store(self, skill_name: str) -> DogOpsStore | str:
         if not self._state_file().exists():
             return _json(ok=False, skill=skill_name, error="missing_run", run_dir=str(self.run_dir))
@@ -791,62 +944,7 @@ class DogOpsSkillContainer(Module):
         publisher = getattr(self, "clicked_point", None)
         if publisher is None or not hasattr(publisher, "publish"):
             return None
-        return ClickedPointGoalPublisher(
-            publisher,
-            PointStamped,
-            on_publish=self._record_clicked_point,
-        )
-
-    def _register_unsubscribe(self, unsubscribe: object) -> None:
-        if not callable(unsubscribe):
-            return
-        try:
-            from reactivex.disposable import Disposable
-        except ModuleNotFoundError:
-            self._fallback_unsubscribers.append(unsubscribe)
-            return
-        register = getattr(self, "register_disposable", None)
-        if register is None:
-            self._fallback_unsubscribers.append(unsubscribe)
-            return
-        register(Disposable(unsubscribe))
-
-    def _record_odom(self, msg: Any) -> None:
-        self._latest_odom = (time.time(), msg)
-
-    def _record_clicked_point(self, msg: Any) -> None:
-        self._latest_clicked_point = (time.time(), msg)
-
-    def _route_live_snapshot(self) -> dict[str, Any]:
-        if self._live_map_adapter is not None:
-            snapshot = self._live_map_adapter.snapshot()
-        else:
-            snapshot = {
-                "ok": False,
-                "source": "DogOpsSkillContainer direct streams",
-                "status": "waiting_for_topics",
-                "topics": {},
-            }
-        now = time.time()
-        odom_pose = _pose_msg_to_map_pose(self._latest_odom, now=now, source="odom")
-        clicked_point = _point_msg_to_map_pose(
-            self._latest_clicked_point,
-            now=now,
-            source="clicked_point",
-        )
-        topics = dict(snapshot.get("topics") or {})
-        if odom_pose is not None:
-            snapshot["robot_pose"] = odom_pose
-            topics["odom"] = _topic_status("/odom", self._latest_odom, now)
-        if clicked_point is not None:
-            snapshot["clicked_point"] = clicked_point
-            topics["clicked_point"] = _topic_status("/clicked_point", self._latest_clicked_point, now)
-        if odom_pose is not None or clicked_point is not None:
-            snapshot["ok"] = True
-            snapshot["status"] = "receiving"
-            snapshot["source"] = "DogOpsSkillContainer direct streams"
-        snapshot["topics"] = topics
-        return snapshot
+        return ClickedPointGoalPublisher(publisher, PointStamped)
 
 
 def _find_incident(incidents: list[Incident], incident_id: str) -> Incident | None:
@@ -856,68 +954,171 @@ def _find_incident(incidents: list[Incident], incident_id: str) -> Incident | No
     return None
 
 
-def _topic_status(topic: str, latest: tuple[float, Any] | None, now: float) -> dict[str, Any]:
-    age_s = round(now - latest[0], 3) if latest is not None else None
-    return {
-        "topic": topic,
-        "received": latest is not None,
-        "age_s": age_s,
-        "stale": False,
-    }
-
-
-def _pose_msg_to_map_pose(
-    latest: tuple[float, Any] | None,
+def _camera_observation(
+    detection: DetectedTag,
     *,
-    now: float,
-    source: str,
-) -> dict[str, Any] | None:
-    if latest is None:
-        return None
-    msg = latest[1]
-    pose = getattr(msg, "pose", msg)
-    position = getattr(pose, "position", pose)
-    x = _finite_float(getattr(position, "x", None))
-    y = _finite_float(getattr(position, "y", None))
-    if x is None or y is None:
-        return None
-    return {
-        "x": x,
-        "y": y,
-        "source": source,
-        "age_s": round(now - latest[0], 3),
+    zone_id: str,
+    run_id: str,
+    observed_at: float,
+    index: int,
+) -> Observation:
+    facts = _camera_detection_facts(detection, zone_id)
+    return Observation(
+        id=f"CAM-{int(observed_at * 1000)}-{index:02d}-{detection.tag_id}",
+        ts=observed_at,
+        run_id=run_id,
+        entity_id=detection.entity_id,
+        tag_id=detection.tag_id,
+        zone_id=zone_id,
+        facts=facts,
+        confidence=detection.confidence,
+        source=detection.source,
+    )
+
+
+def _camera_detection_facts(
+    detection: DetectedTag,
+    zone_id: str,
+) -> dict[str, bool | str | int | float]:
+    facts: dict[str, bool | str | int | float] = {
+        "entity_kind": detection.entity_kind or "unknown",
+        "detection_source": detection.source,
+        "frame_id": detection.frame_id or "",
+        "visible_tag_ids": str(detection.tag_id),
+        "center_px": _format_point(detection.center_px),
+        "area_px": round(detection.area_px, 3) if detection.area_px is not None else 0.0,
     }
+    if detection.entity_id and detection.entity_id.startswith("PKG-"):
+        facts[f"{detection.entity_id}.zone_id"] = zone_id
+    return facts
 
 
-def _point_msg_to_map_pose(
-    latest: tuple[float, Any] | None,
-    *,
-    now: float,
-    source: str,
-) -> dict[str, Any] | None:
-    if latest is None:
+def _apply_observation_package_facts(state: DogOpsState, obs: Observation) -> None:
+    for key, value in obs.facts.items():
+        if not key.endswith(".zone_id"):
+            continue
+        package_id = key.removesuffix(".zone_id")
+        status = state.package_statuses.get(package_id)
+        if status is None or not isinstance(value, str):
+            continue
+        previous_zone = status.observed_zone_id
+        status.observed_zone_id = value
+        if value == status.expected_zone_id:
+            status.state = PackageState.found_ok
+            status.blocks_asset_id = None
+        else:
+            status.state = PackageState.wrong_zone
+        if package_id == "PKG-104" and previous_zone in {"RACK_ROW_A", "COOLING_1"}:
+            if value == "QA_HOLD":
+                state.what_changed.append(
+                    "PKG-104 moved from COOLING_1/RACK_ROW_A to QA_HOLD; INC-001 resolved."
+                )
+
+
+def _package_ids_from_detections(detections: list[DetectedTag]) -> list[str]:
+    return sorted(
+        detection.entity_id
+        for detection in detections
+        if detection.entity_id is not None and detection.entity_id.startswith("PKG-")
+    )
+
+
+def _image_shape(image: object) -> list[int] | None:
+    shape = getattr(image, "shape", None)
+    data = getattr(image, "data", None)
+    if shape is None and data is not None:
+        shape = getattr(data, "shape", None)
+    if shape is None:
         return None
-    msg = latest[1]
-    x = _finite_float(getattr(msg, "x", None))
-    y = _finite_float(getattr(msg, "y", None))
-    if x is None or y is None:
-        return None
-    return {
-        "x": x,
-        "y": y,
-        "source": source,
-        "age_s": round(now - latest[0], 3),
-    }
+    return [int(item) for item in shape]
 
 
-def _finite_float(value: object) -> float | None:
+def _write_camera_frame_png(path: Path, image: object) -> None:
+    array = _camera_array_from_image(image)
+    shape = getattr(array, "shape", None)
+    if shape is None and hasattr(image, "shape"):
+        shape = getattr(image, "shape")
+    if shape is None or len(shape) < 2:
+        raise RuntimeError("latest camera frame does not expose a 2D image shape")
+
+    height = int(shape[0])
+    width = int(shape[1])
+    channels = int(shape[2]) if len(shape) > 2 else 1
+    encoding = str(getattr(image, "encoding", "") or "").lower()
+    rows = []
+    for y in range(height):
+        row = bytearray()
+        for x in range(width):
+            row.extend(_rgb_pixel(array[y][x], channels=channels, encoding=encoding))
+        rows.append(b"\x00" + bytes(row))
+    raw = b"".join(rows)
+    path.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + _png_chunk(b"tEXt", b"Description\x00DogOps live Go2 camera frame")
+        + _png_chunk(b"IDAT", zlib.compress(raw, level=6))
+        + _png_chunk(b"IEND", b"")
+    )
+
+
+def _camera_array_from_image(image: object) -> Any:
+    if hasattr(image, "to_opencv"):
+        return image.to_opencv()  # type: ignore[attr-defined]
+    data = getattr(image, "data", None)
+    if data is not None and hasattr(data, "shape"):
+        return data
+    return image
+
+
+def _rgb_pixel(pixel: object, *, channels: int, encoding: str) -> bytes:
+    if channels <= 1:
+        value = _uint8(pixel)
+        return bytes((value, value, value))
+    values = [_uint8(pixel[index]) for index in range(min(channels, 4))]  # type: ignore[index]
+    if len(values) < 3:
+        value = values[0] if values else 0
+        return bytes((value, value, value))
+    if "rgb" in encoding and "bgr" not in encoding:
+        red, green, blue = values[:3]
+    else:
+        blue, green, red = values[:3]
+    return bytes((red, green, blue))
+
+
+def _uint8(value: object) -> int:
+    result = int(value)  # type: ignore[arg-type]
+    return max(0, min(255, result))
+
+
+def _positive_float(value: object, *, default: float) -> float:
     try:
         result = float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
-        return None
-    if not math.isfinite(result):
-        return None
+        return default
+    if not math.isfinite(result) or result <= 0:
+        return default
     return result
+
+
+def _png_chunk(kind: bytes, data: bytes) -> bytes:
+    checksum = zlib.crc32(kind + data) & 0xFFFFFFFF
+    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", checksum)
+
+
+def _format_point(point: tuple[float, float] | None) -> str:
+    if point is None:
+        return ""
+    return f"{point[0]:.1f},{point[1]:.1f}"
+
+
+def _register_subscription(owner: object, subscription: object) -> None:
+    register = getattr(owner, "register_disposable", None)
+    if not callable(register):
+        return
+    if callable(subscription) and RxDisposable is not None:
+        register(RxDisposable(subscription))
+        return
+    register(subscription)
 
 
 def _find_work_order(work_orders: list[WorkOrder], work_order_id: str) -> WorkOrder | None:

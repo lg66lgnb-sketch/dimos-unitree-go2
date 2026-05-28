@@ -32,15 +32,3 @@ def test_cli_validate_and_simulate(tmp_path) -> None:
     assert "PKG-104 wrong zone and blocking COOLING_1" in (run_dir / "report.md").read_text(
         encoding="utf-8"
     )
-
-
-def test_cli_exposes_rerun_sim_command() -> None:
-    help_result = subprocess.run(
-        [sys.executable, "-m", "dimos.experimental.dogops.cli", "rerun-sim", "--help"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-
-    assert "--source-url" in help_result.stdout
-    assert "--view-mode" in help_result.stdout

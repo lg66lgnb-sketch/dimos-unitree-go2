@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import sqlite3
+import time
+
 from dimos.experimental.dogops.map_authoring import (
     EditableMapPoint,
     EditableRoute,
@@ -8,6 +11,7 @@ from dimos.experimental.dogops.map_authoring import (
     save_map_authoring,
 )
 from dimos.experimental.dogops.route_executor import DogOpsRouteExecutor
+from dimos.experimental.dogops.route_actions import EditableRouteAction
 from dimos.experimental.dogops.route_run_store import RouteRunStore, route_run_db_path
 
 
@@ -62,6 +66,217 @@ def test_every_route_run_gets_distinct_history_record(tmp_path) -> None:
     assert [run["route_run_id"] for run in runs] == [second.route_run_id, first.route_run_id]
     assert (run_dir / "route_runs" / first.route_run_id / "events.jsonl").exists()
     assert (run_dir / "route_runs" / second.route_run_id / "route_run.json").exists()
+
+
+def test_latest_image_evidence_for_waypoint_ignores_current_route_run(tmp_path) -> None:
+    run_dir = tmp_path / ".dogops" / "runs" / "latest"
+    source_image = tmp_path / "frame.jpg"
+    source_image.write_bytes(b"fake-jpeg")
+    route = EditableRoute(
+        id="ROUTE_IMAGES",
+        label="Route Images",
+        waypoints=[
+            EditableRouteWaypoint(
+                id="WP-IMAGE",
+                label="Image Waypoint",
+                target_id="COOLING_1",
+                pose=EditableMapPoint(x=1.0, y=2.0),
+                actions=[
+                    EditableRouteAction(
+                        id="CAPTURE",
+                        kind="capture_image",
+                        args={"image_path": str(source_image), "target": "COOLING_1"},
+                    )
+                ],
+            )
+        ],
+    )
+    save_map_authoring(run_dir, MapAuthoringState(selected_route_id="ROUTE_IMAGES", routes=[route]))
+
+    first = DogOpsRouteExecutor(run_dir).follow_route(dry_run=True)
+    second = DogOpsRouteExecutor(run_dir).follow_route(dry_run=True)
+
+    assert first.route_run_id
+    assert second.route_run_id
+    store = RouteRunStore(run_dir)
+    current = store.image_evidence_for_route_run_waypoint(
+        route_run_id=second.route_run_id,
+        waypoint_id="WP-IMAGE",
+    )
+    baseline = store.latest_image_evidence_for_waypoint(
+        waypoint_id="WP-IMAGE",
+        exclude_route_run_id=second.route_run_id,
+        route_id="ROUTE_IMAGES",
+        target_id="COOLING_1",
+    )
+
+    assert current is not None
+    assert baseline is not None
+    assert current["route_run_id"] == second.route_run_id
+    assert baseline["route_run_id"] == first.route_run_id
+    assert baseline["baseline_match"] == "same_route_waypoint"
+
+
+def test_latest_image_evidence_for_waypoint_ignores_future_route_runs(tmp_path) -> None:
+    run_dir = tmp_path / ".dogops" / "runs" / "latest"
+    source_image = tmp_path / "frame.jpg"
+    source_image.write_bytes(b"fake-jpeg")
+    route = EditableRoute(
+        id="ROUTE_IMAGES",
+        label="Route Images",
+        waypoints=[
+            EditableRouteWaypoint(
+                id="WP-IMAGE",
+                label="Image Waypoint",
+                target_id="COOLING_1",
+                pose=EditableMapPoint(x=1.0, y=2.0),
+                actions=[
+                    EditableRouteAction(
+                        id="CAPTURE",
+                        kind="capture_image",
+                        args={"image_path": str(source_image), "target": "COOLING_1"},
+                    )
+                ],
+            )
+        ],
+    )
+    save_map_authoring(run_dir, MapAuthoringState(selected_route_id="ROUTE_IMAGES", routes=[route]))
+    previous = DogOpsRouteExecutor(run_dir).follow_route(dry_run=True)
+    current = DogOpsRouteExecutor(run_dir).follow_route(dry_run=True)
+    future = DogOpsRouteExecutor(run_dir).follow_route(dry_run=True)
+    assert previous.route_run_id
+    assert current.route_run_id
+    assert future.route_run_id
+
+    now = time.time()
+    with sqlite3.connect(route_run_db_path(run_dir)) as conn:
+        conn.execute(
+            "UPDATE route_runs SET started_at = ? WHERE route_run_id = ?",
+            (now - 60.0, previous.route_run_id),
+        )
+        conn.execute(
+            "UPDATE route_runs SET started_at = ? WHERE route_run_id = ?",
+            (now, current.route_run_id),
+        )
+        conn.execute(
+            "UPDATE route_runs SET started_at = ? WHERE route_run_id = ?",
+            (now + 60.0, future.route_run_id),
+        )
+
+    baseline = RouteRunStore(run_dir).latest_image_evidence_for_waypoint(
+        waypoint_id="WP-IMAGE",
+        exclude_route_run_id=current.route_run_id,
+        route_id="ROUTE_IMAGES",
+        target_id="COOLING_1",
+    )
+
+    assert baseline is not None
+    assert baseline["route_run_id"] == previous.route_run_id
+
+
+def test_latest_image_evidence_prefers_same_route_for_reused_waypoint_ids(tmp_path) -> None:
+    run_dir = tmp_path / ".dogops" / "runs" / "latest"
+    source_image = tmp_path / "frame.jpg"
+    source_image.write_bytes(b"fake-jpeg")
+
+    def route(route_id: str) -> EditableRoute:
+        return EditableRoute(
+            id=route_id,
+            label=route_id,
+            waypoints=[
+                EditableRouteWaypoint(
+                    id="WP-SHARED",
+                    label="Shared Waypoint",
+                    target_id="COOLING_1",
+                    pose=EditableMapPoint(x=1.0, y=2.0),
+                    actions=[
+                        EditableRouteAction(
+                            id="CAPTURE",
+                            kind="capture_image",
+                            args={"image_path": str(source_image), "target": "COOLING_1"},
+                        )
+                    ],
+                )
+            ],
+        )
+
+    save_map_authoring(run_dir, MapAuthoringState(selected_route_id="ROUTE_A", routes=[route("ROUTE_A")]))
+    route_a = DogOpsRouteExecutor(run_dir).follow_route(dry_run=True)
+    save_map_authoring(run_dir, MapAuthoringState(selected_route_id="ROUTE_B", routes=[route("ROUTE_B")]))
+    route_b = DogOpsRouteExecutor(run_dir).follow_route(dry_run=True)
+    current = DogOpsRouteExecutor(run_dir).follow_route(dry_run=True)
+    assert route_a.route_run_id
+    assert route_b.route_run_id
+    assert current.route_run_id
+
+    baseline = RouteRunStore(run_dir).latest_image_evidence_for_waypoint(
+        waypoint_id="WP-SHARED",
+        exclude_route_run_id=current.route_run_id,
+        route_id="ROUTE_B",
+        target_id="COOLING_1",
+    )
+
+    assert baseline is not None
+    assert baseline["route_run_id"] == route_b.route_run_id
+    assert baseline["baseline_match"] == "same_route_waypoint"
+
+
+def test_yesterday_baseline_policy_prefers_previous_calendar_day(tmp_path) -> None:
+    run_dir = tmp_path / ".dogops" / "runs" / "latest"
+    source_image = tmp_path / "frame.jpg"
+    source_image.write_bytes(b"fake-jpeg")
+    route = EditableRoute(
+        id="ROUTE_IMAGES",
+        label="Route Images",
+        waypoints=[
+            EditableRouteWaypoint(
+                id="WP-IMAGE",
+                label="Image Waypoint",
+                target_id="COOLING_1",
+                pose=EditableMapPoint(x=1.0, y=2.0),
+                actions=[
+                    EditableRouteAction(
+                        id="CAPTURE",
+                        kind="capture_image",
+                        args={"image_path": str(source_image), "target": "COOLING_1"},
+                    )
+                ],
+            )
+        ],
+    )
+    save_map_authoring(run_dir, MapAuthoringState(selected_route_id="ROUTE_IMAGES", routes=[route]))
+    old = DogOpsRouteExecutor(run_dir).follow_route(dry_run=True)
+    previous_day = DogOpsRouteExecutor(run_dir).follow_route(dry_run=True)
+    current = DogOpsRouteExecutor(run_dir).follow_route(dry_run=True)
+    assert old.route_run_id
+    assert previous_day.route_run_id
+    assert current.route_run_id
+
+    current_started_at = time.time()
+    with sqlite3.connect(route_run_db_path(run_dir)) as conn:
+        conn.execute(
+            "UPDATE route_runs SET started_at = ? WHERE route_run_id = ?",
+            (current_started_at - 3 * 24 * 60 * 60, old.route_run_id),
+        )
+        conn.execute(
+            "UPDATE route_runs SET started_at = ? WHERE route_run_id = ?",
+            (current_started_at - 24 * 60 * 60, previous_day.route_run_id),
+        )
+        conn.execute(
+            "UPDATE route_runs SET started_at = ? WHERE route_run_id = ?",
+            (current_started_at, current.route_run_id),
+        )
+
+    baseline = RouteRunStore(run_dir).latest_image_evidence_for_waypoint(
+        waypoint_id="WP-IMAGE",
+        exclude_route_run_id=current.route_run_id,
+        route_id="ROUTE_IMAGES",
+        baseline_policy="yesterday",
+    )
+
+    assert baseline is not None
+    assert baseline["route_run_id"] == previous_day.route_run_id
+    assert baseline["baseline_match"] == "previous_day_same_route_waypoint"
 
 
 def test_mission_steps_provide_default_route_actions_for_full_demo_route(tmp_path) -> None:

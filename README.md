@@ -104,33 +104,6 @@ Open:
 http://127.0.0.1:18769/
 ```
 
-## Native MuJoCo Simulation
-
-Use native mode when the top 3D View must reflect the simulated Go2 and MuJoCo scene instead of the DogOps synthetic replay. Start the full DimOS Go2 simulation with Rerun Web:
-
-```bash
-cd $DIMOS_ROOT
-uv run --no-sync dimos --simulation --viewer rerun --rerun-open none --rerun-web run unitree-go2
-```
-
-In another terminal, prepare a DogOps run and serve the dashboard against that same local Rerun source:
-
-```bash
-cd $DIMOS_ROOT
-uv run --no-sync python -m dimos.experimental.dogops.cli simulate --out .dogops/runs/latest
-
-DOGOPS_RUNTIME_MODE=rerun-sim \
-DOGOPS_RERUN_VIEW_MODE=native-3d \
-DOGOPS_RERUN_SOURCE_URL=rerun+http://127.0.0.1:9877/proxy \
-DOGOPS_RERUN_WEB_URL=http://127.0.0.1:9877 \
-  uv run --no-sync python -m dimos.experimental.dogops.cli serve \
-  --run .dogops/runs/latest \
-  --host 127.0.0.1 \
-  --port 18769
-```
-
-In `native-3d`, the dashboard's **Map From Scratch** control publishes DimOS `/explore_cmd`, connects the 3D View, and refreshes `/api/map`; it does not request the synthetic DogOps mapping replay.
-
 ## Live Go2 Mode
 
 Live Go2 map mode must run from the full local DimOS checkout/environment, not only an isolated DogOps checkout, because the Unitree WebRTC, LCM, mapping, and navigation stack live in DimOS.
