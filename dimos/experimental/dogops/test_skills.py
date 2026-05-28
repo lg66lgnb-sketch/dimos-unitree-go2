@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import time
 from typing import Any
 
 import pytest
@@ -256,6 +257,80 @@ def test_skill_container_capture_image_uses_latest_camera_frame(tmp_path) -> Non
     assert evidence["metadata"]["camera_frame_id"] == "front-camera"
     image_path = tmp_path / "latest" / "route_runs" / result["route_execution"]["route_run_id"] / "evidence" / "WP-CAMERA-CAPTURE.png"  # type: ignore[index]
     assert image_path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def test_skill_container_capture_image_fails_without_live_camera_frame(tmp_path) -> None:
+    save_map_authoring(
+        tmp_path / "latest",
+        MapAuthoringState(
+            selected_route_id="ROUTE_CAMERA_CAPTURE_MISSING",
+            routes=[
+                EditableRoute(
+                    id="ROUTE_CAMERA_CAPTURE_MISSING",
+                    label="Route Camera Capture Missing",
+                    waypoints=[
+                        EditableRouteWaypoint(
+                            id="WP-CAMERA",
+                            label="Camera",
+                            pose=EditableMapPoint(x=1.0, y=2.0),
+                            actions=[
+                                EditableRouteAction(
+                                    id="CAPTURE",
+                                    kind="capture_image",
+                                )
+                            ],
+                        ),
+                    ],
+                )
+            ],
+        ),
+    )
+    skills = DogOpsSkillContainer(run_dir=tmp_path / "latest")
+
+    result = _payload(skills.follow_route(dry_run=True))
+
+    assert result["ok"] is False
+    assert result["state"] == "failed"
+    assert "no live Go2 camera frame is available" in str(result["last_error"])
+
+
+def test_skill_container_capture_image_rejects_stale_camera_frame(tmp_path) -> None:
+    save_map_authoring(
+        tmp_path / "latest",
+        MapAuthoringState(
+            selected_route_id="ROUTE_CAMERA_CAPTURE_STALE",
+            routes=[
+                EditableRoute(
+                    id="ROUTE_CAMERA_CAPTURE_STALE",
+                    label="Route Camera Capture Stale",
+                    waypoints=[
+                        EditableRouteWaypoint(
+                            id="WP-CAMERA",
+                            label="Camera",
+                            pose=EditableMapPoint(x=1.0, y=2.0),
+                            actions=[
+                                EditableRouteAction(
+                                    id="CAPTURE",
+                                    kind="capture_image",
+                                    args={"max_camera_frame_age_s": 0.5},
+                                )
+                            ],
+                        ),
+                    ],
+                )
+            ],
+        ),
+    )
+    frame = _ArrayLike([[[0, 0, 255]]])
+    skills = DogOpsSkillContainer(run_dir=tmp_path / "latest")
+    skills.ingest_camera_image(_ImageLike(frame, frame_id="front-camera"))
+    skills._latest_camera_received_at = time.time() - 2.0
+
+    result = _payload(skills.follow_route(dry_run=True))
+
+    assert result["ok"] is False
+    assert result["state"] == "failed"
+    assert "latest Go2 camera frame is stale" in str(result["last_error"])
 
 
 def test_skill_container_route_skills_validate_and_report_dry_run(tmp_path) -> None:

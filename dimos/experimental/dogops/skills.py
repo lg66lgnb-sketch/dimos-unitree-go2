@@ -411,7 +411,15 @@ class DogOpsSkillContainer(Module):
 
     def _capture_latest_camera_image(self, context: dict[str, Any]) -> dict[str, Any] | None:
         if self._latest_camera_image is None:
-            return None
+            raise RuntimeError("no live Go2 camera frame is available for capture_image")
+        action = context.get("action") if isinstance(context.get("action"), dict) else {}
+        action_args = action.get("args") if isinstance(action, dict) and isinstance(action.get("args"), dict) else {}
+        max_age_s = _positive_float(action_args.get("max_camera_frame_age_s"), default=2.0)
+        frame_age_s = self._camera_frame_age_s()
+        if frame_age_s is None or frame_age_s > max_age_s:
+            raise RuntimeError(
+                f"latest Go2 camera frame is stale for capture_image: age={frame_age_s}s max={max_age_s}s"
+            )
         evidence_dir = Path(context["evidence_dir"])
         evidence_dir.mkdir(parents=True, exist_ok=True)
         waypoint_id = str(context["waypoint_id"])
@@ -423,7 +431,7 @@ class DogOpsSkillContainer(Module):
             "source": "go2_camera_live",
             "mime_type": "image/png",
             "metadata": {
-                "camera_frame_age_s": self._camera_frame_age_s(),
+                "camera_frame_age_s": frame_age_s,
                 "camera_frame_id": getattr(self._latest_camera_image, "frame_id", None),
                 "camera_shape": _image_shape(self._latest_camera_image),
                 "camera_encoding": getattr(self._latest_camera_image, "encoding", None),
@@ -1080,6 +1088,16 @@ def _rgb_pixel(pixel: object, *, channels: int, encoding: str) -> bytes:
 def _uint8(value: object) -> int:
     result = int(value)  # type: ignore[arg-type]
     return max(0, min(255, result))
+
+
+def _positive_float(value: object, *, default: float) -> float:
+    try:
+        result = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(result) or result <= 0:
+        return default
+    return result
 
 
 def _png_chunk(kind: bytes, data: bytes) -> bytes:
