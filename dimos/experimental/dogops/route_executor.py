@@ -19,6 +19,8 @@ from dimos.experimental.dogops.map_authoring import (
 )
 from dimos.experimental.dogops.models import DogOpsModel, NavAction, NavEvent
 from dimos.experimental.dogops.nav_eval import summarize_nav_events
+from dimos.experimental.dogops.route_actions import EditableRouteAction, execute_route_action
+from dimos.experimental.dogops.route_run_store import RouteRunStore, new_route_run_id
 from dimos.experimental.dogops.store import DogOpsStore
 
 
@@ -30,6 +32,8 @@ RouteExecutionEventState = Literal[
     "queued",
     "sent",
     "accepted",
+    "started",
+    "completed",
     "reached",
     "timeout",
     "failed",
@@ -96,15 +100,20 @@ class RouteExecutionEvent(DogOpsModel):
     retries: int = 0
     guided: bool = False
     note: str = ""
+    kind: Literal["route", "waypoint", "navigation", "action", "observation", "evidence", "incident", "system"] = "waypoint"
+    action_id: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
 
 
 class RouteExecutionState(DogOpsModel):
     run_id: str
+    route_run_id: str | None = None
     route_id: str = ""
     state: Literal["idle", "running", "paused", "completed", "failed", "stopped"] = "idle"
     started_at: float | None = None
     completed_at: float | None = None
     active_waypoint_id: str | None = None
+    active_action_id: str | None = None
     active_index: int = 0
     stop_requested: bool = False
     frame: str = "map"
@@ -163,10 +172,13 @@ class DogOpsRouteExecutor:
     def follow_route(self, route_id: str | None = None, *, dry_run: bool = False) -> RouteExecutionState:
         with route_execution_lock(self.run_dir):
             route, frame = self._resolve_route(route_id)
+            route = self._route_with_default_actions(route)
             self._validate_route(route)
             started_at = self.time_fn()
+            route_run_id = new_route_run_id(route.id, now=started_at)
             state = RouteExecutionState(
                 run_id=self.run_id,
+                route_run_id=route_run_id,
                 route_id=route.id,
                 state="running",
                 started_at=started_at,
@@ -177,7 +189,17 @@ class DogOpsRouteExecutor:
                 transport="dry_run" if dry_run else self._transport_name,
                 waypoints_total=len(route.waypoints),
             )
+            route_run_store = RouteRunStore(self.run_dir)
+            route_run_store.create_route_run(
+                route_run_id=route_run_id,
+                dogops_run_id=self.run_id,
+                route=route,
+                state=state,
+                dry_run=dry_run,
+                route_snapshot=route.model_dump(mode="json"),
+            )
             save_route_execution(self.run_dir, state)
+            route_run_store.sync_execution_state(state)
 
             for index, waypoint in enumerate(route.waypoints):
                 if load_route_execution(self.run_dir, run_id=self.run_id).stop_requested:
@@ -188,9 +210,15 @@ class DogOpsRouteExecutor:
                 queued = self._event(state, waypoint, "queued", started_at, note="waypoint queued")
                 state.events.append(queued)
                 save_route_execution(self.run_dir, state)
+                route_run_store.sync_execution_state(state)
                 if dry_run:
                     continue
                 state = self._execute_waypoint(state, waypoint, started_at)
+                route_run_store.sync_execution_state(state)
+                if state.state in {"failed", "stopped"}:
+                    break
+                state = self._execute_waypoint_actions(state, waypoint, started_at, route_run_store)
+                route_run_store.sync_execution_state(state)
                 if state.state in {"failed", "stopped"}:
                     break
 
@@ -199,6 +227,7 @@ class DogOpsRouteExecutor:
                 state.active_waypoint_id = None
                 state.completed_at = self.time_fn()
                 save_route_execution(self.run_dir, state)
+                route_run_store.sync_execution_state(state)
                 return state
 
             if state.state == "running":
@@ -206,6 +235,7 @@ class DogOpsRouteExecutor:
                 state.active_waypoint_id = None
                 state.completed_at = self.time_fn()
                 save_route_execution(self.run_dir, state)
+                route_run_store.sync_execution_state(state)
             self._append_nav_events(state)
             return state
 
@@ -220,6 +250,7 @@ class DogOpsRouteExecutor:
         elif state.state == "stopped":
             state.last_error = "route stop requested; no navigation stop handler configured"
             save_route_execution(self.run_dir, state)
+        RouteRunStore(self.run_dir).sync_execution_state(state)
         self._append_nav_events(state)
         return state
 
@@ -252,6 +283,39 @@ class DogOpsRouteExecutor:
         for waypoint in route.waypoints:
             if not math.isfinite(waypoint.pose.x) or not math.isfinite(waypoint.pose.y):
                 raise RouteExecutionError(f"waypoint {waypoint.id} has invalid coordinates")
+
+    def _route_with_default_actions(self, route: EditableRoute) -> EditableRoute:
+        state_path = self.run_dir / "state.json"
+        if not state_path.exists():
+            return route
+        store = DogOpsStore.load_existing(self.run_dir)
+        state = store.state
+        assert state is not None
+        steps_by_target: dict[str, list[Any]] = {}
+        for step in state.mission.steps:
+            steps_by_target.setdefault(step.target_id, []).append(step)
+        route_with_actions = route.model_copy(deep=True)
+        for waypoint in route_with_actions.waypoints:
+            if waypoint.actions:
+                continue
+            target_id = waypoint.target_id or waypoint.id
+            actions = []
+            for step in steps_by_target.get(target_id, []):
+                kind = _mission_action_kind(step.action)
+                if kind is None:
+                    continue
+                actions.append(
+                    EditableRouteAction(
+                        id=step.id,
+                        kind=kind,
+                        label=step.action,
+                        required=step.required,
+                        timeout_s=step.timeout_s,
+                        args={"target_id": step.target_id, "mission_action": step.action},
+                    )
+                )
+            waypoint.actions = actions
+        return route_with_actions
 
     def _execute_waypoint(
         self,
@@ -345,6 +409,64 @@ class DogOpsRouteExecutor:
         save_route_execution(self.run_dir, state)
         return state
 
+    def _execute_waypoint_actions(
+        self,
+        state: RouteExecutionState,
+        waypoint: EditableRouteWaypoint,
+        started_at: float,
+        route_run_store: RouteRunStore,
+    ) -> RouteExecutionState:
+        for action in waypoint.actions:
+            if load_route_execution(self.run_dir, run_id=self.run_id).stop_requested:
+                return self._stop_state(state, waypoint, started_at)
+            state.active_action_id = action.id
+            state.events.append(
+                self._action_event(state, waypoint, action, "started", started_at, note="action started")
+            )
+            save_route_execution(self.run_dir, state)
+            route_run_store.sync_execution_state(state)
+            result = execute_route_action(
+                action,
+                run_dir=self.run_dir,
+                route_run_id=state.route_run_id or "",
+                waypoint_id=waypoint.id,
+            )
+            event_state: RouteExecutionEventState = "completed" if result.ok else "failed"
+            state.events.append(
+                self._action_event(
+                    state,
+                    waypoint,
+                    action,
+                    event_state,
+                    started_at,
+                    note=result.note,
+                    payload=result.payload,
+                )
+            )
+            save_route_execution(self.run_dir, state)
+            route_run_store.sync_execution_state(state)
+            action_event_id = f"{state.route_run_id}-{state.events[-1].id}" if state.route_run_id else state.events[-1].id
+            for evidence in result.evidence:
+                route_run_store.record_evidence(
+                    route_run_id=state.route_run_id or "",
+                    event_id=action_event_id,
+                    observation_id=evidence.get("observation_id"),
+                    kind=str(evidence.get("kind") or "evidence"),
+                    path=evidence.get("path"),
+                    metadata=evidence.get("metadata") or {},
+                    mime_type=evidence.get("mime_type"),
+                )
+            if not result.ok and action.required:
+                state.state = "failed"
+                state.last_error = result.note or f"required action failed: {action.id}"
+                state.completed_at = self.time_fn()
+                save_route_execution(self.run_dir, state)
+                route_run_store.sync_execution_state(state)
+                return state
+        state.active_action_id = None
+        save_route_execution(self.run_dir, state)
+        return state
+
     def _wait_until_reached(
         self,
         waypoint: EditableRouteWaypoint,
@@ -409,6 +531,34 @@ class DogOpsRouteExecutor:
             note=note,
         )
 
+    def _action_event(
+        self,
+        state: RouteExecutionState,
+        waypoint: EditableRouteWaypoint,
+        action: EditableRouteAction,
+        event_state: RouteExecutionEventState,
+        started_at: float,
+        *,
+        note: str = "",
+        payload: dict[str, Any] | None = None,
+    ) -> RouteExecutionEvent:
+        return RouteExecutionEvent(
+            id=f"RTE-{len(state.events) + 1:03d}",
+            ts=self.time_fn(),
+            route_id=state.route_id,
+            waypoint_id=waypoint.id,
+            target_id=waypoint.target_id or waypoint.id,
+            x=waypoint.pose.x,
+            y=waypoint.pose.y,
+            state=event_state,
+            elapsed_s=max(0.0, self.time_fn() - started_at),
+            guided=action.kind == "operator_prompt",
+            note=note,
+            kind="action",
+            action_id=action.id,
+            payload={"kind": action.kind, **(payload or {})},
+        )
+
     def _stop_state(
         self,
         state: RouteExecutionState,
@@ -421,6 +571,7 @@ class DogOpsRouteExecutor:
         state.events.append(self._event(state, waypoint, "stopped", started_at, note="stop requested"))
         state.completed_at = self.time_fn()
         save_route_execution(self.run_dir, state)
+        RouteRunStore(self.run_dir).sync_execution_state(state)
         self._append_nav_events(state)
         return state
 
@@ -560,6 +711,15 @@ def route_feedback_from_snapshot(snapshot: dict[str, Any]) -> tuple[dict[str, fl
             except (TypeError, ValueError):
                     age_s = None
     return {"x": x, "y": y}, age_s
+
+
+def _mission_action_kind(action: str) -> str | None:
+    return {
+        "scan_zone": "scan_tags",
+        "inspect_asset": "inspect_asset",
+        "verify_work_order": "verify_work_order",
+        "wait_for_human_fix": "operator_prompt",
+    }.get(action)
 
 
 def _pose_matches_waypoint(pose: Any, waypoint: EditableRouteWaypoint) -> bool:

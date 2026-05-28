@@ -36,6 +36,7 @@ from dimos.experimental.dogops.map_authoring import (
     save_map_authoring,
 )
 from dimos.experimental.dogops.mission_engine import run_offline_simulation
+from dimos.experimental.dogops.route_executor import DogOpsRouteExecutor
 
 
 def _get_json(url: str) -> dict[str, object]:
@@ -1501,6 +1502,63 @@ def test_dashboard_route_status_requires_token(tmp_path) -> None:
 
     assert status == 403
     assert result["error"] == "map_authoring_forbidden"
+
+
+def test_dashboard_route_run_history_endpoints(tmp_path) -> None:
+    run_dir = tmp_path / ".dogops" / "runs" / "latest"
+    run_offline_simulation(out=run_dir)
+    save_map_authoring(
+        run_dir,
+        MapAuthoringState(
+            selected_route_id="ROUTE_A",
+            routes=[
+                EditableRoute(
+                    id="ROUTE_A",
+                    label="Route A",
+                    waypoints=[
+                        EditableRouteWaypoint(
+                            id="WP-1",
+                            label="Waypoint 1",
+                            pose=EditableMapPoint(x=1.0, y=2.0),
+                        )
+                    ],
+                )
+            ],
+        ),
+    )
+    route_state = DogOpsRouteExecutor(run_dir).follow_route(dry_run=True)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        status_list, route_runs = _get_json_with_status(
+            f"{base_url}/api/route-runs",
+            headers=_robot_headers(server),
+        )
+        status_current, current = _get_json_with_status(
+            f"{base_url}/api/route-runs/current",
+            headers=_robot_headers(server),
+        )
+        status_events, events = _get_json_with_status(
+            f"{base_url}/api/route-runs/{route_state.route_run_id}/events",
+            headers=_robot_headers(server),
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status_list == 200
+    assert route_runs["route_runs"][0]["route_run_id"] == route_state.route_run_id  # type: ignore[index]
+    assert status_current == 200
+    assert current["route_run"]["route_run_id"] == route_state.route_run_id  # type: ignore[index]
+    assert current["events"][0]["state"] == "queued"  # type: ignore[index]
+    timeline_kinds = {row["kind"] for row in current["timeline"]}  # type: ignore[index]
+    assert {"waypoint", "observation", "incident", "work_order", "verification"} <= timeline_kinds
+    assert status_events == 200
+    assert events["events"][0]["route_run_id"] == route_state.route_run_id  # type: ignore[index]
 
 
 def test_dimos_mcp_call_command_prefers_configured_prefix(monkeypatch) -> None:

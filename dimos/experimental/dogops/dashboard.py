@@ -52,6 +52,7 @@ from dimos.experimental.dogops.map_authoring import (
     validation_error_message,
 )
 from dimos.experimental.dogops.route_executor import load_route_execution, request_route_stop
+from dimos.experimental.dogops.route_run_store import RouteRunStore
 from dimos.experimental.dogops.store import DogOpsStore
 
 try:  # pragma: no cover - exercised only inside a full DimOS checkout.
@@ -218,6 +219,15 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/map/routes/status":
             if self._authorize_map_authoring_write():
                 self._route_execution_status()
+        elif path == "/api/route-runs":
+            if self._authorize_map_authoring_write():
+                self._route_runs_list()
+        elif path == "/api/route-runs/current":
+            if self._authorize_map_authoring_write():
+                self._route_runs_current()
+        elif path.startswith("/api/route-runs/"):
+            if self._authorize_map_authoring_write():
+                self._route_runs_detail(path)
         elif path == "/api/robot/pose":
             if self._authorize_local_read():
                 self._send_json(_robot_pose_snapshot(self.robot_ip))
@@ -608,6 +618,117 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
     def _route_execution_status(self) -> None:
         self._send_json({"ok": True, **self._route_execution_payload()})
 
+    def _route_runs_list(self) -> None:
+        store = RouteRunStore(self.run_dir)
+        self._send_json({"ok": True, "route_runs": store.list_route_runs()})
+
+    def _route_runs_current(self) -> None:
+        store = RouteRunStore(self.run_dir)
+        current = store.current_route_run()
+        route_events = store.route_run_events(current["route_run_id"]) if current else []
+        self._send_json(
+            {
+                "ok": True,
+                "route_run": current,
+                "events": route_events,
+                "timeline": self._unified_timeline(route_events),
+                "evidence": store.route_run_evidence(current["route_run_id"]) if current else [],
+            }
+        )
+
+    def _route_runs_detail(self, path: str) -> None:
+        parts = [part for part in path.split("/") if part]
+        route_run_id = parts[2] if len(parts) >= 3 else ""
+        if not route_run_id:
+            self._send_json({"ok": False, "error": "missing_route_run_id"}, HTTPStatus.BAD_REQUEST)
+            return
+        store = RouteRunStore(self.run_dir)
+        route_run = store.route_run_detail(route_run_id)
+        if not route_run:
+            self._send_json({"ok": False, "error": "route_run_not_found"}, HTTPStatus.NOT_FOUND)
+            return
+        if len(parts) == 4 and parts[3] == "events":
+            self._send_json({"ok": True, "events": store.route_run_events(route_run_id)})
+            return
+        if len(parts) == 4 and parts[3] == "evidence":
+            self._send_json({"ok": True, "evidence": store.route_run_evidence(route_run_id)})
+            return
+        route_events = store.route_run_events(route_run_id)
+        self._send_json(
+            {
+                "ok": True,
+                "route_run": route_run,
+                "events": route_events,
+                "timeline": self._unified_timeline(route_events),
+                "evidence": store.route_run_evidence(route_run_id),
+            }
+        )
+
+    def _unified_timeline(self, route_events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        state = self._read_json(self.run_dir / "state.json")
+        report = self._read_json(self.run_dir / "report.json")
+        rows = [
+            {
+                "ts": event.get("ts") or 0,
+                "sequence": event.get("sequence"),
+                "kind": event.get("kind") or "route",
+                "state": event.get("state") or "",
+                "target_id": event.get("target_id") or event.get("waypoint_id") or event.get("action_id"),
+                "note": event.get("note") or "",
+            }
+            for event in route_events
+        ]
+        for observation in state.get("observations") or []:
+            rows.append(
+                {
+                    "ts": observation.get("ts") or 0,
+                    "sequence": "",
+                    "kind": "observation",
+                    "state": "recorded",
+                    "target_id": observation.get("entity_id") or observation.get("zone_id"),
+                    "note": f"observation {observation.get('id')}",
+                }
+            )
+        for incident in report.get("incidents") or []:
+            rows.append(
+                {
+                    "ts": incident.get("ts_open") or 0,
+                    "sequence": "",
+                    "kind": "incident",
+                    "state": incident.get("state") or "",
+                    "target_id": incident.get("entity_id"),
+                    "note": incident.get("title") or incident.get("id") or "",
+                }
+            )
+        incidents_by_id = {item.get("id"): item for item in report.get("incidents") or []}
+        for work_order in report.get("work_orders") or []:
+            incident = incidents_by_id.get(work_order.get("incident_id")) or {}
+            rows.append(
+                {
+                    "ts": incident.get("ts_closed") or incident.get("ts_open") or 0,
+                    "sequence": "",
+                    "kind": "work_order",
+                    "state": work_order.get("state") or "",
+                    "target_id": work_order.get("incident_id"),
+                    "note": work_order.get("requested_action") or work_order.get("id") or "",
+                }
+            )
+        for checkpoint in report.get("checkpoint_verifications") or []:
+            rows.append(
+                {
+                    "ts": state.get("run", {}).get("ended_at") or state.get("run", {}).get("started_at") or 0,
+                    "sequence": "",
+                    "kind": "verification",
+                    "state": "verified" if checkpoint.get("verified") else "missing",
+                    "target_id": checkpoint.get("target_id"),
+                    "note": f"expected tag {checkpoint.get('expected_tag_id')}",
+                }
+            )
+        rows.sort(key=lambda item: (float(item.get("ts") or 0), str(item.get("kind") or "")))
+        for index, row in enumerate(rows, 1):
+            row["sequence"] = row.get("sequence") or index
+        return rows
+
     def _route_execution_payload(
         self,
         *,
@@ -619,6 +740,7 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
             "route_execution": route_execution
             or load_route_execution(self.run_dir).model_dump(mode="json"),
             "authoring": authoring.model_dump(mode="json"),
+            "route_run": RouteRunStore(self.run_dir).current_route_run(),
             "live": _LIVE_MAP_ADAPTER.snapshot(),
         }
 

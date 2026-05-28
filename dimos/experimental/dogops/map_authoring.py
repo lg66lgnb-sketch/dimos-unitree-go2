@@ -13,6 +13,7 @@ import yaml
 from pydantic import Field, ValidationError, field_validator, model_validator
 
 from dimos.experimental.dogops.models import DogOpsModel
+from dimos.experimental.dogops.route_actions import EditableRouteAction
 
 
 AUTHORING_FILENAME = "map_authoring.json"
@@ -88,6 +89,7 @@ class EditableRouteWaypoint(DogOpsModel):
     pose: EditableMapPoint
     target_id: str | None = None
     required: bool = True
+    actions: list[EditableRouteAction] = Field(default_factory=list)
 
     @field_validator("id", "label")
     @classmethod

@@ -10,6 +10,7 @@ from dimos.experimental.dogops.map_authoring import (
     save_map_authoring,
 )
 from dimos.experimental.dogops.mission_engine import run_offline_simulation
+from dimos.experimental.dogops.route_actions import EditableRouteAction
 from dimos.experimental.dogops.route_executor import (
     CallableGoalPublisher,
     DogOpsRouteExecutor,
@@ -20,6 +21,7 @@ from dimos.experimental.dogops.route_executor import (
     route_execution_lock,
     save_route_execution,
 )
+from dimos.experimental.dogops.route_run_store import RouteRunStore
 
 
 def _route(route_id: str = "ROUTE_A") -> EditableRoute:
@@ -145,6 +147,70 @@ def test_fake_publisher_receives_goals_in_order_and_waits_for_odom(tmp_path) -> 
         "sent",
         "reached",
     ]
+
+
+def test_route_actions_record_timeline_and_placeholder_evidence(tmp_path) -> None:
+    route = EditableRoute(
+        id="ROUTE_ACTIONS",
+        label="Route Actions",
+        waypoints=[
+            EditableRouteWaypoint(
+                id="WP-ACTION",
+                label="Waypoint",
+                target_id="COOLING_1",
+                pose=EditableMapPoint(x=1.0, y=2.0),
+                actions=[
+                    EditableRouteAction(
+                        id="SCAN-TAGS",
+                        kind="scan_tags",
+                        args={"expected": [41]},
+                    ),
+                    EditableRouteAction(
+                        id="CAPTURE",
+                        kind="capture_image",
+                        args={"target": "COOLING_1"},
+                    ),
+                ],
+            )
+        ],
+    )
+    save_map_authoring(
+        tmp_path,
+        MapAuthoringState(selected_route_id="ROUTE_ACTIONS", routes=[route]),
+    )
+    current_goal = {"x": 0.0, "y": 0.0}
+
+    def publish(x: float, y: float, z: float, frame: str) -> dict[str, object]:
+        current_goal.update({"x": x, "y": y})
+        return {"accepted": True}
+
+    executor = DogOpsRouteExecutor(
+        tmp_path,
+        goal_publisher=CallableGoalPublisher(publish, transport_name="fake_nav"),
+        live_snapshot_reader=lambda: {
+            "robot_pose": {"x": current_goal["x"], "y": current_goal["y"]},
+            "target": {"x": current_goal["x"], "y": current_goal["y"]},
+            "topics": {"odom": {"age_s": 0.1}},
+        },
+        sleep_fn=lambda _: None,
+    )
+
+    state = executor.follow_route()
+
+    assert state.state == "completed"
+    assert state.route_run_id
+    action_events = [event for event in state.events if event.kind == "action"]
+    assert [event.action_id for event in action_events] == [
+        "SCAN-TAGS",
+        "SCAN-TAGS",
+        "CAPTURE",
+        "CAPTURE",
+    ]
+    assert action_events[-1].payload["source"] == "demo_placeholder"
+    evidence = RouteRunStore(tmp_path).route_run_evidence(state.route_run_id)
+    assert evidence[0]["kind"] == "image"
+    assert evidence[0]["metadata"]["source"] == "demo_placeholder"
+    assert (tmp_path / "route_runs" / state.route_run_id / "evidence" / "WP-ACTION-CAPTURE.svg").exists()
 
 
 def test_stale_odom_causes_timeout_failure(tmp_path) -> None:
