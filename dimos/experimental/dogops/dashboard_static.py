@@ -357,10 +357,11 @@ def _live_with_gathered_heatmap(
         **costmap,
         "source": f"Gathered heatmap {heatmap_snapshot.get('route_run_id') or ''}".strip(),
     }
+    result["source"] = result["costmap"]["source"]
+    result["status"] = "gathered_heatmap"
     result["gathered_heatmap"] = _gathered_heatmap_summary(heatmap_snapshot)
     if not result.get("ok"):
         result["ok"] = True
-        result["status"] = "gathered_heatmap"
     return result
 
 
@@ -1974,9 +1975,15 @@ def render_dashboard_html(
         }}
         routeRunHistory.innerHTML = runs.slice(0, 8).map((run) => {{
           const progress = `${{Number(run.waypoints_reached || 0)}}/${{Number(run.waypoints_total || 0)}} wp, ${{Number(run.actions_completed || 0)}}/${{Number(run.actions_total || 0)}} act`;
-          const mode = run.dry_run ? "Dry run" : "Live";
+          const mode = routeRunMode(run);
           return `<tr><td>${{htmlEscape(formatRouteRunTime(run.started_at))}}</td><td>${{htmlEscape(run.dogops_run_id || "-")}}</td><td>${{htmlEscape(run.route_id || "-")}}</td><td>${{htmlEscape(mode)}}</td><td>${{htmlEscape(run.state || "-")}}</td><td>${{htmlEscape(progress)}}</td></tr>`;
         }}).join("");
+      }};
+      const routeRunMode = (run) => {{
+        if (run && (run.route_id === "GATHER_HEATMAP" || run.transport === "dimos_costmap_snapshot")) {{
+          return "Costmap snapshot";
+        }}
+        return run && run.dry_run ? "Dry run" : "Live";
       }};
       const renderRouteRunTimeline = (events) => {{
         if (!routeRunTimeline) return;
@@ -2897,6 +2904,7 @@ def render_dashboard_html(
             await stopRouteExecution();
           }} else if (action === "heatmap_run") {{
             await gatherHeatmap();
+            await refreshLiveMap();
           }} else if (action === "route_add_action") {{
             await addActionToSelectedRouteWaypoint();
           }} else if (action === "route_up") {{
