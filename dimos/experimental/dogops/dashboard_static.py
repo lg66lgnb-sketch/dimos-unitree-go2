@@ -814,10 +814,6 @@ def render_site_map(
     rerun_web_url = _trusted_rerun_web_url(os.environ.get("DOGOPS_RERUN_WEB_URL"))
     rerun_source_url = _trusted_rerun_source_url(os.environ.get("DOGOPS_RERUN_SOURCE_URL"))
     rerun_view_mode = _trusted_rerun_view_mode(os.environ.get("DOGOPS_RERUN_VIEW_MODE"))
-    camera_stream_url = _trusted_camera_stream_url(
-        os.environ.get("DOGOPS_CAMERA_STREAM_URL")
-        or os.environ.get("DOGOPS_GO2_CAMERA_STREAM_URL")
-    )
     rerun_web_url_attr = escape(rerun_web_url, quote=True)
     legend = (
         '<div class="map-legend">'
@@ -876,6 +872,9 @@ def render_site_map(
         '<button type="button" data-map-edit-action="route_down">Route Down</button>'
         '<span class="map-route-summary" data-map-route-summary>Selected route: none. Next: Route1</span>'
         "</div>"
+        "</div>"
+    )
+    route_action_controls = (
         '<div class="map-edit-row map-route-action-row" data-route-action-row hidden>'
         '<span class="map-route-summary" data-route-action-summary>Select a waypoint to add actions</span>'
         '<button type="button" data-route-action-kind="capture_image">Capture Image</button>'
@@ -887,11 +886,10 @@ def render_site_map(
         '<button type="button" data-route-action-kind="verify_work_order">Verify Work Order</button>'
         '<button type="button" data-route-action-kind="operator_prompt">Operator Prompt</button>'
         "</div>"
-        "</div>"
     )
     return f"""
       <div class="map-shell" data-map-surface>
-        {_render_rerun_surface(rerun_source_url, rerun_web_url, rerun_view_mode, camera_stream_url)}
+        {_render_rerun_surface(rerun_source_url, rerun_web_url, rerun_view_mode)}
         {edit_controls}
         <svg class="site-map" role="img" aria-label="DogOps mission map"
           data-live-map-svg data-map-bounds="{bounds_attr}" data-map-authoring="{authoring_attr}"
@@ -932,6 +930,7 @@ def render_site_map(
             {robot}
           </g>
         </svg>
+        {route_action_controls}
         {layer_controls}
         {legend}
         <div class="map-workflow">
@@ -1225,53 +1224,6 @@ def render_dashboard_html(
     }}
     .rerun-controls button:hover, .rerun-controls a:hover {{ border-color: #52e0c4; }}
     .viewer-offline[hidden] {{ display: none; }}
-    .live-video-panel {{
-      background: rgba(3, 6, 11, 0.88);
-      border: 1px solid #263348;
-      border-radius: 8px;
-      bottom: 12px;
-      box-shadow: 0 12px 30px rgba(0, 0, 0, 0.35);
-      color: #d8dee9;
-      display: grid;
-      gap: 6px;
-      overflow: hidden;
-      padding: 8px;
-      position: absolute;
-      right: 12px;
-      width: min(260px, calc(100% - 24px));
-      z-index: 2;
-    }}
-    .live-video-panel strong {{
-      color: #eef2f8;
-      font-size: 12px;
-      line-height: 1.1;
-    }}
-    .live-video-panel iframe, .live-video-panel img {{
-      aspect-ratio: 16 / 9;
-      background: #01030a;
-      border: 0;
-      border-radius: 5px;
-      display: block;
-      object-fit: contain;
-      width: 100%;
-    }}
-    .live-video-panel img[hidden] {{ display: none; }}
-    .live-video-placeholder {{
-      align-items: center;
-      aspect-ratio: 16 / 9;
-      background:
-        linear-gradient(135deg, rgba(82, 224, 196, 0.10), rgba(96, 165, 250, 0.08)),
-        #05070c;
-      border: 1px dashed #2d3a4f;
-      border-radius: 5px;
-      color: #94a3b8;
-      display: grid;
-      font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace;
-      justify-items: center;
-      padding: 10px;
-      text-align: center;
-    }}
-    .live-video-placeholder[hidden] {{ display: none; }}
     .site-map {{
       aspect-ratio: 23 / 14;
       background: #03060b;
@@ -2017,8 +1969,6 @@ def render_dashboard_html(
       const cameraTopic = document.querySelector("[data-camera-topic]");
       const cameraShape = document.querySelector("[data-camera-shape]");
       const cameraAge = document.querySelector("[data-camera-age]");
-      const liveVideoFrame = document.querySelector("[data-live-video-frame]");
-      const liveVideoEmpty = document.querySelector("[data-live-video-empty]");
       const status = document.querySelector("[data-robot-status]");
       if (!controls || !status) return;
       let motionProfile = "nudge";
@@ -2595,23 +2545,10 @@ def render_dashboard_html(
               cameraEmpty.hidden = false;
             }}
           }}
-          if (liveVideoFrame && liveVideoEmpty) {{
-            if (camera.received) {{
-              liveVideoFrame.src = `/api/camera/frame.jpg?view=top&ts=${{Date.now()}}`;
-              liveVideoFrame.hidden = false;
-              liveVideoEmpty.hidden = true;
-            }} else {{
-              liveVideoFrame.hidden = true;
-              liveVideoFrame.src = "about:blank";
-              liveVideoEmpty.hidden = false;
-            }}
-          }}
         }} catch (error) {{
           if (cameraHealth) cameraHealth.textContent = `Camera unavailable (${{error.message}})`;
           if (cameraFrame) cameraFrame.hidden = true;
           if (cameraEmpty) cameraEmpty.hidden = false;
-          if (liveVideoFrame) liveVideoFrame.hidden = true;
-          if (liveVideoEmpty) liveVideoEmpty.hidden = false;
         }}
       }};
       const runSelectedRoute = async (dryRun) => {{
@@ -3777,44 +3714,10 @@ def _trusted_rerun_view_mode(raw_mode: str | None) -> str:
     return "dogops-2d" if raw_mode == "dogops-2d" else "native-3d"
 
 
-def _trusted_camera_stream_url(raw_url: str | None) -> str:
-    if not raw_url:
-        return ""
-    try:
-        parsed = urlparse(raw_url)
-    except ValueError:
-        return ""
-    if parsed.scheme not in {"http", "https"}:
-        return ""
-    host = (parsed.hostname or "").lower()
-    if host not in {"127.0.0.1", "localhost", "::1"}:
-        return ""
-    return raw_url
-
-
-def _render_live_video_panel(camera_stream_url: str) -> str:
-    if camera_stream_url:
-        camera_stream_url_attr = escape(camera_stream_url, quote=True)
-        return (
-            '<div class="live-video-panel" data-live-video-panel>'
-            "<strong>Live Video</strong>"
-            f'<iframe src="{camera_stream_url_attr}" title="Dog live video stream" loading="lazy"></iframe>'
-            "</div>"
-        )
-    return (
-        '<div class="live-video-panel" data-live-video-panel>'
-        "<strong>Live Video</strong>"
-        '<img data-live-video-frame alt="Dog live video stream" hidden />'
-        '<div class="live-video-placeholder" data-live-video-empty>Waiting for camera stream</div>'
-        "</div>"
-    )
-
-
 def _render_rerun_surface(
     rerun_source_url: str,
     rerun_web_url: str,
     rerun_view_mode: str,
-    camera_stream_url: str,
 ) -> str:
     rerun_source_url_attr = escape(rerun_source_url, quote=True)
     rerun_web_url_attr = escape(rerun_web_url, quote=True)
@@ -3834,7 +3737,6 @@ def _render_rerun_surface(
         "</div>"
         "</div>"
         '<div class="viewer-offline" data-viewer-offline hidden>3D View unavailable</div>'
-        f"{_render_live_video_panel(camera_stream_url)}"
         "</div>"
     )
 

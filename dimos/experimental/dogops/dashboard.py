@@ -25,6 +25,7 @@ from dimos.experimental.dogops.dashboard_static import (
     build_map_data,
     build_poi_data,
     build_route_data,
+    render_dashboard_html,
     write_dashboard_html,
 )
 from dimos.experimental.dogops.heatmap_runs import (
@@ -224,7 +225,7 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         if path in {"/", "/dashboard.html"}:
-            self._send_file(self.run_dir / "dashboard.html", "text/html; charset=utf-8")
+            self._send_dashboard_html()
         elif path == "/api/state":
             self._send_file(self.run_dir / "state.json", "application/json")
         elif path == "/api/report":
@@ -1483,6 +1484,24 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         payload = path.read_bytes()
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self._send_browser_isolation_headers()
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _send_dashboard_html(self) -> None:
+        state = self._read_json(self.run_dir / "state.json")
+        report = self._read_json(self.run_dir / "report.json")
+        authoring = self._load_authoring(state).model_dump(mode="json")
+        payload = render_dashboard_html(
+            state,
+            report,
+            robot_control_token=self.robot_control_token,
+            authoring=authoring,
+            qr_events=load_qr_events(self.run_dir),
+        ).encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
         self._send_browser_isolation_headers()
         self.end_headers()

@@ -67,8 +67,8 @@ class DogOpsLiveCameraAdapter:
                 return
             self._started = True
         try:
-            JpegLcmTransport, Image = _import_dimos_camera_types()
-            transport = JpegLcmTransport(self.topic, Image)
+            pSHMTransport, Image, color_image_capacity = _import_dimos_camera_types()
+            transport = pSHMTransport(self.topic, default_capacity=color_image_capacity)
             unsubscribe = transport.subscribe(self._record)
         except Exception as exc:
             with self._lock:
@@ -107,15 +107,17 @@ class DogOpsLiveCameraAdapter:
                 pass
 
 
-def _import_dimos_camera_types() -> tuple[Any, Any]:
+def _import_dimos_camera_types() -> tuple[Any, Any, int]:
     try:
-        from dimos.core.transport import JpegLcmTransport
+        from dimos.constants import DEFAULT_CAPACITY_COLOR_IMAGE
+        from dimos.core.transport import pSHMTransport
         from dimos.msgs.sensor_msgs.Image import Image
     except ModuleNotFoundError:
         _extend_dimos_package_path()
-        from dimos.core.transport import JpegLcmTransport
+        from dimos.constants import DEFAULT_CAPACITY_COLOR_IMAGE
+        from dimos.core.transport import pSHMTransport
         from dimos.msgs.sensor_msgs.Image import Image
-    return JpegLcmTransport, Image
+    return pSHMTransport, Image, DEFAULT_CAPACITY_COLOR_IMAGE
 
 
 def _extend_dimos_package_path() -> None:

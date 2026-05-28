@@ -118,6 +118,11 @@ def _robot_headers(server) -> dict[str, str]:
     }
 
 
+def _get_text(url: str) -> str:
+    with urllib.request.urlopen(url, timeout=5) as response:
+        return response.read().decode("utf-8")
+
+
 def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     run_dir = tmp_path / "latest"
     run_offline_simulation(out=run_dir)
@@ -202,8 +207,6 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert 'data-rerun-view-mode="native-3d"' in content
     assert 'data-rerun-web-link' in content
     assert "3D View" in content
-    assert "Live Video" in content
-    assert "Waiting for camera stream" in content
     assert "/api/camera/frame.jpg" in content
     assert "/static/rerun-web-viewer.js" in content
     assert "/assets/vendor/@rerun-io/web-viewer/" in content
@@ -273,6 +276,48 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert 'data-motion="step"' in content
     assert 'data-motion="walk"' in content
     assert "X-DogOps-Control-Token" in content
+
+
+def test_dashboard_serves_instance_token_when_run_dir_is_shared(tmp_path) -> None:
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    first_server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    second_server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    first_thread = threading.Thread(target=first_server.serve_forever, daemon=True)
+    second_thread = threading.Thread(target=second_server.serve_forever, daemon=True)
+    first_thread.start()
+    second_thread.start()
+
+    first_url = f"http://127.0.0.1:{first_server.server_address[1]}"
+    try:
+        first_token = first_server.RequestHandlerClass.robot_control_token
+        second_token = second_server.RequestHandlerClass.robot_control_token
+        assert first_token != second_token
+
+        html = _get_text(f"{first_url}/")
+        assert first_token in html
+        assert second_token not in html
+
+        status, result = _post_json(
+            f"{first_url}/api/map/entities",
+            {
+                "id": "CHECKPOINT_SHARED_TOKEN",
+                "kind": "checkpoint",
+                "label": "Checkpoint Shared Token",
+                "pose": {"x": 1.0, "y": 2.0, "source": "dashboard_edit"},
+            },
+            headers={dashboard.ROBOT_CONTROL_TOKEN_HEADER: first_token},
+        )
+    finally:
+        first_server.shutdown()
+        second_server.shutdown()
+        first_server.server_close()
+        second_server.server_close()
+        first_thread.join(timeout=5)
+        second_thread.join(timeout=5)
+
+    assert status == 200
+    assert result["ok"] is True
 
 
 def test_dashboard_static_embeds_full_authoring_state(tmp_path) -> None:
@@ -471,21 +516,6 @@ def test_dashboard_rerun_source_url_stays_loopback_only() -> None:
     assert dashboard_static._trusted_rerun_source_url("http://127.0.0.1:9877/proxy") == fallback
     assert dashboard_static._trusted_rerun_source_url("rerun+https://rerun.example.com/proxy") == fallback
     assert dashboard_static._trusted_rerun_source_url("javascript:alert(1)") == fallback
-
-
-def test_dashboard_camera_stream_url_stays_loopback_only() -> None:
-    assert dashboard_static._trusted_camera_stream_url(None) == ""
-    assert (
-        dashboard_static._trusted_camera_stream_url("http://localhost:8080/video")
-        == "http://localhost:8080/video"
-    )
-    assert (
-        dashboard_static._trusted_camera_stream_url("https://[::1]:8080/video")
-        == "https://[::1]:8080/video"
-    )
-    assert dashboard_static._trusted_camera_stream_url("https://camera.example.com/video") == ""
-    assert dashboard_static._trusted_camera_stream_url("javascript:alert(1)") == ""
-
 
 def test_dashboard_module_writes_dashboard_and_reports_status(tmp_path) -> None:
     run_dir = tmp_path / "latest"
