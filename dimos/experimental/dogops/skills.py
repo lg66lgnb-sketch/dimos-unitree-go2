@@ -16,6 +16,7 @@ from dimos.experimental.dogops.config_loader import (
     load_mission as read_mission,
     load_site_config as read_site_config,
 )
+from dimos.experimental.dogops.heatmap_runs import gather_heatmap_run
 from dimos.experimental.dogops.mission_engine import run_offline_simulation
 from dimos.experimental.dogops.models import (
     Asset,
@@ -319,6 +320,18 @@ class DogOpsSkillContainer(Module):
             last_error=state.last_error,
             route_execution=state.model_dump(mode="json"),
         )
+
+    @skill
+    def gather_heatmap(self, area_id: str = "", duration_s: float = 0.0) -> str:
+        """Snapshot the current DimOS costmap as a DogOps gather-heatmap run."""
+        live_adapter = self._live_map_adapter or DogOpsLiveMapAdapter()
+        result = gather_heatmap_run(
+            self.run_dir,
+            live_snapshot=live_adapter.snapshot(),
+            area_id=area_id,
+            duration_s=duration_s,
+        )
+        return _json(skill="gather_heatmap", **result)
 
     @skill
     def scan_zone(self, zone_id: str) -> str:

@@ -136,12 +136,23 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert 'data-live-path' in content
     assert 'data-live-target' in content
     assert "refreshDimOSMap" in content
+    assert 'data-map-action="gather_heatmap"' in content
+    assert "/api/map/heatmap/gather" in content
+    assert 'data-map-edit-label-row' in content
+    assert 'data-map-edit-route-row' in content
+    assert 'data-map-edit-action="dry_run_route"' in content
     assert 'data-map-edit-action="run_route"' in content
     assert 'data-map-edit-action="stop_route"' in content
+    assert 'data-map-edit-action="route_add_action"' in content
     assert 'data-route-execution-status' in content
     assert "/api/map/routes/follow" in content
     assert "/api/map/routes/stop" in content
     assert "/api/map/routes/status" in content
+    assert "runSelectedRoute(true)" in content
+    assert "runSelectedRoute(false)" in content
+    assert "addActionToSelectedRouteWaypoint" in content
+    assert "Dry run" in content
+    assert "Live" in content
     assert "map-point" in content
     assert "map-robot-core" in content
     assert "free grid" in content
@@ -807,6 +818,63 @@ def test_dashboard_map_data_includes_dimos_live_layers(tmp_path, monkeypatch) ->
     assert map_data["live"]["target"]["source"] == "target"  # type: ignore[index]
     assert map_data["layers"]["heatmap"] is True  # type: ignore[index]
     assert map_data["layers"]["path"] is True  # type: ignore[index]
+
+
+def test_dashboard_gather_heatmap_persists_snapshot_and_history(tmp_path, monkeypatch) -> None:
+    class FakeLiveMapAdapter:
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "ok": True,
+                "source": "DimOS live LCM topics",
+                "status": "receiving",
+                "error": "",
+                "topics": {"navigation_costmap": {"received": True}},
+                "costmap": {
+                    "source": "DimOS live costmap",
+                    "columns": 1,
+                    "rows": 1,
+                    "cells": [{"x": 1.0, "y": 2.0, "width": 0.5, "height": 0.5, "cost": 0.75}],
+                },
+                "path": [],
+                "route": [],
+                "robot_pose": {"x": 1.2, "y": 2.1, "theta_deg": 45.0, "source": "odom"},
+                "target": None,
+            }
+
+    monkeypatch.setattr(dashboard, "_LIVE_MAP_ADAPTER", FakeLiveMapAdapter())
+    run_dir = tmp_path / ".dogops" / "runs" / "latest"
+    run_offline_simulation(out=run_dir)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        status, result = _post_json(
+            f"{base_url}/api/map/heatmap/gather",
+            {"area_id": "AISLE_1", "duration_s": 3},
+            headers=_robot_headers(server),
+        )
+        map_data = _get_json(f"{base_url}/api/map")
+        status_runs, route_runs = _get_json_with_status(
+            f"{base_url}/api/route-runs",
+            headers=_robot_headers(server),
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 200
+    assert status_runs == 200
+    assert result["ok"] is True
+    assert result["run_kind"] == "gather_heatmap"
+    assert result["heatmap"]["area_id"] == "AISLE_1"  # type: ignore[index]
+    assert (run_dir / "heatmaps" / "latest_heatmap.json").is_file()
+    assert map_data["layers"]["heatmap"] is True  # type: ignore[index]
+    assert map_data["gathered_heatmap"]["area_id"] == "AISLE_1"  # type: ignore[index]
+    assert map_data["live"]["costmap"]["source"].startswith("Gathered heatmap")  # type: ignore[index]
+    assert route_runs["route_runs"][0]["route_id"] == "GATHER_HEATMAP"  # type: ignore[index]
 
 
 def test_dashboard_map_data_bounds_include_live_overlay(tmp_path) -> None:
@@ -1521,6 +1589,54 @@ def test_dashboard_route_follow_stop_and_status_endpoints(tmp_path, monkeypatch)
     assert stop_result["route_execution"]["state"] == "stopped"  # type: ignore[index]
     assert stop_result["hard_stop"]["ok"] is True  # type: ignore[index]
     assert stop_result["hard_stop"]["robot_ip"] == "192.168.12.1"  # type: ignore[index]
+
+
+def test_dashboard_route_follow_reports_mcp_unavailable(tmp_path, monkeypatch) -> None:
+    def fail_follow(route_id: str | None, dry_run: bool) -> dict[str, object]:
+        raise RuntimeError("dimos mcp call follow_route failed: no running MCP server")
+
+    monkeypatch.setattr(dashboard, "_run_robot_follow_route", fail_follow)
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    save_map_authoring(
+        run_dir,
+        MapAuthoringState(
+            selected_route_id="ROUTE_A",
+            routes=[
+                EditableRoute(
+                    id="ROUTE_A",
+                    label="Route A",
+                    waypoints=[
+                        EditableRouteWaypoint(
+                            id="WP-1",
+                            label="Waypoint 1",
+                            pose=EditableMapPoint(x=1.0, y=2.0),
+                        )
+                    ],
+                )
+            ],
+        ),
+    )
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        status, result = _post_json(
+            f"{base_url}/api/map/routes/follow",
+            {"route_id": "ROUTE_A", "dry_run": True},
+            headers=_robot_headers(server),
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 503
+    assert result["ok"] is False
+    assert result["error"] == "dimos_mcp_unavailable"
+    assert "no running MCP server" in result["message"]
 
 
 def test_dashboard_stop_syncs_route_history_when_mcp_stop_fails(tmp_path, monkeypatch) -> None:

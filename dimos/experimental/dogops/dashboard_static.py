@@ -39,6 +39,7 @@ def build_map_data(
     report: dict[str, Any],
     *,
     live_overlay: dict[str, Any] | None = None,
+    heatmap_snapshot: dict[str, Any] | None = None,
     authoring: dict[str, Any] | None = None,
     qr_events: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
@@ -293,6 +294,7 @@ def build_map_data(
         "robot_pose": None,
         "target": None,
     }
+    live = _live_with_gathered_heatmap(live, heatmap_snapshot)
     points = [
         (item["x"], item["y"])
         for group in (map_zones, map_assets, map_packages, map_route, map_observations)
@@ -329,6 +331,7 @@ def build_map_data(
         },
         "bounds": bounds,
         "live": live,
+        "gathered_heatmap": _gathered_heatmap_summary(heatmap_snapshot),
         "layers": {
             "semantic": True,
             "heatmap": bool((live.get("costmap") or {}).get("cells")) if isinstance(live, dict) else False,
@@ -336,6 +339,42 @@ def build_map_data(
             "robot": bool(live.get("robot_pose")) if isinstance(live, dict) else False,
             "qr": bool(map_qr_cargo_events),
         },
+    }
+
+
+def _live_with_gathered_heatmap(
+    live: dict[str, Any],
+    heatmap_snapshot: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not isinstance(heatmap_snapshot, dict):
+        return live
+    costmap = heatmap_snapshot.get("costmap")
+    cells = costmap.get("cells") if isinstance(costmap, dict) else None
+    if not isinstance(cells, list) or not cells:
+        return live
+    result = dict(live)
+    result["costmap"] = {
+        **costmap,
+        "source": f"Gathered heatmap {heatmap_snapshot.get('route_run_id') or ''}".strip(),
+    }
+    result["gathered_heatmap"] = _gathered_heatmap_summary(heatmap_snapshot)
+    if not result.get("ok"):
+        result["ok"] = True
+        result["status"] = "gathered_heatmap"
+    return result
+
+
+def _gathered_heatmap_summary(snapshot: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(snapshot, dict):
+        return None
+    costmap = snapshot.get("costmap") if isinstance(snapshot.get("costmap"), dict) else {}
+    cells = costmap.get("cells") if isinstance(costmap, dict) else []
+    return {
+        "route_run_id": snapshot.get("route_run_id"),
+        "area_id": snapshot.get("area_id"),
+        "collected_at": snapshot.get("collected_at"),
+        "cells": len(cells) if isinstance(cells, list) else 0,
+        "source": snapshot.get("source"),
     }
 
 
@@ -749,8 +788,10 @@ def render_site_map(
         '<div class="map-edit-row" data-map-edit-route-row>'
         '<button type="button" data-map-edit-mode="route" aria-pressed="false">Route</button>'
         '<button type="button" data-map-edit-action="route_select">Select Route</button>'
-        '<button type="button" data-map-edit-action="run_route">Run Route</button>'
+        '<button type="button" data-map-edit-action="dry_run_route">Dry Run Route</button>'
+        '<button type="button" data-map-edit-action="run_route">Run Live Route</button>'
         '<button type="button" data-map-edit-action="stop_route">Stop Route</button>'
+        '<button type="button" data-map-edit-action="route_add_action">Add Action</button>'
         '<button type="button" data-map-edit-action="route_up">Route Up</button>'
         '<button type="button" data-map-edit-action="route_down">Route Down</button>'
         '<span class="map-route-summary" data-map-route-summary>Selected route: none. Next: Route1</span>'
@@ -812,10 +853,10 @@ def render_site_map(
           <strong>Route Run History</strong>
           <table>
             <thead>
-              <tr><th>Time</th><th>Run</th><th>Route</th><th>State</th><th>Progress</th></tr>
+              <tr><th>Time</th><th>Run</th><th>Route</th><th>Mode</th><th>State</th><th>Progress</th></tr>
             </thead>
             <tbody data-route-run-history>
-              <tr><td colspan="5">No route runs recorded</td></tr>
+              <tr><td colspan="6">No route runs recorded</td></tr>
             </tbody>
           </table>
         </div>
@@ -1521,6 +1562,7 @@ def render_dashboard_html(
         </div>
         <div class="map-controls" data-map-controls>
           <button type="button" data-map-action="start">Start Live Map</button>
+          <button type="button" data-map-action="gather_heatmap">Gather Heatmap</button>
           <button type="button" data-map-action="origin">Set Map Origin</button>
           <button type="button" data-map-action="arm_go_to" aria-pressed="false">Arm Go To</button>
         </div>
@@ -1917,15 +1959,22 @@ def render_dashboard_html(
         '"': "&quot;",
         "'": "&#39;",
       }}[char]));
+      const routeApiErrorText = (result, fallback) => {{
+        const error = result && result.error ? String(result.error) : "";
+        const message = result && result.message ? String(result.message) : "";
+        if (error && message) return `${{error}}: ${{message}}`;
+        return message || error || fallback;
+      }};
       const renderRouteRunHistory = (runs) => {{
         if (!routeRunHistory) return;
         if (!Array.isArray(runs) || !runs.length) {{
-          routeRunHistory.innerHTML = '<tr><td colspan="5">No route runs recorded</td></tr>';
+          routeRunHistory.innerHTML = '<tr><td colspan="6">No route runs recorded</td></tr>';
           return;
         }}
         routeRunHistory.innerHTML = runs.slice(0, 8).map((run) => {{
           const progress = `${{Number(run.waypoints_reached || 0)}}/${{Number(run.waypoints_total || 0)}} wp, ${{Number(run.actions_completed || 0)}}/${{Number(run.actions_total || 0)}} act`;
-          return `<tr><td>${{htmlEscape(formatRouteRunTime(run.started_at))}}</td><td>${{htmlEscape(run.dogops_run_id || "-")}}</td><td>${{htmlEscape(run.route_id || "-")}}</td><td>${{htmlEscape(run.state || "-")}}</td><td>${{htmlEscape(progress)}}</td></tr>`;
+          const mode = run.dry_run ? "Dry run" : "Live";
+          return `<tr><td>${{htmlEscape(formatRouteRunTime(run.started_at))}}</td><td>${{htmlEscape(run.dogops_run_id || "-")}}</td><td>${{htmlEscape(run.route_id || "-")}}</td><td>${{htmlEscape(mode)}}</td><td>${{htmlEscape(run.state || "-")}}</td><td>${{htmlEscape(progress)}}</td></tr>`;
         }}).join("");
       }};
       const renderRouteRunTimeline = (events) => {{
@@ -1971,7 +2020,7 @@ def render_dashboard_html(
           }});
           const result = await response.json();
           if (!response.ok || result.ok === false) {{
-            throw new Error(result.message || result.error || "route_status_failed");
+            throw new Error(routeApiErrorText(result, "route_status_failed"));
           }}
           const state = result.route_execution || {{}};
           setRouteExecutionStatus(routeExecutionText(state), state.state === "failed" ? "error" : "ok");
@@ -1982,13 +2031,14 @@ def render_dashboard_html(
           routeExecutionPolling = false;
         }}
       }};
-      const runSelectedRoute = async () => {{
+      const runSelectedRoute = async (dryRun) => {{
         const route = selectedRoute();
         if (!route) {{
           setRouteExecutionStatus("Execution: select or author a route first", "error");
           return;
         }}
-        setRouteExecutionStatus(`Execution: starting ${{route.id}}...`, "");
+        const modeText = dryRun ? "dry run" : "live run";
+        setRouteExecutionStatus(`Execution: starting ${{modeText}} ${{route.id}}...`, "");
         try {{
           const response = await fetch("/api/map/routes/follow", {{
             method: "POST",
@@ -1996,16 +2046,16 @@ def render_dashboard_html(
               "Content-Type": "application/json",
               "X-DogOps-Control-Token": robotControlToken,
             }},
-            body: JSON.stringify({{route_id: route.id, dry_run: false}}),
+            body: JSON.stringify({{route_id: route.id, dry_run: !!dryRun}}),
           }});
           const result = await response.json();
           const state = (result.mcp_result && result.mcp_result.route_execution) || result.route_execution || {{}};
           if (!response.ok || result.ok === false) {{
-            throw new Error(result.message || result.error || "follow_route_failed");
+            throw new Error(routeApiErrorText(result, "follow_route_failed"));
           }}
           setRouteExecutionStatus(routeExecutionText(state), "ok");
         }} catch (error) {{
-          setRouteExecutionStatus(`Execution failed: ${{error.message}}`, "error");
+          setRouteExecutionStatus(`Execution failed (${{modeText}}): ${{error.message}}`, "error");
         }} finally {{
           await refreshRouteExecution();
         }}
@@ -2023,7 +2073,7 @@ def render_dashboard_html(
           }});
           const result = await response.json();
           if (!response.ok || result.ok === false) {{
-            throw new Error(result.message || result.error || "stop_route_failed");
+            throw new Error(routeApiErrorText(result, "stop_route_failed"));
           }}
           setRouteExecutionStatus(routeExecutionText(result.route_execution || {{}}), "ok");
         }} catch (error) {{
@@ -2071,6 +2121,68 @@ def render_dashboard_html(
         route.waypoints = waypoints;
         routes[routeIndex] = route;
         await saveRoutes(routes, route.id);
+      }};
+      const routeActionArgs = (kind, waypoint) => {{
+        if (kind === "scan_tags") {{
+          const raw = window.prompt("Expected AprilTag IDs, comma separated", "");
+          const expected = (raw || "").split(",").map((item) => Number(item.trim())).filter((item) => Number.isFinite(item));
+          return {{expected}};
+        }}
+        if (kind === "scan_qr") {{
+          const raw = window.prompt("Expected QR payloads, comma separated", "");
+          const expected = (raw || "").split(",").map((item) => item.trim()).filter(Boolean);
+          return {{expected}};
+        }}
+        if (kind === "capture_image") {{
+          return {{target: waypoint.target_id || waypoint.id}};
+        }}
+        if (kind === "wait") {{
+          const seconds = Number(window.prompt("Wait seconds", "2") || 2);
+          return {{seconds: Number.isFinite(seconds) ? seconds : 2}};
+        }}
+        return {{target: waypoint.target_id || waypoint.id}};
+      }};
+      const addActionToSelectedRouteWaypoint = async () => {{
+        if (!selectedMapObject || selectedMapObject.kind !== "route_stop") {{
+          setMapAuthoringStatus("Select a route waypoint before adding an action", "error");
+          return;
+        }}
+        const kindInput = window.prompt(
+          "Action kind: capture_image, scan_qr, scan_tags, wait, inspect_asset, verify_work_order, operator_prompt",
+          "capture_image"
+        );
+        const kind = (kindInput || "").trim();
+        const allowed = new Set(["capture_image", "scan_qr", "scan_tags", "wait", "inspect_asset", "verify_work_order", "operator_prompt"]);
+        if (!allowed.has(kind)) {{
+          setMapAuthoringStatus("Unsupported route action kind", "error");
+          return;
+        }}
+        const current = mapAuthoring || {{}};
+        const routes = Array.isArray(current.routes) ? [...current.routes] : [];
+        const route = routes.find((item) => item.id === current.selected_route_id) || routes[0];
+        const routeIndex = routes.indexOf(route);
+        const waypointIndex = routeIndex >= 0 ? routeIndexForTarget(route, selectedMapObject.id) : -1;
+        if (!route || waypointIndex < 0) {{
+          setMapAuthoringStatus("Selected route waypoint was not found", "error");
+          return;
+        }}
+        const waypoints = [...(route.waypoints || [])];
+        const waypoint = {{...waypoints[waypointIndex]}};
+        const actionId = mapEditId(kind.toUpperCase());
+        const label = window.prompt("Action label", kind) || kind;
+        waypoint.actions = [...(waypoint.actions || []), {{
+          id: actionId,
+          kind,
+          label,
+          required: true,
+          timeout_s: 5.0,
+          args: routeActionArgs(kind, waypoint),
+        }}];
+        waypoints[waypointIndex] = waypoint;
+        route.waypoints = waypoints;
+        routes[routeIndex] = route;
+        await saveRoutes(routes, route.id);
+        setMapAuthoringStatus(`Added ${{kind}} to ${{waypoint.id}}`, "ok");
       }};
       const selectRouteByPrompt = async () => {{
         const current = mapAuthoring || {{}};
@@ -2557,6 +2669,46 @@ def render_dashboard_html(
         );
         await refreshLiveMap();
       }};
+      const gatherHeatmap = async () => {{
+        if (robotBusy) return;
+        const areaId = (window.prompt("Heatmap area label", "CURRENT_AREA") || "").trim();
+        const durationRaw = window.prompt("Gather duration in seconds", "10");
+        const durationS = Number(durationRaw || 10);
+        robotBusy = true;
+        setBusy(true);
+        setStatus("Gathering heatmap...", "");
+        setMapCommandStatus("Gathering heatmap from DimOS costmap...", "");
+        try {{
+          const headers = {{"Content-Type": "application/json"}};
+          if (robotControlToken) headers["X-DogOps-Control-Token"] = robotControlToken;
+          const response = await fetch("/api/map/heatmap/gather", {{
+            method: "POST",
+            headers,
+            body: JSON.stringify({{
+              command: "gather_heatmap",
+              area_id: areaId,
+              duration_s: Number.isFinite(durationS) ? durationS : 10,
+            }}),
+          }});
+          const result = await response.json();
+          if (!response.ok || result.ok === false) {{
+            throw new Error(result.message || result.error || "gather_heatmap_failed");
+          }}
+          const cells = result.heatmap && result.heatmap.costmap && Array.isArray(result.heatmap.costmap.cells)
+            ? result.heatmap.costmap.cells.length
+            : 0;
+          setStatus(`Gathered heatmap (${{cells}} cells)`, "ok");
+          setMapCommandStatus(`Gathered heatmap run ${{result.route_run_id || ""}}`, "ok");
+          await refreshDimOSMap();
+          await refreshRouteRunHistory();
+        }} catch (error) {{
+          setStatus(`Gather heatmap failed: ${{error.message}}`, "error");
+          setMapCommandStatus(`Gather heatmap failed: ${{error.message}}`, "error");
+        }} finally {{
+          robotBusy = false;
+          setBusy(false);
+        }}
+      }};
       const sendRobotAction = async (url, body, successText) => {{
         robotBusy = true;
         setBusy(true);
@@ -2689,6 +2841,8 @@ def render_dashboard_html(
               {{command: "map_origin"}},
               () => "Map origin set"
             );
+          }} else if (action === "gather_heatmap") {{
+            await gatherHeatmap();
           }} else if (action === "arm_go_to") {{
             setGoToArmed(!goToArmed);
           }}
@@ -2734,10 +2888,14 @@ def render_dashboard_html(
             await placeSelectedFromObservation();
           }} else if (action === "route_select") {{
             await selectRouteByPrompt();
+          }} else if (action === "dry_run_route") {{
+            await runSelectedRoute(true);
           }} else if (action === "run_route") {{
-            await runSelectedRoute();
+            await runSelectedRoute(false);
           }} else if (action === "stop_route") {{
             await stopRouteExecution();
+          }} else if (action === "route_add_action") {{
+            await addActionToSelectedRouteWaypoint();
           }} else if (action === "route_up") {{
             await moveSelectedRouteWaypoint(-1);
           }} else if (action === "route_down") {{

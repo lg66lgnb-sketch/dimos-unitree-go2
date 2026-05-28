@@ -27,6 +27,10 @@ from dimos.experimental.dogops.dashboard_static import (
     build_route_data,
     write_dashboard_html,
 )
+from dimos.experimental.dogops.heatmap_runs import (
+    gather_heatmap_run,
+    latest_heatmap_snapshot,
+)
 from dimos.experimental.dogops.live_map import DogOpsLiveMapAdapter
 from dimos.experimental.dogops.map_authoring import (
     EditableIncidentLocation,
@@ -80,6 +84,13 @@ ROBOT_CALL_TIMEOUT_S = 8.0
 DIMOS_MCP_CALL_TIMEOUT_S = 12.0
 DIMOS_ROUTE_CALL_TIMEOUT_S = 180.0
 WEBRTC_COMMAND_TIMEOUT_S = 2.0
+MCP_UNAVAILABLE_MARKERS = (
+    "no running mcp server",
+    "mcp server is not running",
+    "connection refused",
+    "failed to connect",
+    "tool not found",
+)
 HARD_STOP_REPEATS = 6
 HARD_STOP_INTERVAL_S = 0.05
 ROBOT_POSE_HISTORY_LIMIT = 240
@@ -219,6 +230,7 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
                     state,
                     report,
                     live_overlay=_LIVE_MAP_ADAPTER.snapshot(),
+                    heatmap_snapshot=latest_heatmap_snapshot(self.run_dir),
                     authoring=authoring.model_dump(mode="json"),
                     qr_events=load_qr_events(self.run_dir),
                 )
@@ -293,6 +305,9 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/robot/map_origin":
             if self._authorize_robot_control():
                 self._robot_map_origin()
+        elif path == "/api/map/heatmap/gather":
+            if self._authorize_robot_control():
+                self._gather_heatmap()
         elif path == "/api/map/entities":
             if self._authorize_map_authoring_write():
                 self._upsert_map_entity()
@@ -390,6 +405,7 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
                     state,
                     report,
                     live_overlay=_LIVE_MAP_ADAPTER.snapshot(),
+                    heatmap_snapshot=latest_heatmap_snapshot(self.run_dir),
                     authoring=payload,
                     qr_events=load_qr_events(self.run_dir),
                 ),
@@ -531,6 +547,22 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
             return
         self._send_authoring(authoring)
 
+    def _gather_heatmap(self) -> None:
+        payload = self._read_body_json()
+        area_id = str(payload.get("area_id") or "").strip()
+        try:
+            duration_s = float(payload.get("duration_s") or 0.0)
+        except (TypeError, ValueError):
+            duration_s = 0.0
+        result = gather_heatmap_run(
+            self.run_dir,
+            live_snapshot=_LIVE_MAP_ADAPTER.snapshot(),
+            area_id=area_id,
+            duration_s=max(0.0, duration_s),
+        )
+        status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
+        self._send_json(result, status)
+
     def _follow_map_route(self) -> None:
         payload = self._read_body_json()
         route_id = payload.get("route_id")
@@ -564,6 +596,17 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
             )
             return
         except Exception as exc:
+            if _is_mcp_unavailable_error(exc):
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": "dimos_mcp_unavailable",
+                        "message": str(exc),
+                        **self._route_execution_payload(),
+                    },
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+                return
             self._send_json(
                 {
                     "ok": False,
@@ -621,6 +664,18 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
             )
             return
         except Exception as exc:
+            if _is_mcp_unavailable_error(exc):
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": "dimos_mcp_unavailable",
+                        "message": str(exc),
+                        "hard_stop": hard_stop,
+                        **self._route_execution_payload(),
+                    },
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+                return
             self._send_json(
                 {
                     "ok": False,
@@ -1516,6 +1571,11 @@ def _mcp_route_execution(result: Any) -> dict[str, Any] | None:
     if isinstance(result.get("route_execution"), dict):
         return result["route_execution"]
     return None
+
+
+def _is_mcp_unavailable_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(marker in message for marker in MCP_UNAVAILABLE_MARKERS)
 
 
 def _call_dimos_mcp_skill(
