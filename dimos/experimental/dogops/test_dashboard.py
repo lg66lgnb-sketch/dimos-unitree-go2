@@ -356,6 +356,10 @@ def test_dashboard_map_controls_are_grouped_near_legend(tmp_path) -> None:
     assert "new id creates a route" in content
     assert "label: routeId" in content
     assert "routeTable.addEventListener(\"click\"" in content
+    assert 'data-route-run-select="' in content
+    assert "const overlayPath = Array.isArray(live.path) && live.path.length" in content
+    assert "? live.path" in content
+    assert ": data.route || []" in content
     assert "mapEditControls.addEventListener(\"click\"" in content
     assert ".map-route-table {" in content
     assert ".route-run-history, .route-run-timeline {" in content
@@ -957,6 +961,10 @@ def test_dashboard_gather_heatmap_persists_snapshot_and_history(tmp_path, monkey
             f"{base_url}/api/route-runs",
             headers=_robot_headers(server),
         )
+        status_detail, detail = _get_json_with_status(
+            f"{base_url}/api/route-runs/{result['route_run_id']}",
+            headers=_robot_headers(server),
+        )
     finally:
         server.shutdown()
         server.server_close()
@@ -964,15 +972,19 @@ def test_dashboard_gather_heatmap_persists_snapshot_and_history(tmp_path, monkey
 
     assert status == 200
     assert status_runs == 200
+    assert status_detail == 200
     assert result["ok"] is True
     assert result["run_kind"] == "gather_heatmap"
     assert result["heatmap"]["area_id"] == "AISLE_1"  # type: ignore[index]
     assert (run_dir / "heatmaps" / "latest_heatmap.json").is_file()
+    assert (run_dir / "heatmaps" / f"{result['route_run_id']}.json").is_file()
     assert map_data["layers"]["heatmap"] is True  # type: ignore[index]
     assert map_data["gathered_heatmap"]["area_id"] == "AISLE_1"  # type: ignore[index]
     assert map_data["live"]["costmap"]["source"].startswith("Gathered heatmap")  # type: ignore[index]
     assert route_runs["route_runs"][0]["route_id"] == "GATHER_HEATMAP"  # type: ignore[index]
     assert route_runs["route_runs"][0]["transport"] == "dimos_costmap_snapshot"  # type: ignore[index]
+    assert detail["map"]["gathered_heatmap"]["route_run_id"] == result["route_run_id"]  # type: ignore[index]
+    assert detail["map"]["live"]["costmap"]["cells"][0]["cost"] == 0.75  # type: ignore[index]
 
 
 def test_dashboard_gather_heatmap_without_costmap_records_failed_history(tmp_path, monkeypatch) -> None:
@@ -2060,6 +2072,10 @@ def test_dashboard_route_run_history_endpoints(tmp_path) -> None:
             f"{base_url}/api/route-runs/{route_state.route_run_id}/events",
             headers=_robot_headers(server),
         )
+        status_detail, detail = _get_json_with_status(
+            f"{base_url}/api/route-runs/{route_state.route_run_id}",
+            headers=_robot_headers(server),
+        )
     finally:
         server.shutdown()
         server.server_close()
@@ -2074,6 +2090,9 @@ def test_dashboard_route_run_history_endpoints(tmp_path) -> None:
     assert {"waypoint", "observation", "incident", "work_order", "verification"} <= timeline_kinds
     assert status_events == 200
     assert events["events"][0]["route_run_id"] == route_state.route_run_id  # type: ignore[index]
+    assert status_detail == 200
+    assert detail["map"]["route"][0]["target_id"] == "WP-1"  # type: ignore[index]
+    assert detail["map"]["route"][0]["x"] == 1.0  # type: ignore[index]
 
 
 def test_dashboard_route_run_detail_uses_historical_run_dir(tmp_path) -> None:
