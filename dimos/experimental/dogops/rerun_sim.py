@@ -14,6 +14,7 @@ import zlib
 from dimos.experimental.dogops.store import DogOpsStore
 
 DEFAULT_RERUN_SOURCE_URL = "rerun+http://127.0.0.1:9877/proxy"
+DEFAULT_RERUN_SERVER_MEMORY_LIMIT = "256MB"
 NATIVE_3D_START_HINT = (
     "native-3d mode requires an existing DimOS Go2 Rerun stream. Start the native "
     "simulator first, for example from the full DimOS checkout: "
@@ -37,6 +38,7 @@ PACKAGE_OFFSETS_M = {
     "PKG-103": (0.0, 0.28),
     "PKG-104": (-0.28, -0.20),
 }
+_ACTIVE_RERUN_RECORDINGS: list[Any] = []
 
 
 @dataclass(frozen=True)
@@ -747,11 +749,14 @@ def _start_rerun_stream(
     rr: Any,
     source_url: str,
     *,
-    server_memory_limit: str = "1GB",
+    server_memory_limit: str = DEFAULT_RERUN_SERVER_MEMORY_LIMIT,
     require_existing: bool = False,
 ) -> str:
     host, port = _parse_local_rerun_source(source_url)
-    rr.init("dogops_siteops_agent")
+    rr.init("dogops_siteops_agent", recording_id="dogops_siteops_agent", spawn=False)
+    recording = rr.get_global_data_recording() if hasattr(rr, "get_global_data_recording") else None
+    if recording is not None:
+        _ACTIVE_RERUN_RECORDINGS.append(recording)
     if _port_open(host, port):
         rr.connect_grpc(url=source_url)
         return source_url
@@ -760,9 +765,15 @@ def _start_rerun_stream(
     served = rr.serve_grpc(
         grpc_port=port,
         server_memory_limit=server_memory_limit,
+        recording=recording,
         cors_allow_origin=["*"],
     )
-    return served if isinstance(served, str) and served else source_url
+    active_url = served if isinstance(served, str) and served else source_url
+    for _ in range(20):
+        if _port_open(host, port):
+            return active_url
+        time.sleep(0.1)
+    raise RuntimeError(f"Rerun stream did not open at {source_url}")
 
 
 def _send_map_blueprint(rr: Any) -> None:

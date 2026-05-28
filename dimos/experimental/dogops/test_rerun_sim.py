@@ -81,6 +81,8 @@ class _FakeRerun:
         self.blueprints: list[object] = []
         self.connected: list[str] = []
         self.served: list[int] = []
+        self.serve_kwargs: list[dict[str, object]] = []
+        self.recording = object()
 
     class Clear:
         def __init__(self, *args: object, **kwargs: object) -> None:
@@ -113,14 +115,18 @@ class _FakeRerun:
     def send_blueprint(self, blueprint: object) -> None:
         self.blueprints.append(blueprint)
 
-    def init(self, _name: str) -> None:
+    def init(self, _name: str, **_kwargs: object) -> None:
         return
+
+    def get_global_data_recording(self) -> object:
+        return self.recording
 
     def connect_grpc(self, *, url: str) -> None:
         self.connected.append(url)
 
-    def serve_grpc(self, *, grpc_port: int, **_kwargs: object) -> str:
+    def serve_grpc(self, *, grpc_port: int, **kwargs: object) -> str:
         self.served.append(grpc_port)
+        self.serve_kwargs.append(kwargs)
         return f"rerun+http://127.0.0.1:{grpc_port}/proxy"
 
 
@@ -167,7 +173,8 @@ def test_native_3d_stream_requires_existing_dimos_rerun_source(monkeypatch) -> N
 
 
 def test_dogops_2d_stream_can_start_local_rerun_source(monkeypatch) -> None:
-    monkeypatch.setattr(rerun_sim, "_port_open", lambda _host, _port: False)
+    port_checks = iter([False, True])
+    monkeypatch.setattr(rerun_sim, "_port_open", lambda _host, _port: next(port_checks))
     port = 65531
     source_url = f"rerun+http://127.0.0.1:{port}/proxy"
     rr = _FakeRerun()
@@ -177,3 +184,5 @@ def test_dogops_2d_stream_can_start_local_rerun_source(monkeypatch) -> None:
     assert active_url == source_url
     assert rr.connected == []
     assert rr.served == [port]
+    assert rr.serve_kwargs[0]["recording"] is rr.recording
+    assert rr.serve_kwargs[0]["server_memory_limit"] == "256MB"

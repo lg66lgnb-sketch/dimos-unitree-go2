@@ -161,6 +161,8 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert "3D View" in content
     assert "Rerun Web Visualization" not in content
     assert "connectRerunSurface" in content
+    assert "3D replay requested; waiting for simulation frames..." in content
+    assert "result.replay_after_ms" in content
     assert 'data-map-command-status' in content
     assert "height: clamp(360px, 44vh, 620px)" in content
     assert "max-height: 620px" in content
@@ -406,7 +408,10 @@ def test_dashboard_serves_rerun_web_viewer_and_replay_command(tmp_path) -> None:
     base_url = f"http://127.0.0.1:{server.server_address[1]}"
 
     try:
+        with urllib.request.urlopen(f"{base_url}/", timeout=5) as response:
+            html_headers = dict(response.headers.items())
         with urllib.request.urlopen(f"{base_url}/static/rerun-web-viewer.js", timeout=5) as response:
+            js_headers = dict(response.headers.items())
             static_js = response.read().decode("utf-8")
         vendor_js = ""
         if dashboard._rerun_web_viewer_asset_path("index.js").exists():
@@ -430,7 +435,13 @@ def test_dashboard_serves_rerun_web_viewer_and_replay_command(tmp_path) -> None:
         server.server_close()
         thread.join(timeout=5)
 
+    assert html_headers["Cross-Origin-Opener-Policy"] == "same-origin"
+    assert html_headers["Cross-Origin-Embedder-Policy"] == "require-corp"
+    assert js_headers["Cross-Origin-Resource-Policy"] == "same-origin"
     assert "DogOpsRerunWebViewer" in static_js
+    assert "follow_if_http: true" in static_js
+    assert "local stream probe was inconclusive" in static_js
+    assert 'showFallback(root, "Rerun stream offline' not in static_js
     if vendor_js:
         assert "WebViewer" in vendor_js
         assert "WebAssembly" in extensionless_js
@@ -438,6 +449,8 @@ def test_dashboard_serves_rerun_web_viewer_and_replay_command(tmp_path) -> None:
     assert result["ok"] is True
     command = json.loads((run_dir / dashboard.RERUN_COMMAND_FILENAME).read_text(encoding="utf-8"))
     assert command["action"] == "replay_mapping"
+    assert result["command_id"] == command["id"]
+    assert result["replay_after_ms"] >= 500
 
 
 def test_dashboard_rejects_unsupported_rerun_replay_action(tmp_path) -> None:

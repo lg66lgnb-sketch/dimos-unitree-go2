@@ -1025,15 +1025,13 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
                 if isinstance(previous_action, str) and previous_action not in history:
                     history.append(previous_action)
         history.append(action)
+        command_id = str(time.time_ns())
         command_path.write_text(
-            json.dumps(
-                {"action": action, "history": history[-20:], "id": str(time.time_ns())},
-                sort_keys=True,
-            )
+            json.dumps({"action": action, "history": history[-20:], "id": command_id}, sort_keys=True)
             + "\n",
             encoding="utf-8",
         )
-        self._send_json({"ok": True, "action": action})
+        self._send_json({"ok": True, "action": action, "command_id": command_id, "replay_after_ms": 850})
 
     def _authorize_local_read(self) -> bool:
         host = self.headers.get("Host", "")
@@ -1088,6 +1086,7 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
+        self._send_browser_isolation_headers()
         self.end_headers()
         self.wfile.write(payload)
 
@@ -1120,8 +1119,14 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(raw)))
+        self._send_browser_isolation_headers()
         self.end_headers()
         self.wfile.write(raw)
+
+    def _send_browser_isolation_headers(self) -> None:
+        self.send_header("Cross-Origin-Opener-Policy", "same-origin")
+        self.send_header("Cross-Origin-Embedder-Policy", "require-corp")
+        self.send_header("Cross-Origin-Resource-Policy", "same-origin")
 
     def _read_json(self, path: Path) -> dict[str, Any]:
         return json.loads(path.read_text(encoding="utf-8"))

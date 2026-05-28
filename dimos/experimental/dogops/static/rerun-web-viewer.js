@@ -127,8 +127,7 @@ export async function mountDogOpsRerunViewer(root) {
 
   const probeUrl = sourceProbeUrl(sourceUrl);
   if (!(await canReachLocalSource(probeUrl))) {
-    showFallback(root, "Rerun stream offline. Showing latest DogOps map artifact.");
-    return;
+    setStatus(root, "Opening 3D View; local stream probe was inconclusive.", "");
   }
 
   const viewer = new WebViewer();
@@ -160,6 +159,9 @@ export async function mountDogOpsRerunViewer(root) {
         height: "100%",
         hide_welcome_screen: true,
         base_url: assetBaseUrl,
+      },
+      {
+        follow_if_http: true,
       },
     );
   } catch (error) {

@@ -1840,7 +1840,10 @@ def render_dashboard_html(
           if (!response.ok || result.ok === false) {{
             throw new Error(result.message || result.error || "rerun_replay_failed");
           }}
+          setMapCommandStatus("3D replay requested; waiting for simulation frames...", "ok");
+          await new Promise((resolve) => window.setTimeout(resolve, Number(result.replay_after_ms || 850)));
           await connectRerunSurface({{replay: true}});
+          setMapCommandStatus("3D replay started.", "ok");
           return true;
         }} catch (error) {{
           setMapCommandStatus(`3D replay failed: ${{error.message}}`, "error");
