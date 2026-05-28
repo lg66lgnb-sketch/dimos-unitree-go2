@@ -23,9 +23,13 @@ class EditableMapPoint(DogOpsModel):
     x: float
     y: float
     theta_deg: float | None = None
-    source: Literal["site_config", "dashboard_edit", "observation", "live_topic"] = (
-        "dashboard_edit"
-    )
+    source: Literal[
+        "site_config",
+        "dashboard_edit",
+        "observation",
+        "live_topic",
+        "qr_cargo_event",
+    ] = "dashboard_edit"
 
     @field_validator("x", "y", "theta_deg")
     @classmethod
