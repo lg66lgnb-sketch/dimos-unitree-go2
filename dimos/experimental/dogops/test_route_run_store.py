@@ -133,3 +133,42 @@ def test_timeline_events_are_persisted_in_sqlite(tmp_path) -> None:
     timeline = store.timeline_events(dogops_run_id="latest")
     assert [event["kind"] for event in timeline] == ["incident", "work_order"]
     assert timeline[0]["payload"] == {}
+
+
+def test_timeline_event_ids_are_scoped_by_run_and_route_run(tmp_path) -> None:
+    run_dir = tmp_path / ".dogops" / "runs" / "latest"
+    store = RouteRunStore(run_dir)
+
+    store.replace_timeline_events(
+        "first",
+        [
+            {
+                "event_id": "INC-001",
+                "route_run_id": "RR-FIRST",
+                "ts": 1.0,
+                "kind": "incident",
+                "state": "open",
+                "note": "first incident",
+            },
+        ],
+        route_run_id="RR-FIRST",
+    )
+    store.replace_timeline_events(
+        "second",
+        [
+            {
+                "event_id": "INC-001",
+                "route_run_id": "RR-SECOND",
+                "ts": 1.0,
+                "kind": "incident",
+                "state": "open",
+                "note": "second incident",
+            },
+        ],
+        route_run_id="RR-SECOND",
+    )
+
+    first = store.timeline_events(dogops_run_id="first", route_run_id="RR-FIRST")
+    second = store.timeline_events(dogops_run_id="second", route_run_id="RR-SECOND")
+    assert [event["note"] for event in first] == ["first incident"]
+    assert [event["note"] for event in second] == ["second incident"]

@@ -217,7 +217,9 @@ class RouteRunStore:
                     (dogops_run_id, route_run_id),
                 )
             for sequence, row in enumerate(rows, 1):
-                event_id = str(row.get("event_id") or f"{dogops_run_id}-TL-{sequence:04d}")
+                row_route_run_id = row.get("route_run_id") or route_run_id or ""
+                source_event_id = str(row.get("event_id") or f"TL-{sequence:04d}")
+                event_id = f"{dogops_run_id}:{row_route_run_id or 'run'}:{source_event_id}"
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO dogops_timeline_events (
@@ -228,7 +230,7 @@ class RouteRunStore:
                     (
                         event_id,
                         dogops_run_id,
-                        row.get("route_run_id"),
+                        row_route_run_id or None,
                         float(row.get("ts") or 0.0),
                         int(row.get("sequence") or sequence),
                         str(row.get("kind") or "system"),
