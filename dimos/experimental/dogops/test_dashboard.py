@@ -1561,6 +1561,58 @@ def test_dashboard_route_run_history_endpoints(tmp_path) -> None:
     assert events["events"][0]["route_run_id"] == route_state.route_run_id  # type: ignore[index]
 
 
+def test_dashboard_route_run_detail_uses_historical_run_dir(tmp_path) -> None:
+    first_run_dir = tmp_path / ".dogops" / "runs" / "first"
+    second_run_dir = tmp_path / ".dogops" / "runs" / "second"
+    for run_dir, route_id in ((first_run_dir, "ROUTE_FIRST"), (second_run_dir, "ROUTE_SECOND")):
+        run_offline_simulation(out=run_dir)
+        save_map_authoring(
+            run_dir,
+            MapAuthoringState(
+                selected_route_id=route_id,
+                routes=[
+                    EditableRoute(
+                        id=route_id,
+                        label=route_id,
+                        waypoints=[
+                            EditableRouteWaypoint(
+                                id=f"{route_id}-WP-1",
+                                label="Waypoint 1",
+                                pose=EditableMapPoint(x=1.0, y=2.0),
+                            )
+                        ],
+                    )
+                ],
+            ),
+        )
+    second_report_path = second_run_dir / "report.json"
+    second_report = json.loads(second_report_path.read_text(encoding="utf-8"))
+    second_report["incidents"][0]["title"] = "second-run-only incident"
+    second_report_path.write_text(json.dumps(second_report), encoding="utf-8")
+
+    DogOpsRouteExecutor(first_run_dir).follow_route(dry_run=True)
+    second_route_state = DogOpsRouteExecutor(second_run_dir).follow_route(dry_run=True)
+    server = make_dashboard_server(first_run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        status_detail, detail = _get_json_with_status(
+            f"{base_url}/api/route-runs/{second_route_state.route_run_id}",
+            headers=_robot_headers(server),
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status_detail == 200
+    assert detail["route_run"]["dogops_run_id"] == "second"  # type: ignore[index]
+    timeline_notes = {row["note"] for row in detail["timeline"]}  # type: ignore[index]
+    assert "second-run-only incident" in timeline_notes
+
+
 def test_dimos_mcp_call_command_prefers_configured_prefix(monkeypatch) -> None:
     monkeypatch.setenv("DOGOPS_DIMOS_MCP_CALL", "python -m dimos mcp call")
 

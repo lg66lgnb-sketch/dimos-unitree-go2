@@ -660,7 +660,7 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
                 "ok": True,
                 "route_run": current,
                 "events": route_events,
-                "timeline": self._unified_timeline(route_events),
+                "timeline": self._unified_timeline(route_events, current) if current else [],
                 "evidence": store.route_run_evidence(current["route_run_id"]) if current else [],
             }
         )
@@ -688,19 +688,25 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
                 "ok": True,
                 "route_run": route_run,
                 "events": route_events,
-                "timeline": self._unified_timeline(route_events),
+                "timeline": self._unified_timeline(route_events, route_run),
                 "evidence": store.route_run_evidence(route_run_id),
             }
         )
 
-    def _unified_timeline(self, route_events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        state = self._read_json(self.run_dir / "state.json")
-        report = self._read_json(self.run_dir / "report.json")
-        route_run_id = str(route_events[0].get("route_run_id")) if route_events else None
+    def _unified_timeline(
+        self,
+        route_events: list[dict[str, Any]],
+        route_run: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        timeline_run_dir = Path(str(route_run.get("run_dir") or self.run_dir))
+        state = self._read_json(timeline_run_dir / "state.json")
+        report = self._read_json(timeline_run_dir / "report.json")
+        route_run_id = str(route_run.get("route_run_id") or "")
+        dogops_run_id = str(route_run.get("dogops_run_id") or state.get("run", {}).get("id") or timeline_run_dir.name)
         rows = [
             {
                 "event_id": f"TL-{event.get('event_id') or event.get('sequence')}",
-                "route_run_id": event.get("route_run_id"),
+                "route_run_id": event.get("route_run_id") or route_run_id,
                 "ts": event.get("ts") or 0,
                 "sequence": event.get("sequence"),
                 "kind": event.get("kind") or "route",
@@ -767,10 +773,10 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         rows.sort(key=lambda item: (float(item.get("ts") or 0), str(item.get("kind") or "")))
         for index, row in enumerate(rows, 1):
             row["sequence"] = row.get("sequence") or index
-        store = RouteRunStore(self.run_dir)
-        store.replace_timeline_events(str(state.get("run", {}).get("id") or self.run_dir.name), rows)
+        store = RouteRunStore(timeline_run_dir)
+        store.replace_timeline_events(dogops_run_id, rows, route_run_id=route_run_id)
         return store.timeline_events(
-            dogops_run_id=str(state.get("run", {}).get("id") or self.run_dir.name),
+            dogops_run_id=dogops_run_id,
             route_run_id=route_run_id,
         )
 

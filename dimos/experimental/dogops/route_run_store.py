@@ -201,9 +201,21 @@ class RouteRunStore:
             "created_at": created_at,
         }
 
-    def replace_timeline_events(self, dogops_run_id: str, rows: list[dict[str, Any]]) -> None:
+    def replace_timeline_events(
+        self,
+        dogops_run_id: str,
+        rows: list[dict[str, Any]],
+        *,
+        route_run_id: str | None = None,
+    ) -> None:
         with self._connect() as conn:
-            conn.execute("DELETE FROM dogops_timeline_events WHERE dogops_run_id = ?", (dogops_run_id,))
+            if route_run_id is None:
+                conn.execute("DELETE FROM dogops_timeline_events WHERE dogops_run_id = ?", (dogops_run_id,))
+            else:
+                conn.execute(
+                    "DELETE FROM dogops_timeline_events WHERE dogops_run_id = ? AND route_run_id = ?",
+                    (dogops_run_id, route_run_id),
+                )
             for sequence, row in enumerate(rows, 1):
                 event_id = str(row.get("event_id") or f"{dogops_run_id}-TL-{sequence:04d}")
                 conn.execute(
