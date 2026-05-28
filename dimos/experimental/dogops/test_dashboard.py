@@ -43,6 +43,19 @@ def _get_json(url: str) -> dict[str, object]:
         return json.loads(response.read().decode("utf-8"))
 
 
+def _get_json_with_status(
+    url: str,
+    *,
+    headers: dict[str, str] | None = None,
+) -> tuple[int, dict[str, object]]:
+    request = urllib.request.Request(url, headers=headers or {}, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return exc.status, json.loads(exc.read().decode("utf-8"))
+
+
 def _post_json(
     url: str,
     payload: dict[str, Any],
@@ -121,6 +134,12 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert 'data-live-path' in content
     assert 'data-live-target' in content
     assert "refreshDimOSMap" in content
+    assert 'data-map-edit-action="run_route"' in content
+    assert 'data-map-edit-action="stop_route"' in content
+    assert 'data-route-execution-status' in content
+    assert "/api/map/routes/follow" in content
+    assert "/api/map/routes/stop" in content
+    assert "/api/map/routes/status" in content
     assert "map-point" in content
     assert "map-robot-core" in content
     assert "free grid" in content
@@ -151,7 +170,7 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert "/api/map/no_go_shapes/publish" in content
     assert "/api/map/tag_bindings" in content
     assert "/from_observation" in content
-    assert "routes.find((item) => item.id === current.selected_route_id) || routes[0]" in content
+    assert "if (!current.selected_route_id) return null" in content
     assert "selected_route_id: route.id" in content
     assert 'data-go-to-marker' in content
     assert "/api/robot/go_to" in content
@@ -1365,6 +1384,123 @@ def test_dashboard_robot_go_to_rejects_bad_target(tmp_path, monkeypatch) -> None
     assert status == 400
     assert result["ok"] is False
     assert result["error"] == "invalid_go_to_target"
+
+
+def test_dashboard_route_follow_stop_and_status_endpoints(tmp_path, monkeypatch) -> None:
+    calls: list[tuple[str | None, bool]] = []
+    timeouts: list[float] = []
+
+    def fake_follow(route_id: str | None, dry_run: bool) -> dict[str, object]:
+        calls.append((route_id, dry_run))
+        return {
+            "transport": "dimos_mcp",
+            "skill": "follow_route",
+            "mcp_result": {
+                "ok": True,
+                "route_id": route_id,
+                "state": "completed",
+                "route_execution": {"route_id": route_id, "state": "completed"},
+            },
+        }
+
+    def fake_stop() -> dict[str, object]:
+        return {
+            "transport": "dimos_mcp",
+            "skill": "stop_route",
+            "mcp_result": {"ok": True, "state": "stopped", "route_execution": {"state": "stopped"}},
+        }
+
+    monkeypatch.setattr(dashboard, "_run_robot_follow_route", fake_follow)
+    monkeypatch.setattr(dashboard, "_run_robot_stop_route", fake_stop)
+    monkeypatch.setattr(dashboard, "_run_route_hard_stop", lambda robot_ip: {"robot_ip": robot_ip})
+    original_run_robot_call = dashboard._run_robot_call
+
+    def tracking_run_robot_call(fn: Any, *, timeout_s: float = dashboard.ROBOT_CALL_TIMEOUT_S) -> object:
+        timeouts.append(timeout_s)
+        return original_run_robot_call(fn, timeout_s=timeout_s)
+
+    monkeypatch.setattr(dashboard, "_run_robot_call", tracking_run_robot_call)
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    save_map_authoring(
+        run_dir,
+        MapAuthoringState(
+            selected_route_id="ROUTE_A",
+            routes=[
+                EditableRoute(
+                    id="ROUTE_A",
+                    label="Route A",
+                    waypoints=[
+                        EditableRouteWaypoint(
+                            id="WP-1",
+                            label="Waypoint 1",
+                            pose=EditableMapPoint(x=1.0, y=2.0),
+                        )
+                    ],
+                )
+            ],
+        ),
+    )
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        status_follow, follow_result = _post_json(
+            f"{base_url}/api/map/routes/follow",
+            {"route_id": "ROUTE_A", "dry_run": True},
+            headers=_robot_headers(server),
+        )
+        status_status, status_result = _get_json_with_status(
+            f"{base_url}/api/map/routes/status",
+            headers=_robot_headers(server),
+        )
+        status_stop, stop_result = _post_json(
+            f"{base_url}/api/map/routes/stop",
+            {},
+            headers=_robot_headers(server),
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status_follow == 200
+    assert follow_result["ok"] is True
+    assert follow_result["command"] == "follow_route"
+    assert follow_result["route_execution"]["state"] == "completed"  # type: ignore[index]
+    assert follow_result["authoring"]["selected_route_id"] == "ROUTE_A"  # type: ignore[index]
+    assert calls == [("ROUTE_A", True)]
+    assert timeouts[0] == dashboard.DIMOS_ROUTE_CALL_TIMEOUT_S
+    assert status_status == 200
+    assert status_result["ok"] is True
+    assert status_result["route_execution"]["state"] == "idle"  # type: ignore[index]
+    assert status_stop == 200
+    assert stop_result["ok"] is True
+    assert stop_result["command"] == "stop_route"
+    assert stop_result["route_execution"]["state"] == "stopped"  # type: ignore[index]
+    assert stop_result["hard_stop"]["ok"] is True  # type: ignore[index]
+    assert stop_result["hard_stop"]["robot_ip"] == "192.168.12.1"  # type: ignore[index]
+
+
+def test_dashboard_route_status_requires_token(tmp_path) -> None:
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        status, result = _get_json_with_status(f"{base_url}/api/map/routes/status")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 403
+    assert result["error"] == "map_authoring_forbidden"
 
 
 def test_dimos_mcp_call_command_prefers_configured_prefix(monkeypatch) -> None:

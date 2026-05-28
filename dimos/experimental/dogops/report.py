@@ -150,6 +150,8 @@ def render_report_markdown(state: DogOpsState) -> str:
             f"{nav.tag_reacquisition_successes} tag-search recovery, "
             f"{nav.safety_stops} safety stops"
         )
+        for note in nav.notes:
+            lines.append(f"Nav evidence: {note}")
     lines.append(
         "Checkpoints: "
         f"{data['checkpoints_verified']}/{data['checkpoints_total']} tag sign-ins verified"
