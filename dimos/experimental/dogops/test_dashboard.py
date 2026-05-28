@@ -155,6 +155,7 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert 'data-rerun-connect' in content
     assert 'data-rerun-canvas' in content
     assert 'data-rerun-source-url=' in content
+    assert 'data-rerun-view-mode="dogops-2d"' in content
     assert 'data-rerun-web-link' in content
     assert "/static/rerun-web-viewer.js" in content
     assert "/assets/vendor/@rerun-io/web-viewer/" in content
@@ -229,6 +230,19 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert 'data-motion="step"' in content
     assert 'data-motion="walk"' in content
     assert "X-DogOps-Control-Token" in content
+
+
+def test_dashboard_static_html_can_use_native_rerun_view_mode(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("DOGOPS_RERUN_VIEW_MODE", "native-3d")
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+
+    content = write_dashboard_html(run_dir).read_text(encoding="utf-8")
+
+    assert 'data-rerun-view-mode="native-3d"' in content
+    assert "isNativeRerunView()" in content
+    assert "/api/map/explore/start" in content
+    assert "Native 3D mapping uses the live DimOS/MuJoCo stream." in content
 
 
 def test_dashboard_static_embeds_full_authoring_state(tmp_path) -> None:
@@ -475,6 +489,69 @@ def test_dashboard_rejects_unsupported_rerun_replay_action(tmp_path) -> None:
     assert status == 400
     assert result["ok"] is False
     assert result["error"] == "unsupported_rerun_action"
+
+
+def test_dashboard_rejects_synthetic_mapping_replay_in_native_rerun_mode(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("DOGOPS_RERUN_VIEW_MODE", "native-3d")
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        status, result = _post_json(
+            f"{base_url}/api/rerun/replay",
+            {"action": "replay_mapping"},
+            headers=_robot_headers(server),
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 409
+    assert result["ok"] is False
+    assert result["error"] == "native_rerun_uses_live_map"
+    assert not (run_dir / dashboard.RERUN_COMMAND_FILENAME).exists()
+
+
+def test_dashboard_map_explore_start_publishes_dimos_explore_command(
+    tmp_path, monkeypatch
+) -> None:
+    calls: list[str] = []
+
+    def fake_publish_explore() -> dict[str, object]:
+        calls.append("explore")
+        return {"transport": "lcm", "topic": "/explore_cmd"}
+
+    monkeypatch.setattr(dashboard, "_publish_explore_command", fake_publish_explore)
+    run_dir = tmp_path / "latest"
+    run_offline_simulation(out=run_dir)
+    server = make_dashboard_server(run_dir, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        status, result = _post_json(
+            f"{base_url}/api/map/explore/start",
+            {},
+            headers=_robot_headers(server),
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 200
+    assert result["ok"] is True
+    assert result["command"] == "explore_start"
+    assert result["topic"] == "/explore_cmd"
+    assert calls == ["explore"]
 
 
 def test_dashboard_map_authoring_endpoints_persist_and_compose(tmp_path) -> None:

@@ -618,6 +618,7 @@ def render_site_map(
     scan_items = "".join(_render_scan_item(observation) for observation in map_data["observations"])
     rerun_source_url = _trusted_rerun_source_url(os.environ.get("DOGOPS_RERUN_SOURCE_URL"))
     rerun_web_url = _trusted_rerun_web_url(os.environ.get("DOGOPS_RERUN_WEB_URL"))
+    rerun_view_mode = _trusted_rerun_view_mode(os.environ.get("DOGOPS_RERUN_VIEW_MODE"))
     rerun_web_url_attr = escape(rerun_web_url, quote=True)
     legend = (
         '<div class="map-legend">'
@@ -668,7 +669,7 @@ def render_site_map(
     route_execution_status = _route_execution_status_text(route_execution)
     return f"""
       <div class="map-shell" data-map-surface>
-        {_render_rerun_surface(rerun_source_url, rerun_web_url)}
+        {_render_rerun_surface(rerun_source_url, rerun_web_url, rerun_view_mode)}
         {layer_controls}
         {edit_controls}
         <svg class="site-map" role="img" aria-label="DogOps mission map"
@@ -1850,7 +1851,32 @@ def render_dashboard_html(
           return false;
         }}
       }};
+      const isNativeRerunView = () => (rerunSurface && rerunSurface.dataset.rerunViewMode) === "native-3d";
       const mapFromScratch = async () => {{
+        if (isNativeRerunView()) {{
+          try {{
+            const response = await fetch("/api/map/explore/start", {{
+              method: "POST",
+              headers: {{
+                "Content-Type": "application/json",
+                "X-DogOps-Control-Token": robotControlToken,
+              }},
+              body: JSON.stringify({{}}),
+            }});
+            const result = await response.json();
+            if (!response.ok || result.ok === false) {{
+              throw new Error(result.message || result.error || "explore_start_failed");
+            }}
+          }} catch (error) {{
+            setMapCommandStatus(`Native exploration failed: ${{error.message}}`, "error");
+            return;
+          }}
+          setMapCommandStatus("Native 3D mapping uses the live DimOS/MuJoCo stream.", "ok");
+          await connectRerunSurface({{replay: false}});
+          await refreshDimOSMap();
+          await refreshLiveMap();
+          return;
+        }}
         setMapCommandStatus("Mapping from scratch in simulation...", "ok");
         await requestRerunReplay("replay_mapping");
       }};
@@ -2575,6 +2601,10 @@ def _trusted_rerun_source_url(raw_url: str | None) -> str:
     return raw_url
 
 
+def _trusted_rerun_view_mode(raw_view_mode: str | None) -> str:
+    return "native-3d" if raw_view_mode == "native-3d" else "dogops-2d"
+
+
 def _route_execution_status_text(route_execution: dict[str, Any] | None) -> str:
     if not route_execution or not route_execution.get("state"):
         return "Execution: idle"
@@ -2624,14 +2654,19 @@ def _with_default_route_authoring(
     return updated
 
 
-def _render_rerun_surface(rerun_source_url: str, rerun_web_url: str) -> str:
+def _render_rerun_surface(
+    rerun_source_url: str,
+    rerun_web_url: str,
+    rerun_view_mode: str,
+) -> str:
     rerun_source_url_attr = escape(rerun_source_url, quote=True)
     rerun_web_url_attr = escape(rerun_web_url, quote=True)
+    rerun_view_mode_attr = escape(_trusted_rerun_view_mode(rerun_view_mode), quote=True)
     return (
         '<div class="rerun-surface" data-rerun-surface data-map-viewer '
         f'data-rerun-source-url="{rerun_source_url_attr}" '
         'data-rerun-asset-base-url="/assets/vendor/@rerun-io/web-viewer/" '
-        'data-rerun-view-mode="dogops-2d">'
+        f'data-rerun-view-mode="{rerun_view_mode_attr}">'
         '<div class="rerun-canvas" data-rerun-canvas hidden></div>'
         '<div class="rerun-offline" data-viewer-offline hidden>'
         '<div>3D View unavailable. Start the Rerun stream, then connect again.</div>'

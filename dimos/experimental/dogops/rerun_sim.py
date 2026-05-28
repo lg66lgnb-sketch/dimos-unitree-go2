@@ -629,7 +629,11 @@ def serve_rerun_sim(
             command_id = str(command.get("id") or "")
             action = str(command.get("action") or "")
             is_new_replay = bool(command_id and command_id != last_command_id)
-            if is_new_replay and action in {"replay_mapping", "replay_route"}:
+            if is_new_replay and action == "replay_mapping" and view_mode == "native-3d":
+                log_state_to_rerun(rr, store.state, view_mode=view_mode)
+                last_command_id = command_id
+                print("DogOps Rerun stream ignored synthetic mapping replay in native-3d mode", flush=True)
+            elif is_new_replay and action in {"replay_mapping", "replay_route"}:
                 log_state_to_rerun(
                     rr,
                     store.state,

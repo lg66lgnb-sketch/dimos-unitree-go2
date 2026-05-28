@@ -27,7 +27,7 @@ from dimos.experimental.dogops.dashboard_static import (
     build_route_data,
     write_dashboard_html,
 )
-from dimos.experimental.dogops.live_map import DogOpsLiveMapAdapter
+from dimos.experimental.dogops.live_map import DogOpsLiveMapAdapter, _extend_dimos_package_path
 from dimos.experimental.dogops.map_authoring import (
     EditableIncidentLocation,
     EditableMapEntity,
@@ -113,6 +113,10 @@ _ROBOT_SESSIONS: dict[str, _RobotMotionSession] = {}
 _ROBOT_SESSIONS_LOCK = threading.Lock()
 _AUTHORING_LOCK = threading.Lock()
 _LIVE_MAP_ADAPTER = DogOpsLiveMapAdapter()
+
+
+def _rerun_view_mode() -> str:
+    return "native-3d" if os.environ.get("DOGOPS_RERUN_VIEW_MODE") == "native-3d" else "dogops-2d"
 
 
 class DogOpsDashboardServer(ThreadingHTTPServer):
@@ -292,6 +296,9 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/map/routes/stop":
             if self._authorize_map_authoring_write():
                 self._stop_map_route()
+        elif path == "/api/map/explore/start":
+            if self._authorize_map_authoring_write():
+                self._start_map_exploration()
         elif path == "/api/rerun/replay":
             if self._authorize_map_authoring_write():
                 self._replay_rerun()
@@ -999,6 +1006,27 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
 
         self._send_json({"ok": bool(result), "command": "map_origin"})
 
+    def _start_map_exploration(self) -> None:
+        try:
+            result = _publish_explore_command()
+        except ModuleNotFoundError as exc:
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": "dimos_explore_unavailable",
+                    "message": str(exc),
+                },
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            return
+        except Exception as exc:
+            self._send_json(
+                {"ok": False, "error": "explore_start_failed", "message": str(exc)},
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            return
+        self._send_json({"ok": True, "command": "explore_start", **result})
+
     def _replay_rerun(self) -> None:
         payload = self._read_body_json()
         action = str(payload.get("action") or "").strip()
@@ -1006,6 +1034,16 @@ class DogOpsDashboardHandler(BaseHTTPRequestHandler):
             self._send_json(
                 {"ok": False, "error": "unsupported_rerun_action"},
                 HTTPStatus.BAD_REQUEST,
+            )
+            return
+        if _rerun_view_mode() == "native-3d" and action == "replay_mapping":
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": "native_rerun_uses_live_map",
+                    "message": "Native 3D mode uses the live DimOS/MuJoCo map stream instead of synthetic mapping replay.",
+                },
+                HTTPStatus.CONFLICT,
             )
             return
         command_path = self.run_dir / RERUN_COMMAND_FILENAME
@@ -1407,6 +1445,23 @@ def _run_robot_posture(command: str, robot_ip: str) -> bool:
 
 def _run_robot_go_to(x: float, y: float) -> dict[str, Any]:
     return _call_dimos_mcp_skill("go_to", {"x": x, "y": y})
+
+
+def _publish_explore_command() -> dict[str, Any]:
+    try:
+        from dimos.core.transport import LCMTransport
+        from dimos.msgs.std_msgs.Bool import Bool
+    except ModuleNotFoundError:
+        _extend_dimos_package_path()
+        from dimos.core.transport import LCMTransport
+        from dimos.msgs.std_msgs.Bool import Bool
+
+    transport = LCMTransport("/explore_cmd", Bool)
+    try:
+        transport.publish(Bool(data=True))
+    finally:
+        transport.stop()
+    return {"transport": "lcm", "topic": "/explore_cmd"}
 
 
 def _run_route_hard_stop(robot_ip: str) -> dict[str, Any]:
