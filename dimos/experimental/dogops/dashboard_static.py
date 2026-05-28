@@ -793,10 +793,19 @@ def render_site_map(
         '<button type="button" data-map-edit-action="run_route">Run Live Route</button>'
         '<button type="button" data-map-edit-action="stop_route">Stop Route</button>'
         '<button type="button" data-map-edit-action="heatmap_run">Heatmap Run</button>'
-        '<button type="button" data-map-edit-action="route_add_action">Add Action</button>'
         '<button type="button" data-map-edit-action="route_up">Route Up</button>'
         '<button type="button" data-map-edit-action="route_down">Route Down</button>'
         '<span class="map-route-summary" data-map-route-summary>Selected route: none. Next: Route1</span>'
+        "</div>"
+        '<div class="map-edit-row map-route-action-row" data-route-action-row hidden>'
+        '<span class="map-route-summary" data-route-action-summary>Select a waypoint to add actions</span>'
+        '<button type="button" data-route-action-kind="capture_image">Capture Image</button>'
+        '<button type="button" data-route-action-kind="scan_qr">Scan QR</button>'
+        '<button type="button" data-route-action-kind="scan_tags">Scan Tags</button>'
+        '<button type="button" data-route-action-kind="wait">Wait</button>'
+        '<button type="button" data-route-action-kind="inspect_asset">Inspect Asset</button>'
+        '<button type="button" data-route-action-kind="verify_work_order">Verify Work Order</button>'
+        '<button type="button" data-route-action-kind="operator_prompt">Operator Prompt</button>'
         "</div>"
         "</div>"
     )
@@ -1109,7 +1118,14 @@ def render_dashboard_html(
       stroke-linejoin: round;
       stroke-width: 4;
     }}
-    .map-route-stop {{ fill: #05070c; stroke: #52e0c4; stroke-width: 2; }}
+    .map-route-stop {{ fill: #05070c; stroke: #52e0c4; stroke-width: 2; transition: fill 120ms ease, r 120ms ease, stroke-width 120ms ease; }}
+    .map-route-stop-marker {{ cursor: pointer; }}
+    .map-route-stop-marker.is-selected .map-route-stop {{
+      fill: #145c52;
+      stroke: #d8fff6;
+      stroke-width: 3;
+    }}
+    .map-route-stop-marker.is-selected .map-route-index {{ fill: #ffffff; font-size: 13px; }}
     .map-route-index {{
       dominant-baseline: central;
       fill: #d8fff6;
@@ -1289,6 +1305,18 @@ def render_dashboard_html(
       border-color: #52e0c4;
       color: #d8fff6;
       font-weight: 700;
+    }}
+    .map-route-action-row[hidden] {{ display: none; }}
+    .map-route-action-row {{
+      background: rgba(8, 13, 22, 0.72);
+      border: 1px solid #243244;
+      border-radius: 8px;
+      padding: 8px;
+    }}
+    .map-route-action-row button {{
+      background: #123b36;
+      border-color: #52e0c4;
+      color: #d8fff6;
     }}
     .map-route-summary {{
       color: #a9b4c4;
@@ -1659,6 +1687,8 @@ def render_dashboard_html(
       const mapControls = document.querySelector("[data-map-controls]");
       const layerControls = document.querySelector("[data-map-layer-controls]");
       const mapEditControls = document.querySelector("[data-map-edit-controls]");
+      const routeActionRow = document.querySelector("[data-route-action-row]");
+      const routeActionSummary = document.querySelector("[data-route-action-summary]");
       const rerunSurface = document.querySelector("[data-rerun-surface]");
       const rerunConnect = document.querySelector("[data-rerun-connect]");
       const rerunFrame = document.querySelector("[data-rerun-frame]");
@@ -1879,12 +1909,36 @@ def render_dashboard_html(
         }}
         setMapAuthoringStatus(mapEditMode === "select" ? "Map authoring idle" : `Map authoring: ${{mapEditMode}}`, mapEditMode === "select" ? "" : "ok");
       }};
+      const clearRouteStopSelection = () => {{
+        if (!liveMapSvg) return;
+        liveMapSvg.querySelectorAll(".map-route-stop-marker.is-selected").forEach((item) => {{
+          item.classList.remove("is-selected");
+          const circle = item.querySelector(".map-route-stop");
+          if (circle) circle.setAttribute("r", "9");
+        }});
+      }};
+      const updateRouteActionControls = () => {{
+        const hasRouteStop = selectedMapObject && selectedMapObject.kind === "route_stop";
+        if (routeActionRow) routeActionRow.hidden = !hasRouteStop;
+        if (routeActionSummary) {{
+          routeActionSummary.textContent = hasRouteStop
+            ? `Actions for ${{selectedMapObject.id}}`
+            : "Select a waypoint to add actions";
+        }}
+      }};
       const selectMapObject = (target) => {{
         const item = target ? target.closest("[data-edit-kind][data-edit-id]") : null;
+        clearRouteStopSelection();
         selectedMapObject = item ? {{
           kind: item.getAttribute("data-edit-kind"),
           id: item.getAttribute("data-edit-id"),
         }} : null;
+        if (selectedMapObject && selectedMapObject.kind === "route_stop") {{
+          item.classList.add("is-selected");
+          const circle = item.querySelector(".map-route-stop");
+          if (circle) circle.setAttribute("r", "18");
+        }}
+        updateRouteActionControls();
         setMapAuthoringStatus(
           selectedMapObject ? `Selected ${{selectedMapObject.kind}} ${{selectedMapObject.id}}` : "Map authoring idle",
           selectedMapObject ? "ok" : ""
@@ -2150,17 +2204,21 @@ def render_dashboard_html(
         }}
         return {{target: waypoint.target_id || waypoint.id}};
       }};
-      const addActionToSelectedRouteWaypoint = async () => {{
+      const routeActionLabels = {{
+        capture_image: "Capture Image",
+        scan_qr: "Scan QR",
+        scan_tags: "Scan Tags",
+        wait: "Wait",
+        inspect_asset: "Inspect Asset",
+        verify_work_order: "Verify Work Order",
+        operator_prompt: "Operator Prompt",
+      }};
+      const addActionToSelectedRouteWaypoint = async (kind) => {{
         if (!selectedMapObject || selectedMapObject.kind !== "route_stop") {{
           setMapAuthoringStatus("Select a route waypoint before adding an action", "error");
           return;
         }}
-        const kindInput = window.prompt(
-          "Action kind: capture_image, scan_qr, scan_tags, wait, inspect_asset, verify_work_order, operator_prompt",
-          "capture_image"
-        );
-        const kind = (kindInput || "").trim();
-        const allowed = new Set(["capture_image", "scan_qr", "scan_tags", "wait", "inspect_asset", "verify_work_order", "operator_prompt"]);
+        const allowed = new Set(Object.keys(routeActionLabels));
         if (!allowed.has(kind)) {{
           setMapAuthoringStatus("Unsupported route action kind", "error");
           return;
@@ -2177,7 +2235,7 @@ def render_dashboard_html(
         const waypoints = [...(route.waypoints || [])];
         const waypoint = {{...waypoints[waypointIndex]}};
         const actionId = mapEditId(kind.toUpperCase());
-        const label = window.prompt("Action label", kind) || kind;
+        const label = routeActionLabels[kind] || kind;
         waypoint.actions = [...(waypoint.actions || []), {{
           id: actionId,
           kind,
@@ -2776,6 +2834,11 @@ def render_dashboard_html(
           }}, "PUT");
         }});
         liveMapSvg.addEventListener("click", async (event) => {{
+          const selected = selectMapObject(event.target);
+          if (selected) {{
+            event.preventDefault();
+            return;
+          }}
           if (mapEditMode !== "select") {{
             event.preventDefault();
             const target = worldFromSvgEvent(event);
@@ -2786,7 +2849,6 @@ def render_dashboard_html(
             await applyMapEditAt(target);
             return;
           }}
-          if (selectMapObject(event.target)) return;
           if (!goToArmed) return;
           event.preventDefault();
           const target = worldFromSvgEvent(event);
@@ -2859,6 +2921,12 @@ def render_dashboard_html(
       }}
       if (mapEditControls) {{
         mapEditControls.addEventListener("click", async (event) => {{
+          const routeActionButton = event.target.closest("button[data-route-action-kind]");
+          if (routeActionButton) {{
+            routeActionButton.blur();
+            await addActionToSelectedRouteWaypoint(routeActionButton.getAttribute("data-route-action-kind") || "");
+            return;
+          }}
           const modeButton = event.target.closest("button[data-map-edit-mode]");
           if (modeButton) {{
             setGoToArmed(false);
@@ -2905,8 +2973,6 @@ def render_dashboard_html(
           }} else if (action === "heatmap_run") {{
             await gatherHeatmap();
             await refreshLiveMap();
-          }} else if (action === "route_add_action") {{
-            await addActionToSelectedRouteWaypoint();
           }} else if (action === "route_up") {{
             await moveSelectedRouteWaypoint(-1);
           }} else if (action === "route_down") {{
@@ -3382,7 +3448,8 @@ def _render_route_stop(projector: _MapProjector, stop: dict[str, Any], index: in
     y = projector.y(float(stop["y"]))
     title = escape(str(stop.get("target_id") or "route stop"))
     return (
-        f'<g data-edit-kind="route_stop" data-edit-id="{escape(str(stop.get("target_id") or ""))}"><title>{title}</title>'
+        f'<g class="map-route-stop-marker" data-edit-kind="route_stop" '
+        f'data-edit-id="{escape(str(stop.get("target_id") or ""))}"><title>{title}</title>'
         f'<circle class="map-route-stop" cx="{x:.1f}" cy="{y:.1f}" r="9" />'
         f'<text class="map-route-index" x="{x:.1f}" y="{y + 1:.1f}">{index}</text>'
         "</g>"

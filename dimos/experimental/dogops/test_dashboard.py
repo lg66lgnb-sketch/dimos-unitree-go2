@@ -145,10 +145,20 @@ def test_dashboard_static_html_contains_closed_loop_result(tmp_path) -> None:
     assert 'data-map-edit-action="run_route"' in content
     assert 'data-map-edit-action="stop_route"' in content
     assert 'data-map-edit-action="heatmap_run"' in content
-    assert 'data-map-edit-action="route_add_action"' in content
+    assert 'data-route-action-row' in content
+    assert 'data-route-action-kind="capture_image"' in content
+    assert 'data-route-action-kind="scan_qr"' in content
+    assert 'data-route-action-kind="scan_tags"' in content
+    assert 'data-route-action-kind="wait"' in content
+    assert 'data-route-action-kind="inspect_asset"' in content
+    assert 'data-route-action-kind="verify_work_order"' in content
+    assert 'data-route-action-kind="operator_prompt"' in content
+    assert 'class="map-route-stop-marker"' in content
+    assert 'circle.setAttribute("r", "18")' in content
+    assert 'circle.setAttribute("r", "9")' in content
     assert 'run.route_id === "GATHER_HEATMAP"' in content
     assert "Costmap snapshot" in content
-    assert 'new Set(["capture_image", "scan_qr", "scan_tags", "wait", "inspect_asset", "verify_work_order", "operator_prompt"])' in content
+    assert "new Set(Object.keys(routeActionLabels))" in content
     assert "routeActionArgs(kind, waypoint)" in content
     assert 'data-route-execution-status' in content
     assert "/api/map/routes/follow" in content
@@ -315,6 +325,7 @@ def test_dashboard_map_controls_are_grouped_near_legend(tmp_path) -> None:
     assert 'data-map-edit-action="route_select"' in route_row.group(1)
     assert 'data-map-edit-action="run_route"' in route_row.group(1)
     assert 'data-map-edit-action="heatmap_run"' in route_row.group(1)
+    assert 'data-map-edit-action="route_add_action"' not in route_row.group(1)
     assert 'data-map-edit-action="route_down"' in route_row.group(1)
     assert 'data-map-route-summary' in route_row.group(1)
 
