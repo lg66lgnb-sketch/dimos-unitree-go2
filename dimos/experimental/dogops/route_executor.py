@@ -20,6 +20,7 @@ from dimos.experimental.dogops.map_authoring import (
 from dimos.experimental.dogops.models import DogOpsModel, NavAction, NavEvent
 from dimos.experimental.dogops.nav_eval import summarize_nav_events
 from dimos.experimental.dogops.route_actions import (
+    CaptureImageHandler,
     EditableRouteAction,
     ScanZoneHandler,
     execute_route_action,
@@ -148,6 +149,7 @@ class DogOpsRouteExecutor:
         live_snapshot_reader: Callable[[], dict[str, Any]] | None = None,
         stop_handler: StopHandler | None = None,
         scan_zone_handler: ScanZoneHandler | None = None,
+        capture_image_handler: CaptureImageHandler | None = None,
         frame: str = "map",
         reach_radius_m: float = 0.35,
         waypoint_timeout_s: float = 20.0,
@@ -162,6 +164,7 @@ class DogOpsRouteExecutor:
         self.live_snapshot_reader = live_snapshot_reader
         self.stop_handler = stop_handler
         self.scan_zone_handler = scan_zone_handler
+        self.capture_image_handler = capture_image_handler
         self.frame = frame or "map"
         self.reach_radius_m = reach_radius_m
         self.waypoint_timeout_s = waypoint_timeout_s
@@ -434,6 +437,7 @@ class DogOpsRouteExecutor:
                     target_id=waypoint.target_id or waypoint.id,
                     pose=waypoint.pose.model_dump(mode="json"),
                     scan_zone_handler=self.scan_zone_handler,
+                    capture_image_handler=self.capture_image_handler,
                 )
                 result_ok = result.ok
                 result_note = result.note

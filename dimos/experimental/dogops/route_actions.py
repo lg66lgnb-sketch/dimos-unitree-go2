@@ -44,6 +44,7 @@ class RouteActionResult(DogOpsModel):
 
 
 ScanZoneHandler = Callable[[str], str | dict[str, Any]]
+CaptureImageHandler = Callable[[dict[str, Any]], dict[str, Any] | None]
 
 
 def execute_route_action(
@@ -56,6 +57,7 @@ def execute_route_action(
     target_id: str | None = None,
     pose: dict[str, Any] | None = None,
     scan_zone_handler: ScanZoneHandler | None = None,
+    capture_image_handler: CaptureImageHandler | None = None,
 ) -> RouteActionResult:
     if action.kind == "scan_tags":
         expected = [int(tag) for tag in action.args.get("expected", [])]
@@ -117,18 +119,23 @@ def execute_route_action(
             ],
         )
     if action.kind == "capture_image":
-        image_path, source, mime_type = _capture_image_path(
+        image_path, source, mime_type, capture_metadata = _capture_image_path(
             run_dir=Path(run_dir),
             route_run_id=route_run_id,
             waypoint_id=waypoint_id,
             action=action,
+            capture_image_handler=capture_image_handler,
         )
         return RouteActionResult(
             ok=True,
             note=(
-                "configured Go2 camera image captured"
-                if source == "go2_camera_configured"
-                else "placeholder dog-camera image captured"
+                "live Go2 camera image captured"
+                if source == "go2_camera_live"
+                else (
+                    "configured Go2 camera image captured"
+                    if source == "go2_camera_configured"
+                    else "placeholder dog-camera image captured"
+                )
             ),
             payload={"source": source, "path": str(image_path)},
             evidence=[
@@ -144,6 +151,7 @@ def execute_route_action(
                         "action_id": action.id,
                         "target": action.args.get("target") or target_id or waypoint_id,
                         "pose": pose,
+                        **capture_metadata,
                     },
                 }
             ],
@@ -398,17 +406,35 @@ def _capture_image_path(
     route_run_id: str,
     waypoint_id: str,
     action: EditableRouteAction,
-) -> tuple[Path, str, str]:
+    capture_image_handler: CaptureImageHandler | None = None,
+) -> tuple[Path, str, str, dict[str, Any]]:
+    evidence_dir = run_dir / "route_runs" / route_run_id / "evidence"
+    if capture_image_handler is not None:
+        captured = capture_image_handler(
+            {
+                "evidence_dir": evidence_dir,
+                "route_run_id": route_run_id,
+                "waypoint_id": waypoint_id,
+                "action_id": action.id,
+                "action": action.model_dump(mode="json"),
+            }
+        )
+        if captured:
+            return (
+                Path(str(captured["path"])),
+                str(captured.get("source") or "go2_camera_live"),
+                str(captured.get("mime_type") or "image/png"),
+                dict(captured.get("metadata") or {}),
+            )
     configured = action.args.get("image_path") or os.environ.get("DOGOPS_GO2_CAMERA_IMAGE_PATH")
     if configured:
         source = Path(str(configured)).expanduser()
         if source.exists() and source.is_file():
-            evidence_dir = run_dir / "route_runs" / route_run_id / "evidence"
             evidence_dir.mkdir(parents=True, exist_ok=True)
             suffix = source.suffix or ".img"
             destination = evidence_dir / f"{waypoint_id}-{action.id}{suffix}"
             shutil.copyfile(source, destination)
-            return destination, "go2_camera_configured", _mime_type_for_suffix(suffix)
+            return destination, "go2_camera_configured", _mime_type_for_suffix(suffix), {}
     return (
         _write_placeholder_image(
             run_dir=run_dir,
@@ -418,6 +444,7 @@ def _capture_image_path(
         ),
         "demo_placeholder",
         "image/png",
+        {},
     )
 
 

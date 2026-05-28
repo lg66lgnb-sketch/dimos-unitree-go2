@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -267,6 +268,59 @@ def test_capture_image_uses_configured_go2_image(tmp_path) -> None:
     assert image_evidence["metadata"]["source"] == "go2_camera_configured"
     copied_path = tmp_path / "route_runs" / state.route_run_id / "evidence" / "WP-IMAGE-CAPTURE.jpg"
     assert copied_path.read_bytes() == b"fake-jpeg"
+
+
+def test_capture_image_uses_live_camera_handler_when_available(tmp_path) -> None:
+    route = EditableRoute(
+        id="ROUTE_LIVE_IMAGE",
+        label="Route Live Image",
+        waypoints=[
+            EditableRouteWaypoint(
+                id="WP-LIVE-IMAGE",
+                label="Waypoint",
+                pose=EditableMapPoint(x=1.0, y=2.0),
+                actions=[
+                    EditableRouteAction(
+                        id="CAPTURE",
+                        kind="capture_image",
+                    ),
+                ],
+            )
+        ],
+    )
+    save_map_authoring(
+        tmp_path,
+        MapAuthoringState(selected_route_id="ROUTE_LIVE_IMAGE", routes=[route]),
+    )
+
+    def capture_image(context: dict[str, object]) -> dict[str, object]:
+        evidence_dir = context["evidence_dir"]
+        assert isinstance(evidence_dir, Path)
+        path = evidence_dir / "live-camera.png"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"live-camera")
+        return {
+            "path": str(path),
+            "source": "go2_camera_live",
+            "mime_type": "image/png",
+            "metadata": {
+                "camera_frame_id": "front-1",
+                "camera_frame_age_s": 0.25,
+            },
+        }
+
+    state = DogOpsRouteExecutor(
+        tmp_path,
+        capture_image_handler=capture_image,
+    ).follow_route(dry_run=True)
+
+    assert state.route_run_id
+    evidence = RouteRunStore(tmp_path).route_run_evidence(state.route_run_id)
+    image_evidence = [item for item in evidence if item["kind"] == "image"][0]
+    assert image_evidence["metadata"]["source"] == "go2_camera_live"
+    assert image_evidence["metadata"]["camera_frame_id"] == "front-1"
+    assert image_evidence["metadata"]["camera_frame_age_s"] == 0.25
+    assert Path(image_evidence["path"]).read_bytes() == b"live-camera"
 
 
 def test_qr_route_action_uses_scan_zone_handler_when_target_is_zone(tmp_path) -> None:
