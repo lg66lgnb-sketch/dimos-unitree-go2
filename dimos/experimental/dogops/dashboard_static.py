@@ -714,41 +714,52 @@ def render_site_map(
     )
     layer_controls = (
         '<div class="map-layer-controls" data-map-layer-controls>'
-        '<button type="button" data-map-layer="semantic" aria-pressed="true">Semantic</button>'
-        '<button type="button" data-map-layer="heatmap" aria-pressed="true">Heatmap</button>'
-        '<button type="button" data-map-layer="path" aria-pressed="true">Path</button>'
-        '<button type="button" data-map-layer="robot" aria-pressed="true">Robot</button>'
-        '<button type="button" data-map-layer="qr" aria-pressed="true">QR</button>'
+        '<button type="button" data-map-layer="semantic" aria-pressed="true">'
+        '<i class="layer-semantic"></i>Semantic</button>'
+        '<button type="button" data-map-layer="heatmap" aria-pressed="true">'
+        '<i class="legend-heatmap"></i>Heatmap</button>'
+        '<button type="button" data-map-layer="path" aria-pressed="true">'
+        '<i class="legend-route"></i>Path</button>'
+        '<button type="button" data-map-layer="robot" aria-pressed="true">'
+        '<i class="legend-live"></i>Robot</button>'
+        '<button type="button" data-map-layer="qr" aria-pressed="true">'
+        '<i class="legend-qr"></i>QR</button>'
         "</div>"
     )
     edit_controls = (
         '<div class="map-edit-controls" data-map-edit-controls>'
+        '<div class="map-edit-row" data-map-edit-general-row>'
         '<button type="button" data-map-edit-mode="select" aria-pressed="true">Select</button>'
         '<button type="button" data-map-edit-mode="home" aria-pressed="false">Set Home</button>'
+        '<button type="button" data-map-edit-action="delete_selected">Delete</button>'
+        '<button type="button" data-map-edit-action="save">Save</button>'
+        '<button type="button" data-map-edit-action="reset">Reset</button>'
+        '<button type="button" data-map-edit-action="export">Export</button>'
+        "</div>"
+        '<div class="map-edit-row" data-map-edit-label-row>'
         '<button type="button" data-map-edit-mode="zone" aria-pressed="false">Label</button>'
         '<button type="button" data-map-edit-mode="asset" aria-pressed="false">Asset</button>'
         '<button type="button" data-map-edit-mode="package" aria-pressed="false">Package</button>'
         '<button type="button" data-map-edit-mode="no_go" aria-pressed="false">No-Go</button>'
-        '<button type="button" data-map-edit-mode="route" aria-pressed="false">Route</button>'
         '<button type="button" data-map-edit-mode="incident" aria-pressed="false">Incident</button>'
         '<button type="button" data-map-edit-mode="tag" aria-pressed="false">Bind Tag</button>'
         '<button type="button" data-map-edit-action="use_observation">Use Observation</button>'
-        '<button type="button" data-map-edit-action="delete_selected">Delete</button>'
+        '<button type="button" data-map-edit-action="publish_no_go">Publish No-Go</button>'
+        "</div>"
+        '<div class="map-edit-row" data-map-edit-route-row>'
+        '<button type="button" data-map-edit-mode="route" aria-pressed="false">Route</button>'
         '<button type="button" data-map-edit-action="route_select">Select Route</button>'
         '<button type="button" data-map-edit-action="run_route">Run Route</button>'
         '<button type="button" data-map-edit-action="stop_route">Stop Route</button>'
         '<button type="button" data-map-edit-action="route_up">Route Up</button>'
         '<button type="button" data-map-edit-action="route_down">Route Down</button>'
-        '<button type="button" data-map-edit-action="publish_no_go">Publish No-Go</button>'
-        '<button type="button" data-map-edit-action="save">Save</button>'
-        '<button type="button" data-map-edit-action="reset">Reset</button>'
-        '<button type="button" data-map-edit-action="export">Export</button>'
+        '<span class="map-route-summary" data-map-route-summary>Selected route: none. Next: Route1</span>'
+        "</div>"
         "</div>"
     )
     return f"""
       <div class="map-shell" data-map-surface>
         {_render_rerun_surface(rerun_web_url)}
-        {layer_controls}
         {edit_controls}
         <svg class="site-map" role="img" aria-label="DogOps mission map"
           data-live-map-svg data-map-bounds="{bounds_attr}" data-map-authoring="{authoring_attr}"
@@ -789,6 +800,7 @@ def render_site_map(
             {robot}
           </g>
         </svg>
+        {layer_controls}
         {legend}
         <div class="map-workflow">
           <a href="{rerun_web_url_attr}" target="_blank" rel="noreferrer" data-rerun-web-link>Open Rerun Web</a>
@@ -1149,20 +1161,37 @@ def render_dashboard_html(
     .map-go-to-cross {{ stroke: #fecaca; stroke-linecap: round; stroke-width: 2; }}
     .map-axis-label {{ fill: #657184; font-size: 10px; }}
     .site-map.go-to-armed {{ cursor: crosshair; }}
-    .map-legend {{
+    .map-legend, .map-layer-controls {{
       color: #a9b4c4;
       display: flex;
       flex-wrap: wrap;
       gap: 12px;
       font-size: 12px;
     }}
-    .map-legend span {{ align-items: center; display: inline-flex; gap: 6px; }}
-    .map-legend i {{
+    .map-legend span, .map-layer-controls button {{
+      align-items: center;
+      display: inline-flex;
+      gap: 6px;
+    }}
+    .map-legend i, .map-layer-controls i {{
       border-radius: 999px;
       display: inline-block;
       height: 10px;
       width: 10px;
     }}
+    .map-layer-controls button {{
+      background: transparent;
+      border: 0;
+      color: inherit;
+      cursor: pointer;
+      font: inherit;
+      padding: 0;
+    }}
+    .map-layer-controls button[aria-pressed="true"] {{
+      color: #d8fff6;
+      font-weight: 700;
+    }}
+    .map-layer-controls button[aria-pressed="false"] {{ opacity: 0.48; }}
     .legend-free {{ background: #484981; }}
     .legend-heatmap {{ background: #f97316; }}
     .legend-route {{ background: #52e0c4; }}
@@ -1170,6 +1199,7 @@ def render_dashboard_html(
     .legend-tag {{ background: #a78bfa; }}
     .legend-no-go {{ background: #ef4444; }}
     .legend-incident {{ background: #fb7185; }}
+    .layer-semantic {{ background: #a78bfa; }}
     .legend-qr {{ background: #facc15; }}
     .map-workflow {{
       align-items: center;
@@ -1191,17 +1221,17 @@ def render_dashboard_html(
     }}
     .map-command-status.ok {{ color: #86efac; }}
     .map-command-status.error {{ color: #fca5a5; }}
-    .map-layer-controls {{
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-    }}
     .map-edit-controls {{
+      display: grid;
+      gap: 8px;
+    }}
+    .map-edit-row {{
+      align-items: center;
       display: flex;
       flex-wrap: wrap;
       gap: 8px;
     }}
-    .map-layer-controls button, .map-edit-controls button {{
+    .map-edit-controls button {{
       background: #0d1119;
       border: 1px solid #334155;
       border-radius: 999px;
@@ -1211,11 +1241,18 @@ def render_dashboard_html(
       min-height: 30px;
       padding: 5px 10px;
     }}
-    .map-layer-controls button[aria-pressed="true"], .map-edit-controls button[aria-pressed="true"] {{
+    .map-edit-controls button[aria-pressed="true"] {{
       background: #123b36;
       border-color: #52e0c4;
       color: #d8fff6;
       font-weight: 700;
+    }}
+    .map-route-summary {{
+      color: #a9b4c4;
+      font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace;
+      min-height: 30px;
+      display: inline-flex;
+      align-items: center;
     }}
     .map-live-status {{
       color: #f7d75d;
@@ -1588,6 +1625,7 @@ def render_dashboard_html(
       const mapCommandStatus = document.querySelector("[data-map-command-status]");
       const mapAuthoringStatus = document.querySelector("[data-map-authoring-status]");
       const routeExecutionStatus = document.querySelector("[data-route-execution-status]");
+      const routeSummary = document.querySelector("[data-map-route-summary]");
       const routeRunHistory = document.querySelector("[data-route-run-history]");
       const routeRunTimeline = document.querySelector("[data-route-run-timeline]");
       const liveHeatmap = liveMapSvg ? liveMapSvg.querySelector("[data-live-heatmap]") : null;
@@ -1670,6 +1708,32 @@ def render_dashboard_html(
         routeExecutionStatus.textContent = text;
         routeExecutionStatus.className = `map-route-execution-status ${{state || ""}}`;
       }};
+      const routeList = () => {{
+        const current = mapAuthoring || {{}};
+        return Array.isArray(current.routes) ? current.routes : [];
+      }};
+      const nextRouteId = (routes = routeList()) => {{
+        const used = new Set(routes.map((route) => String(route.id || "")));
+        let index = 1;
+        while (used.has(`Route${{index}}`)) index += 1;
+        return `Route${{index}}`;
+      }};
+      const updateRouteSummary = () => {{
+        if (!routeSummary) return;
+        const current = mapAuthoring || {{}};
+        const routes = routeList();
+        if (!routes.length) {{
+          routeSummary.textContent = `Selected route: none. Next: ${{nextRouteId(routes)}}`;
+          return;
+        }}
+        const selected = routes.find((route) => route.id === current.selected_route_id) || null;
+        const selectedText = selected
+          ? `${{selected.id}} (${{(selected.waypoints || []).length}} waypoint${{(selected.waypoints || []).length === 1 ? "" : "s"}})`
+          : "none";
+        const routeIds = routes.map((route) => route.id).join(", ");
+        routeSummary.textContent = `Selected route: ${{selectedText}}. Routes: ${{routeIds}}. Next: ${{nextRouteId(routes)}}`;
+      }};
+      updateRouteSummary();
       const setRerunStatus = (text) => {{
         if (rerunStatus) rerunStatus.textContent = text;
       }};
@@ -1752,6 +1816,7 @@ def render_dashboard_html(
             throw new Error(result.message || result.error || "map_authoring_failed");
           }}
           mapAuthoring = result.authoring || mapAuthoring;
+          updateRouteSummary();
           setMapAuthoringStatus("Map edit saved; refreshing", "ok");
           await refreshDimOSMap();
           window.setTimeout(() => window.location.reload(), 150);
@@ -1821,7 +1886,7 @@ def render_dashboard_html(
       }};
       const selectedRoute = () => {{
         const current = mapAuthoring || {{}};
-        const routes = Array.isArray(current.routes) ? current.routes : [];
+        const routes = routeList();
         if (!routes.length) return null;
         if (!current.selected_route_id) return null;
         return routes.find((route) => route.id === current.selected_route_id) || null;
@@ -2009,10 +2074,20 @@ def render_dashboard_html(
       }};
       const selectRouteByPrompt = async () => {{
         const current = mapAuthoring || {{}};
-        const routes = Array.isArray(current.routes) ? current.routes : [];
-        const routeId = window.prompt("Route id", current.selected_route_id || (routes[0] && routes[0].id) || "AUTHORED_ROUTE");
+        const routes = routeList();
+        const existingRouteIds = routes.map((route) => route.id).join(", ") || "none";
+        const routeIdInput = window.prompt(
+          `Route id (existing: ${{existingRouteIds}}; new id creates a route)`,
+          current.selected_route_id || (routes[0] && routes[0].id) || nextRouteId(routes)
+        );
+        const routeId = routeIdInput ? routeIdInput.trim() : "";
         if (!routeId) return;
-        await postAuthoring(`/api/map/routes/${{encodeURIComponent(routeId)}}/select`, {{}});
+        const existing = routes.find((route) => route.id === routeId);
+        if (existing) {{
+          await postAuthoring(`/api/map/routes/${{encodeURIComponent(routeId)}}/select`, {{}});
+        }} else {{
+          await saveRoutes([...routes, {{id: routeId, label: routeId, waypoints: [], mission_id: null}}], routeId);
+        }}
       }};
       const mapEditId = (prefix) => `${{prefix}}-${{Date.now().toString(36)}}`;
       const applyMapEditAt = async (target) => {{
@@ -2062,8 +2137,9 @@ def render_dashboard_html(
           }});
         }} else if (mapEditMode === "route") {{
           const current = mapAuthoring || {{}};
-          const routes = Array.isArray(current.routes) ? [...current.routes] : [];
-          const route = routes.find((item) => item.id === current.selected_route_id) || routes[0] || {{id: "AUTHORED_ROUTE", label: "Authored Route", waypoints: [], mission_id: null}};
+          const routes = [...routeList()];
+          const newRouteId = nextRouteId(routes);
+          const route = routes.find((item) => item.id === current.selected_route_id) || routes[0] || {{id: newRouteId, label: newRouteId, waypoints: [], mission_id: null}};
           const routeIndex = routes.indexOf(route);
           route.waypoints = [...(route.waypoints || []), {{
             id: mapEditId("WP"),
